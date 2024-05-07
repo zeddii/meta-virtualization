@@ -19,7 +19,7 @@ SRC_URI = "git://github.com/containers/crun.git;branch=main;name=crun;protocol=h
 
 PV = "v1.23.1+git${SRCREV_crun}"
 
-inherit autotools-brokensep pkgconfig
+inherit autotools-brokensep pkgconfig features_check
 
 # if this is true, we'll symlink crun to runc for easier integration
 # with container stacks
@@ -54,3 +54,7 @@ do_install() {
         ln -sr "${D}/${bindir}/crun" "${D}${bindir}/runc"
     fi
 }
+
+REQUIRED_DISTRO_FEATURES:class-native ?= ""
+DEPENDS:class-native += "yajl libcap go-md2man m4 libseccomp"
+BBCLASSEXTEND = "native"
