@@ -11,7 +11,7 @@ DEPENDS = " \
 
 # Specify the first two important SRCREVs as the format
 SRCREV_FORMAT = "nerdcli_cgroups"
-SRCREV_nerdcli = "497c7cf74d09bf1ddf2678382360ca61e6faebac"
+SRCREV_nerdcli = "832c4556e0b82789f687b70d1e394b892e035722"
 
 SRC_URI = "git://github.com/containerd/nerdctl.git;name=nerdcli;branch=main;protocol=https;destsuffix=${GO_SRCURI_DESTSUFFIX}"
 
@@ -20,7 +20,6 @@ include src_uri.inc
 # patches and config
 SRC_URI += " \
             file://0001-Makefile-allow-external-specification-of-build-setti.patch \
-            file://modules.txt \
            "
 
 LICENSE = "Apache-2.0"
@@ -28,14 +27,24 @@ LIC_FILES_CHKSUM = "file://src/import/LICENSE;md5=3b83ef96387f14655fc854ddc3c6bd
 
 GO_IMPORT = "import"
 
-PV = "v2.0.3"
+PV = "v2.1.3"
 
 NERDCTL_PKG = "github.com/containerd/nerdctl"
+
+BB_GIT_SHALLOW = "1"
+BB_GIT_SHALLOW_DEPTH = "1"
+BB_GENERATE_SHALLOW_TARBALLS = "1"
 
 inherit go goarch
 inherit systemd pkgconfig
 
+# Set up Go working directory
+GO_WORKDIR ?= "${GO_IMPORT}"
+do_compile[dirs] += "${B}/src/${GO_WORKDIR}"
+
 do_configure[noexec] = "1"
+
+include module_cache_task.inc 
 
 EXTRA_OEMAKE = " \
      PREFIX=${prefix} BINDIR=${bindir} LIBEXECDIR=${libexecdir} \
@@ -45,16 +54,10 @@ EXTRA_OEMAKE = " \
 
 PACKAGECONFIG ?= ""
 
-# sets the "sites" variable.
-include relocation.inc
-
 PIEFLAG = "${@bb.utils.contains('GOBUILDFLAGS', '-buildmode=pie', '-buildmode=pie', '', d)}"
 
 do_compile() {
-
     	cd ${S}/src/import
-
-	export GOPATH="$GOPATH:${S}/src/import/.gopath"
 
 	# Pass the needed cflags/ldflags so that cgo
 	# can find the needed headers files and libraries
@@ -62,13 +65,7 @@ do_compile() {
 	export CGO_ENABLED="1"
 	export CGO_CFLAGS="${CFLAGS} --sysroot=${STAGING_DIR_TARGET}"
 	export CGO_LDFLAGS="${LDFLAGS} --sysroot=${STAGING_DIR_TARGET}"
-
-	export GOFLAGS="-mod=vendor -trimpath ${PIEFLAG}"
-
-	# our copied .go files are to be used for the build
-	ln -sf vendor.copy vendor
-	# inform go that we know what we are doing
-	cp ${UNPACKDIR}/modules.txt vendor/
+	export GOFLAGS="${GOFLAGS} -trimpath ${PIEFLAG}"
 
 	oe_runmake GO=${GO} BUILDTAGS="${BUILDTAGS}" binaries
 }
@@ -80,4 +77,3 @@ do_install() {
 
 INHIBIT_PACKAGE_STRIP = "1"
 INSANE_SKIP:${PN} += "ldflags already-stripped"
-
