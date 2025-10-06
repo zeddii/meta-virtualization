@@ -2686,6 +2686,14 @@ class GoModuleFetcher:
     s = d.getVar('S')
     cache_dir = Path(s) / "pkg" / "mod" / "cache" / "download"
     go_sum_path = Path(s) / "src" / "import" / "go.sum"
+    workdir = Path(d.getVar('WORKDIR'))
+    fallback_marker = workdir / ".use-gomodgit-go-sum"
+    fallback_sum = workdir / "go.sum.gomodgit"
+
+    if fallback_marker.exists() or fallback_sum.exists():
+        bb.warn("go.sum.gomodgit fallback detected - skipping helper-based go.sum generation")
+        fallback_marker.touch()
+        return
 
     # Go helper binary for checksums
     go_helper = Path(d.getVar('STAGING_BINDIR_NATIVE')) / "dirhash"
@@ -2788,6 +2796,19 @@ addtask generate_go_sum after do_create_module_cache before do_compile
     export GONOSUMDB="*"
     export GOPRIVATE="*"
     export GOFLAGS="${GOFLAGS} -mod=mod -modcacherw"
+
+    fallback_sum="${WORKDIR}/go.sum.gomodgit"
+    fallback_marker="${WORKDIR}/.use-gomodgit-go-sum"
+
+    if [ -f "${fallback_sum}" ]; then
+        bbwarn "Fallback go.sum.gomodgit detected - using provided checksums"
+        install -d "${S}/src/import"
+        install -m 0644 "${fallback_sum}" "${S}/src/import/go.sum"
+        touch "${fallback_marker}"
+    else
+        rm -f "${fallback_marker}"
+    fi
+
     bbnote "Using offline Go module cache at ${GOMODCACHE}"
 }
 '''
@@ -3821,7 +3842,7 @@ addtask generate_go_sum after do_create_module_cache before do_compile
 
             # Create module zip file (EXACT same method as module_cache_task.inc)
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                prefix = f"{module_path}@{version}/"
+                module_prefix = f"{module_path}@{version}/"
                 expected_go_mod = f"{subdir}/go.mod" if subdir else "go.mod"
 
                 excluded_prefixes: List[str] = []
@@ -3834,7 +3855,7 @@ addtask generate_go_sum after do_create_module_cache before do_compile
                 for file_path in files:
                     if subdir and not file_path.startswith(subdir):
                         continue
-                    if any(file_path.startswith(prefix) for prefix in excluded_prefixes):
+                    if any(file_path.startswith(excluded_prefix) for excluded_prefix in excluded_prefixes):
                         continue
                     if file_path.endswith('go.mod') and file_path != expected_go_mod:
                         # Skip nested module go.mod files to match Go's module zip layout
@@ -3844,7 +3865,7 @@ addtask generate_go_sum after do_create_module_cache before do_compile
                             ["git", "cat-file", "blob", f"HEAD:{file_path}"],
                             cwd=repo_dir
                         )
-                        archive_path = prefix + (file_path[len(subdir)+1:] if subdir else file_path)
+                        archive_path = module_prefix + (file_path[len(subdir)+1:] if subdir else file_path)
                         zf.writestr(archive_path, content)
                     except subprocess.CalledProcessError:
                         continue
@@ -3930,7 +3951,7 @@ addtask generate_go_sum after do_create_module_cache before do_compile
 
             # Create zip file with same logic as module_cache_task.inc
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                prefix = f"{module_path}@{version}/"
+                module_prefix = f"{module_path}@{version}/"
                 expected_go_mod = f"{subdir}/go.mod" if subdir else "go.mod"
 
                 excluded_prefixes: List[str] = []
@@ -3943,7 +3964,7 @@ addtask generate_go_sum after do_create_module_cache before do_compile
                 for file_path in files:
                     if subdir and not file_path.startswith(subdir):
                         continue
-                    if any(file_path.startswith(prefix) for prefix in excluded_prefixes):
+                    if any(file_path.startswith(excluded_prefix) for excluded_prefix in excluded_prefixes):
                         continue
                     if file_path.endswith('go.mod') and file_path != expected_go_mod:
                         continue
@@ -3953,7 +3974,7 @@ addtask generate_go_sum after do_create_module_cache before do_compile
                             ["git", "cat-file", "blob", f"HEAD:{file_path}"],
                             cwd=repo_dir
                         )
-                        archive_path = prefix + (file_path[len(subdir)+1:] if subdir else file_path)
+                        archive_path = module_prefix + (file_path[len(subdir)+1:] if subdir else file_path)
                         zf.writestr(archive_path, content)
                     except subprocess.CalledProcessError:
                         continue
