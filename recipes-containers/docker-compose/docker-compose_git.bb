@@ -9,21 +9,18 @@ DEPENDS = " \
 
 # Specify the first two important SRCREVs as the format
 SRCREV_FORMAT = "compose_survey"
-SRCREV_compose = "eaf9800948e022573997649656c040a19d4b15c2"
+SRCREV_compose = "fa7e85ed839ae5e38aeafa9ef6ea81894d5f8dc0"
 
 SRC_URI = "git://github.com/docker/compose;name=compose;branch=main;protocol=https;destsuffix=${GO_SRCURI_DESTSUFFIX}"
 
 include src_uri.inc
-
-# patches and config
-SRC_URI += "file://modules.txt"
 
 LICENSE = "Apache-2.0"
 LIC_FILES_CHKSUM = "file://src/import/LICENSE;md5=175792518e4ac015ab6696d16c4f607e"
 
 GO_IMPORT = "import"
 
-PV = "v2.33.1"
+PV = "v2.26.1"
 
 COMPOSE_PKG = "github.com/docker/compose/v2"
 
@@ -37,9 +34,8 @@ do_configure[noexec] = "1"
 PACKAGECONFIG ?= "docker-plugin"
 PACKAGECONFIG[docker-plugin] = ",,,docker"
 
-include relocation.inc
+include module_cache_task.inc 
 
-GOBUILDFLAGS:append = " -mod=vendor"
 do_compile() {
     	cd ${S}/src/import
 
@@ -51,11 +47,6 @@ do_compile() {
 	export CGO_ENABLED="1"
 	export CGO_CFLAGS="${CFLAGS} --sysroot=${STAGING_DIR_TARGET}"
 	export CGO_LDFLAGS="${LDFLAGS} --sysroot=${STAGING_DIR_TARGET}"
-
-	# our copied .go files are to be used for the build
-	ln -sf vendor.copy vendor
-	# inform go that we know what we are doing
-	cp ${UNPACKDIR}/modules.txt vendor/
 
 	GO_LDFLAGS="-s -w -X internal.Version=${PV} -X ${COMPOSE_PKG}/internal.Version=${PV}"
 	GO_BUILDTAGS=""
