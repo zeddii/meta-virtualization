@@ -993,19 +993,19 @@ class GoModuleFetcher:
                     print("    Removing incomplete repository checkout before cloning...")
                     shutil.rmtree(repo_dir, ignore_errors=True)
                 print(f"    Cloning from {repo_url}...")
-                # First try a full clone to ensure we get all refs/tags
+                # Start with a shallow clone to reduce transfer size
                 clone_result = self._run_git_command_with_retry(
-                    ["git", "clone", repo_url, str(repo_dir)],
+                    ["git", "clone", "--depth", "1", repo_url, str(repo_dir)],
                     cleanup=repo_dir,
-                    description=f"git clone {repo_url}"
+                    description=f"git clone --depth 1 {repo_url}"
                 )
                 if not clone_result:
-                    # If full clone fails, fallback to shallow clone
-                    print("    Full clone failed, trying shallow clone...")
+                    # If shallow clone fails, fall back to a full history clone
+                    print("    Shallow clone failed, trying full history clone...")
                     clone_result = self._run_git_command_with_retry(
-                        ["git", "clone", "--depth", "1", repo_url, str(repo_dir)],
+                        ["git", "clone", repo_url, str(repo_dir)],
                         cleanup=repo_dir,
-                        description=f"git clone --depth 1 {repo_url}"
+                        description=f"git clone {repo_url}"
                     )
                     if not clone_result:
                         return False
@@ -1015,36 +1015,99 @@ class GoModuleFetcher:
             print(f"    ❌ Git operation failed: {e}")
             return False
 
+    def _deepen_repository(self, repo_dir: Path) -> bool:
+        """Ensure a shallow clone has enough history for the required revision."""
+        try:
+            depth_check = subprocess.run(
+                ["git", "rev-parse", "--is-shallow-repository"],
+                cwd=repo_dir,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError:
+            return False
+
+        if depth_check.stdout.strip().lower() != "true":
+            # Already have full history
+            return True
+
+        print("    Repository is shallow; fetching additional history for required revision...")
+
+        # Try to upgrade the shallow clone; fall back to a full fetch if needed
+        fetch_result = self._run_git_command_with_retry(
+            ["git", "fetch", "--unshallow", "--tags"],
+            cwd=repo_dir,
+            description="git fetch --unshallow --tags",
+        )
+
+        if not fetch_result:
+            print("    ⚠️  --unshallow failed; attempting full fetch to obtain commit history...")
+            fetch_result = self._run_git_command_with_retry(
+                ["git", "fetch", "--all", "--tags"],
+                cwd=repo_dir,
+                description="git fetch --all --tags",
+            )
+            if not fetch_result:
+                return False
+
+        # Confirm repository is no longer shallow
+        try:
+            depth_check = subprocess.run(
+                ["git", "rev-parse", "--is-shallow-repository"],
+                cwd=repo_dir,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError:
+            return True
+
+        return depth_check.stdout.strip().lower() != "true"
+
     def checkout_revision(self, repo_dir: Path, hash_val: str, ref: str, version: str) -> bool:
         """Checkout specific revision in the repository."""
         try:
-            # Try hash first (most reliable)
-            if hash_val:
-                print(f"    Checking out commit {hash_val[:8]}...")
+            deepened_history = False
+
+            def try_checkout(target: str) -> bool:
                 try:
                     subprocess.run(
-                        ["git", "checkout", hash_val],
+                        ["git", "checkout", target],
                         cwd=repo_dir,
                         check=True,
                         capture_output=True
                     )
                     return True
                 except subprocess.CalledProcessError:
-                    print("    Hash checkout failed, trying alternatives...")
+                    return False
+
+            def ensure_deep_history() -> bool:
+                nonlocal deepened_history
+                if deepened_history:
+                    return True
+                deepened_history = self._deepen_repository(repo_dir)
+                if not deepened_history:
+                    print("    ⚠️  Failed to automatically deepen repository history")
+                return deepened_history
+
+            # Try hash first (most reliable)
+            if hash_val:
+                print(f"    Checking out commit {hash_val[:8]}...")
+                if try_checkout(hash_val):
+                    return True
+                if ensure_deep_history() and try_checkout(hash_val):
+                    return True
+                print("    Hash checkout failed, trying alternatives...")
 
             # Try ref (tag or branch)
             if ref:
                 print(f"    Checking out ref {ref}...")
-                try:
-                    subprocess.run(
-                        ["git", "checkout", ref],
-                        cwd=repo_dir,
-                        check=True,
-                        capture_output=True
-                    )
+                if try_checkout(ref):
                     return True
-                except subprocess.CalledProcessError:
-                    print("    Ref checkout failed, trying version tag...")
+                if ensure_deep_history() and try_checkout(ref):
+                    return True
+                print("    Ref checkout failed, trying version tag...")
 
             # Try version as tag
             if version:
@@ -1056,16 +1119,10 @@ class GoModuleFetcher:
 
                 for tag in possible_tags:
                     print(f"    Trying to checkout tag {tag}...")
-                    try:
-                        subprocess.run(
-                            ["git", "checkout", tag],
-                            cwd=repo_dir,
-                            check=True,
-                            capture_output=True
-                        )
+                    if try_checkout(tag):
                         return True
-                    except subprocess.CalledProcessError:
-                        continue
+                    if ensure_deep_history() and try_checkout(tag):
+                        return True
 
             # FALLBACK: Try default branch when specific revisions fail
             print(f"    ⚠️  Could not checkout any specific revision (hash: {hash_val}, ref: {ref}, version: {version})")
