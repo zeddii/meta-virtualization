@@ -2440,15 +2440,18 @@ class GoModuleFetcher:
             print("    ❌ No module information available from go list")
             return
 
-        print(f"    🎯 Processing {len(modules_info)} modules from go list")
+        module_items = list(modules_info.items())
+        total_modules = len(module_items)
+
+        print(f"    🎯 Processing {total_modules} modules from go list")
 
         gomodgit_src_uris = []
 
         # Process each module identified by go list
-        for module_path, module_info in modules_info.items():
+        for index, (module_path, module_info) in enumerate(module_items, start=1):
             version = module_info['Version']
 
-            print(f"\n  📦 Processing module: {module_path} @ {version}")
+            print(f"\n  📦 [{index}/{total_modules}] Processing module: {module_path} @ {version}")
 
             # Skip the main module (the current project)
             if version == "" or version == "v0.0.0":
@@ -2567,17 +2570,20 @@ class GoModuleFetcher:
             print("    ❌ No module information available from go list")
             return
 
-        print(f"    🎯 Processing {len(modules_info)} modules from go list")
+        module_items = list(modules_info.items())
+        total_modules = len(module_items)
+
+        print(f"    🎯 Processing {total_modules} modules from go list")
 
         # Prepare modules list for hybrid approach
         modules_data = []
         failed_modules = []
 
         # Process each module identified by go list
-        for module_path, module_info in modules_info.items():
+        for index, (module_path, module_info) in enumerate(module_items, start=1):
             version = module_info['Version']
 
-            print(f"\n  📦 Processing module: {module_path} @ {version}")
+            print(f"\n  📦 [{index}/{total_modules}] Processing module: {module_path} @ {version}")
 
             download_info = self.get_module_download_info(module_path, version)
             origin = download_info.get('Origin', {}) if download_info else {}
@@ -5061,13 +5067,14 @@ Checked out at: {datetime.datetime.now().isoformat()}
             print(f"    🔧 Processing missing vendor modules with proper SRC_URI generation...")
 
             success_count = 0
-            for module_path in missing_modules:
+            ordered_missing = sorted(missing_modules)
+            for index, module_path in enumerate(ordered_missing, start=1):
                 # Try to get version from vendor analysis (this should have been parsed)
                 version = "unknown"
                 if hasattr(self, 'vendor_module_info') and module_path in self.vendor_module_info:
                     version = self.vendor_module_info[module_path].get('version', 'unknown')
 
-                print(f"      🔄 Processing missing vendor module: {module_path}@{version}")
+                print(f"      🔄 [{index}/{len(ordered_missing)}] Processing missing vendor module: {module_path}@{version}")
 
                 # Try to process this module properly with SRC_URI generation
                 if self.process_module(module_path, version):
