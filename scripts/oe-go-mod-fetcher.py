@@ -32,6 +32,7 @@ class GoModuleFetcher:
     def __init__(self, output_dir: str = "modules", vendor_dir: Optional[str] = None, 
                  generate_oe_files: bool = False, include_indirect: bool = False,
                  vendor_like: bool = False, gomod_cache: Optional[str] = None,
+                 generate_gomodgit: bool = False,
                  git_timeout: int = 120, git_retries: int = 3):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
@@ -53,6 +54,7 @@ class GoModuleFetcher:
             self.repo_cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.generate_oe_files = generate_oe_files
+        self.generate_gomodgit = generate_gomodgit
         self.include_indirect = include_indirect
         self.vendor_like = vendor_like
         self.oe_src_uris = []
@@ -2771,17 +2773,19 @@ class GoModuleFetcher:
             print(f"    ⚡ Expected performance: ~2-3 minutes vs 20+ minutes (10x faster)")
             print(f"    🔧 Integration: Include module_cache_task.inc in your BitBake recipe")
 
-            # Generate go.sum.gomodgit with hybrid-compatible checksums
-            print(f"\n📝 Generating go.sum.gomodgit with hybrid-compatible checksums...")
-            import os
-            original_cwd = os.getcwd()
-            try:
-                # Change to output directory so go.sum.gomodgit is created there
-                os.chdir(output_dir)
-                # Pass the source directory explicitly since the hybrid path uses a different temp structure
-                self.generate_gomodgit_go_sum_for_hybrid(source_dir)
-            finally:
-                os.chdir(original_cwd)
+            if self.generate_gomodgit:
+                # Generate go.sum.gomodgit with hybrid-compatible checksums when requested
+                print(f"\n📝 Generating go.sum.gomodgit with hybrid-compatible checksums...")
+                original_cwd = os.getcwd()
+                try:
+                    # Change to output directory so go.sum.gomodgit is created there
+                    os.chdir(output_dir)
+                    # Pass the source directory explicitly since the hybrid path uses a different temp structure
+                    self.generate_gomodgit_go_sum_for_hybrid(source_dir)
+                finally:
+                    os.chdir(original_cwd)
+            else:
+                print("\n⏭️  Skipping go.sum.gomodgit generation (use --generate-gomodgit to enable)")
 
             if failed_modules:
                 print(f"\n⚠️  {len(failed_modules)} modules could not be processed:")
@@ -3744,16 +3748,25 @@ addtask generate_go_sum after do_create_module_cache before do_compile
 
         # Vendor directory no longer needed for final output (removed vendor tarball approach)
 
-        # Generate corrected go.sum for gomodgit compatibility
-        self.generate_gomodgit_go_sum()
+        # Generate corrected go.sum for gomodgit compatibility when requested
+        if self.generate_gomodgit:
+            self.generate_gomodgit_go_sum()
+        else:
+            print("\n⏭️  Skipping go.sum.gomodgit generation (use --generate-gomodgit to enable)")
 
         print(f"\n✅ OpenEmbedded files generated:")
         print(f"   📄 modules.txt - Copied from 'go mod vendor' output.")
         print(f"   📄 src_uri.inc - Generated with SRC_URI entries for each module.")
         print(f"   📄 relocation.inc - Generated with individual module relocation commands.")
-        print(f"   📄 go.sum.gomodgit - Corrected checksums for gomodgit compatibility.")
+        if self.generate_gomodgit:
+            print(f"   📄 go.sum.gomodgit - Corrected checksums for gomodgit compatibility.")
+        else:
+            print(f"   ⏭️  go.sum.gomodgit not generated (use --generate-gomodgit if needed).")
         print(f"\n💡 Add these files to your recipe with:")
-        print(f"   SRC_URI += \"file://modules.txt file://src_uri.inc file://relocation.inc file://go.sum.gomodgit\"")
+        if self.generate_gomodgit:
+            print(f"   SRC_URI += \"file://modules.txt file://src_uri.inc file://relocation.inc file://go.sum.gomodgit\"")
+        else:
+            print(f"   SRC_URI += \"file://modules.txt file://src_uri.inc file://relocation.inc\"")
 
     def calculate_zip_checksum_using_go(self, zip_path):
         """
@@ -5135,6 +5148,8 @@ Examples:
                        help="Use BitBake's gomodgit:// infrastructure (EXPERIMENTAL)")
     parser.add_argument("--use-hybrid", action="store_true",
                        help="Use hybrid git:// + custom module cache approach for fast parallel downloads")
+    parser.add_argument("--generate-gomodgit", action="store_true",
+                       help="Generate go.sum.gomodgit reference checksums (optional; defaults to off)")
     parser.add_argument("--recipedir", help="Output directory for generated .inc files (default: current directory)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -5195,6 +5210,7 @@ Examples:
             args.include_indirect,
             args.vendor_like,
             args.gomodcache,
+            generate_gomodgit=args.generate_gomodgit,
             git_timeout=args.git_timeout,
             git_retries=args.git_retries
         )
