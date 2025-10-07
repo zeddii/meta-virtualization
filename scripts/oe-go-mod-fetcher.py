@@ -5100,6 +5100,78 @@ Checked out at: {datetime.datetime.now().isoformat()}
             print(f"    ✅ All {len(vendor_modules)} vendor modules already included in oe_modules")
 
 
+def detect_current_git_context() -> Optional[Dict[str, Optional[str]]]:
+    """Return information about the current Git repository, if any."""
+    try:
+        inside = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+
+    if inside.stdout.strip().lower() != "true":
+        return None
+
+    def _run_git_cmd(args: List[str]) -> Optional[str]:
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, check=True)
+            return result.stdout.strip() or None
+        except subprocess.CalledProcessError:
+            return None
+
+    toplevel = _run_git_cmd(["git", "rev-parse", "--show-toplevel"])
+    commit = _run_git_cmd(["git", "rev-parse", "HEAD"])
+    branch = _run_git_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+
+    remote_url = _run_git_cmd(["git", "config", "--get", "remote.origin.url"])
+    if not remote_url:
+        remote_output = _run_git_cmd(["git", "remote", "-v"])
+        if remote_output:
+            seen = {}
+            for line in remote_output.splitlines():
+                parts = line.split()
+                if len(parts) >= 2:
+                    name, url = parts[0], parts[1]
+                    if name not in seen:
+                        seen[name] = url
+            if "origin" in seen:
+                remote_url = seen["origin"]
+            elif seen:
+                remote_url = next(iter(seen.values()))
+
+    return {
+        "toplevel": toplevel,
+        "commit": commit,
+        "branch": branch,
+        "remote": remote_url,
+    }
+
+
+def prompt_yes_no(question: str, default: bool = True) -> bool:
+    """Prompt the user with a yes/no question and return the answer."""
+    if default:
+        prompt = " [Y/n] "
+    else:
+        prompt = " [y/N] "
+
+    while True:
+        try:
+            answer = input(question + prompt).strip().lower()
+        except EOFError:
+            return default
+
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        print("Please respond with 'y' or 'n'.")
+
+
 def main():
     print(f"Go Module Git Fetcher v{VERSION}")
     print("=" * 40)
@@ -5161,7 +5233,46 @@ Examples:
     parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
 
     args = parser.parse_args()
-    
+
+    # Offer to auto-populate Git arguments when running inside a repository
+    if (not args.git_repo or not args.git_ref) and sys.stdin.isatty():
+        context = detect_current_git_context()
+        if context and context.get("commit"):
+            repo_candidate = context.get("remote") or context.get("toplevel")
+            ref_candidate = context.get("commit")
+            missing_repo = not args.git_repo
+            missing_ref = not args.git_ref
+
+            if repo_candidate and (missing_repo or missing_ref):
+                commit_short = ref_candidate[:12] if ref_candidate else None
+                branch = context.get("branch") or "HEAD"
+                print("💡 Detected local Git repository context:")
+                if context.get("toplevel"):
+                    print(f"   Path: {context['toplevel']}")
+                if context.get("remote"):
+                    print(f"   Remote: {context['remote']}")
+                if commit_short:
+                    branch_display = f" ({branch})" if branch and branch != "HEAD" else ""
+                    print(f"   HEAD: {commit_short}{branch_display}")
+
+                print("   Proposed values:")
+                if missing_repo:
+                    print(f"     --git-repo = {repo_candidate}")
+                else:
+                    print(f"     --git-repo = {args.git_repo} (existing)")
+                if missing_ref:
+                    print(f"     --git-ref  = {ref_candidate}")
+                else:
+                    print(f"     --git-ref  = {args.git_ref} (existing)")
+
+                if prompt_yes_no("Use these Git settings?", default=True):
+                    if missing_repo:
+                        args.git_repo = repo_candidate
+                    if missing_ref:
+                        args.git_ref = ref_candidate
+                else:
+                    print("   ↩️  Keeping command-line values unchanged.")
+
     # Set default to vendor-like if nothing specified and generating OpenEmbedded files
     if not args.include_indirect and not args.vendor_like:
         if args.openembedded:
