@@ -54,6 +54,7 @@ This removes the need to copy the repository URL and commit hash into every comm
 - Clear `${S}/pkg/mod/cache/download` in the build tree when switching branches or after script upgrades so new zip-filtering rules take effect.
 - Keep `module_cache_task.inc` and the script in sync; rerun the fetcher whenever you adjust the include manually.
 - Pre-populate the Git cache by cloning modules to `${GOMODCACHE}/repos/<safe-name>` (e.g. `github.com/example/module` → `github.com_example_module`), keeping a normal `.git/` worktree with an `origin` remote so the script can refresh tags and check out commits.
+- The generator now caches finished module archives under `${GOMODCACHE}/cache/download` (or `~/.cache/oe-go-mod-fetcher/downloads` when no gomodcache is provided); reruns will reuse the stored `.zip/.mod` pair as long as the commit hash is unchanged.
 
 ## Integrating with a Recipe
 1. Drop the generated files (`src_uri.inc`, `module_cache_task.inc`, optional `go.sum.gomodgit`) into the recipe directory.

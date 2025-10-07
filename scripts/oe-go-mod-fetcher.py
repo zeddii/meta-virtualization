@@ -4026,6 +4026,37 @@ addtask generate_go_sum after do_create_module_cache before do_compile
             zip_path = download_dir / f"{escaped_version}.zip"
             mod_path = download_dir / f"{escaped_version}.mod"
 
+            # Persistent cache location for generated module artifacts
+            if self.gomod_cache:
+                persistent_base = Path(self.gomod_cache) / "cache" / "download" / escaped_module / "@v"
+            else:
+                persistent_base = Path.home() / ".cache" / "oe-go-mod-fetcher" / "downloads" / escaped_module / "@v"
+            persistent_base.mkdir(parents=True, exist_ok=True)
+
+            persistent_zip = persistent_base / f"{escaped_version}.zip"
+            persistent_mod = persistent_base / f"{escaped_version}.mod"
+            persistent_commit = persistent_base / f"{escaped_version}.commit"
+
+            # Reuse cached artifacts when the commit matches
+            if persistent_zip.exists() and persistent_mod.exists():
+                cached_commit = None
+                if persistent_commit.exists():
+                    try:
+                        cached_commit = persistent_commit.read_text().strip()
+                    except OSError:
+                        cached_commit = None
+                if cached_commit == commit:
+                    print(f"    📦 Using cached module archive for {module_path}@{version}")
+                    if not zip_path.exists():
+                        shutil.copy2(persistent_zip, zip_path)
+                    if not mod_path.exists():
+                        shutil.copy2(persistent_mod, mod_path)
+                    return True
+                elif cached_commit and cached_commit != commit:
+                    display_cached = cached_commit[:8] if len(cached_commit) >= 8 else cached_commit
+                    display_target = commit[:8] if len(commit) >= 8 else commit
+                    print(f"    ♻️  Cached archive for {module_path}@{version} targets {display_cached}, regenerating for {display_target}")
+
             # Use persistent cache directory for repositories
             repo_cache_dir = Path.home() / ".cache" / "oe-go-mod-fetcher" / "repos"
             repo_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -4184,6 +4215,16 @@ addtask generate_go_sum after do_create_module_cache before do_compile
 
             with open(mod_path, 'wb') as f:
                 f.write(mod_content)
+
+            # Persist generated artifacts for future runs
+            try:
+                if zip_path.exists():
+                    shutil.copy2(zip_path, persistent_zip)
+                if mod_path.exists():
+                    shutil.copy2(mod_path, persistent_mod)
+                persistent_commit.write_text(str(commit))
+            except OSError as cache_error:
+                print(f"    ⚠️  Unable to update cache for {module_path}@{version}: {cache_error}")
 
             return True
 
