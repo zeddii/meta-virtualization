@@ -16,7 +16,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from contextlib import ExitStack
+import time
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 
@@ -30,7 +31,8 @@ DIRHASH_HELPER_SOURCE = """package main\n\nimport (\n    \"fmt\"\n    \"os\"\n\n
 class GoModuleFetcher:
     def __init__(self, output_dir: str = "modules", vendor_dir: Optional[str] = None, 
                  generate_oe_files: bool = False, include_indirect: bool = False,
-                 vendor_like: bool = False, gomod_cache: Optional[str] = None):
+                 vendor_like: bool = False, gomod_cache: Optional[str] = None,
+                 git_timeout: int = 120, git_retries: int = 3):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
         
@@ -57,6 +59,9 @@ class GoModuleFetcher:
         self.oe_modules = []
         self.temp_dir = None
         self.dirhash_helper_tempdir = None
+        self.git_timeout = max(1, int(git_timeout))
+        self.git_retries = max(1, int(git_retries))
+        self._last_git_error = None
         
         # Track processed modules to avoid duplicates
         self.processed_modules = set()
@@ -73,6 +78,10 @@ class GoModuleFetcher:
         # Check for rsync availability
         self.has_rsync = self._check_rsync_available()
 
+        # Ensure repo lock directory exists for cross-process coordination
+        self.repo_lock_root = Path.home() / ".cache" / "oe-go-mod-fetcher" / "locks"
+        self.repo_lock_root.mkdir(parents=True, exist_ok=True)
+
     def _check_rsync_available(self) -> bool:
         """Check if rsync is available for faster copying."""
         try:
@@ -80,6 +89,143 @@ class GoModuleFetcher:
             return True
         except (subprocess.CalledProcessError, FileNotFoundError):
             return False
+
+    def _clear_git_index_lock(self, cwd: Optional[Path]) -> None:
+        """Remove a stale git index.lock if present."""
+        if not cwd:
+            return
+
+        try:
+            repo_path = Path(cwd)
+            lock_path = repo_path / ".git" / "index.lock"
+            if lock_path.exists():
+                lock_path.unlink()
+                print(f"    🧹 Removed stale git index.lock at {lock_path}")
+        except Exception as exc:  # pragma: no cover - best effort cleanup
+            print(f"    ⚠️  Could not remove git index.lock: {exc}")
+
+    def _ensure_clean_worktree(self, repo_dir: Path) -> bool:
+        """Reset and clean the repository so checkouts cannot fail."""
+        if not repo_dir or not repo_dir.exists():
+            return True
+
+        commands = [
+            (["git", "reset", "--hard", "HEAD"], "git reset --hard HEAD"),
+            (["git", "clean", "-fdx"], "git clean -fdx"),
+        ]
+
+        for command, description in commands:
+            result = self._run_git_command_with_retry(
+                command,
+                cwd=repo_dir,
+                description=description,
+                retries=1,
+            )
+            if result is None:
+                return False
+        return True
+
+    @contextmanager
+    def _acquire_repo_lock(self, lock_id: str):
+        """Serialize access to a cached repository across processes."""
+        lock_path = self.repo_lock_root / lock_id
+        acquired = False
+        try:
+            while not acquired:
+                try:
+                    lock_path.mkdir()
+                    acquired = True
+                except FileExistsError:
+                    try:
+                        if (time.time() - lock_path.stat().st_mtime) > 900:
+                            lock_path.rmdir()
+                            continue
+                    except FileNotFoundError:
+                        continue
+                    time.sleep(0.2)
+            yield
+        finally:
+            if acquired:
+                try:
+                    lock_path.rmdir()
+                except OSError:
+                    pass
+
+    def _run_git_command_with_retry(
+        self,
+        command: List[str],
+        cwd: Optional[Path] = None,
+        cleanup: Optional[Path] = None,
+        description: Optional[str] = None,
+        timeout: Optional[int] = None,
+        retries: Optional[int] = None,
+    ) -> Optional[subprocess.CompletedProcess]:
+        """Run a git command with timeout handling and automatic retries."""
+
+        attempts = max(1, int(retries) if retries is not None else self.git_retries)
+        timeout_sec = max(1, int(timeout) if timeout is not None else self.git_timeout)
+        self._last_git_error = None
+
+        if description:
+            friendly_desc = description
+        elif command and command[0] == "git":
+            friendly_desc = f"git {' '.join(command[1:])}".strip()
+        else:
+            friendly_desc = " ".join(command)
+
+        cleanup_path = Path(cleanup) if cleanup else None
+        last_error = ""
+
+        for attempt in range(1, attempts + 1):
+            if command and command[0] == "git":
+                self._clear_git_index_lock(cwd)
+            try:
+                result = subprocess.run(
+                    command,
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_sec,
+                )
+                if result.returncode == 0:
+                    return result
+                last_error = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
+                if "index.lock" in last_error:
+                    self._clear_git_index_lock(cwd)
+            except KeyboardInterrupt:
+                if cleanup_path and cleanup_path.exists():
+                    if cleanup_path.is_dir():
+                        shutil.rmtree(cleanup_path, ignore_errors=True)
+                    else:
+                        try:
+                            cleanup_path.unlink()
+                        except FileNotFoundError:
+                            pass
+                raise
+            except subprocess.TimeoutExpired:
+                last_error = f"timed out after {timeout_sec} seconds"
+                self._clear_git_index_lock(cwd)
+            except OSError as exc:
+                last_error = str(exc)
+
+            if cleanup_path and cleanup_path.exists():
+                if cleanup_path.is_dir():
+                    shutil.rmtree(cleanup_path, ignore_errors=True)
+                else:
+                    try:
+                        cleanup_path.unlink()
+                    except FileNotFoundError:
+                        pass
+
+            if attempt < attempts:
+                print(f"    🔁 Retrying {friendly_desc} ({attempt}/{attempts})...")
+                time.sleep(min(5, attempt * 2))
+                # Ensure stale index.lock is cleared before we retry
+                self._clear_git_index_lock(cwd)
+
+        print(f"    ⚠️  {friendly_desc} failed: {last_error}")
+        self._last_git_error = last_error
+        return None
 
     def _go_env(self, extra_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         """Return environment for Go commands with optional overrides."""
@@ -150,24 +296,28 @@ class GoModuleFetcher:
         mod_dest = gopath / "src" / "golang.org" / "x" / "mod"
         mod_dest.parent.mkdir(parents=True, exist_ok=True)
 
-        try:
-            subprocess.run(
-                ["git", "clone", DIRHASH_REPO_URL, str(mod_dest)],
-                check=True,
-                capture_output=True,
-                text=True
-            )
-            subprocess.run(
-                ["git", "checkout", DIRHASH_REPO_COMMIT],
-                cwd=mod_dest,
-                check=True,
-                capture_output=True,
-                text=True
-            )
-        except subprocess.CalledProcessError as exc:
+        clone_result = self._run_git_command_with_retry(
+            ["git", "clone", DIRHASH_REPO_URL, str(mod_dest)],
+            cleanup=mod_dest,
+            description=f"git clone {DIRHASH_REPO_URL}"
+        )
+        if not clone_result:
             raise RuntimeError(
-                f"Unable to prepare golang.org/x/mod sources for dirhash helper: {exc.stderr or exc.stdout}"
-            ) from exc
+                "Unable to prepare golang.org/x/mod sources for dirhash helper: "
+                f"{self._last_git_error or 'git clone failed'}"
+            )
+
+        checkout_result = self._run_git_command_with_retry(
+            ["git", "checkout", DIRHASH_REPO_COMMIT],
+            cwd=mod_dest,
+            description=f"git checkout {DIRHASH_REPO_COMMIT}",
+            retries=1
+        )
+        if not checkout_result:
+            raise RuntimeError(
+                "Unable to prepare golang.org/x/mod sources for dirhash helper: "
+                f"{self._last_git_error or 'git checkout failed'}"
+            )
 
         env = os.environ.copy()
         env.update({
@@ -207,52 +357,55 @@ class GoModuleFetcher:
         repo_dir = self.temp_dir / "source_repo"
         
         try:
+            if repo_dir.exists():
+                shutil.rmtree(repo_dir, ignore_errors=True)
+
             # Clone the repository
             print(f"    Cloning repository...")
             # For commit hashes, we need a full clone to access arbitrary commits
             if len(ref) == 40 and all(c in '0123456789abcdef' for c in ref.lower()):
-                # Full clone for commit hash
-                subprocess.run(
+                clone_result = self._run_git_command_with_retry(
                     ["git", "clone", repo_url, str(repo_dir)],
-                    check=True,
-                    capture_output=True,
-                    text=True
+                    cleanup=repo_dir,
+                    description=f"git clone {repo_url}"
                 )
             else:
                 # Shallow clone for branches/tags
-                subprocess.run(
+                clone_result = self._run_git_command_with_retry(
                     ["git", "clone", "--depth", "1", repo_url, str(repo_dir)],
-                    check=True,
-                    capture_output=True,
-                    text=True
+                    cleanup=repo_dir,
+                    description=f"git clone --depth 1 {repo_url}"
                 )
-            
+
+            if not clone_result:
+                raise RuntimeError(f"Failed to clone repository: {self._last_git_error or 'unknown git error'}")
+
             # Checkout the specific ref
             print(f"    Checking out {ref}...")
-            try:
-                subprocess.run(
-                    ["git", "checkout", ref],
-                    cwd=repo_dir,
-                    check=True,
-                    capture_output=True,
-                    text=True
-                )
-            except subprocess.CalledProcessError:
+            checkout_result = self._run_git_command_with_retry(
+                ["git", "checkout", ref],
+                cwd=repo_dir,
+                description=f"git checkout {ref}",
+                retries=1
+            )
+            if not checkout_result:
                 # If checkout fails, try fetching first
-                subprocess.run(
+                fetch_result = self._run_git_command_with_retry(
                     ["git", "fetch", "origin", ref],
                     cwd=repo_dir,
-                    check=True,
-                    capture_output=True,
-                    text=True
+                    description=f"git fetch origin {ref}",
+                    retries=1
                 )
-                subprocess.run(
+                if not fetch_result:
+                    raise RuntimeError(f"Failed to fetch ref {ref}: {self._last_git_error or 'unknown git error'}")
+                checkout_result = self._run_git_command_with_retry(
                     ["git", "checkout", ref],
                     cwd=repo_dir,
-                    check=True,
-                capture_output=True,
-                text=True
-            )
+                    description=f"git checkout {ref}",
+                    retries=1
+                )
+                if not checkout_result:
+                    raise RuntimeError(f"Failed to checkout ref {ref}: {self._last_git_error or 'unknown git error'}")
             
             # Find the go.mod file
             go_mod_file = repo_dir / go_mod_path
@@ -303,12 +456,8 @@ class GoModuleFetcher:
             
             return str(go_mod_file)
             
-        except subprocess.CalledProcessError as e:
-            if e.stderr:
-                error_msg = e.stderr.decode() if isinstance(e.stderr, bytes) else str(e.stderr)
-                raise RuntimeError(f"Git operation failed: {error_msg}")
-            else:
-                raise RuntimeError(f"Git operation failed: {e}")
+        except RuntimeError:
+            raise
         except Exception as e:
             raise RuntimeError(f"Failed to fetch go.mod from Git repository: {e}")
 
@@ -833,29 +982,33 @@ class GoModuleFetcher:
             repo_dir.parent.mkdir(parents=True, exist_ok=True)
             if (repo_dir / '.git').exists():
                 print("    Updating existing repository...")
-                subprocess.run(
+                if not self._run_git_command_with_retry(
                     ["git", "fetch", "--all", "--tags"],
                     cwd=repo_dir,
-                    check=True,
-                    capture_output=True
-                )
+                    description="git fetch --all --tags"
+                ):
+                    return False
             else:
+                if repo_dir.exists():
+                    print("    Removing incomplete repository checkout before cloning...")
+                    shutil.rmtree(repo_dir, ignore_errors=True)
                 print(f"    Cloning from {repo_url}...")
                 # First try a full clone to ensure we get all refs/tags
-                try:
-                    subprocess.run(
-                        ["git", "clone", repo_url, str(repo_dir)],
-                        check=True,
-                        capture_output=True
-                    )
-                except subprocess.CalledProcessError:
+                clone_result = self._run_git_command_with_retry(
+                    ["git", "clone", repo_url, str(repo_dir)],
+                    cleanup=repo_dir,
+                    description=f"git clone {repo_url}"
+                )
+                if not clone_result:
                     # If full clone fails, fallback to shallow clone
                     print("    Full clone failed, trying shallow clone...")
-                    subprocess.run(
+                    clone_result = self._run_git_command_with_retry(
                         ["git", "clone", "--depth", "1", repo_url, str(repo_dir)],
-                        check=True,
-                        capture_output=True
+                        cleanup=repo_dir,
+                        description=f"git clone --depth 1 {repo_url}"
                     )
+                    if not clone_result:
+                        return False
             return True
             
         except subprocess.CalledProcessError as e:
@@ -3800,29 +3953,84 @@ addtask generate_go_sum after do_create_module_cache before do_compile
             repo_hash = hashlib.md5(repo_url.encode()).hexdigest()[:8]
             safe_repo_name = module_path.replace('/', '_').replace('.', '_')
             repo_dir = repo_cache_dir / f"{safe_repo_name}_{repo_hash}"
+            lock_id = f"{safe_repo_name}_{repo_hash}"
 
-            # Clone repository if not already cached
-            if not repo_dir.exists():
-                print(f"    📥 Cloning {repo_url} (first time)...")
-                result = subprocess.run([
-                    "git", "clone", repo_url, str(repo_dir)
-                ], capture_output=True, text=True, timeout=120)
+            with self._acquire_repo_lock(lock_id):
+                # Remove incomplete caches that lack a .git directory
+                if repo_dir.exists() and not (repo_dir / ".git").exists():
+                    print(f"    ♻️  Removing incomplete repository cache for {module_path}")
+                    shutil.rmtree(repo_dir, ignore_errors=True)
 
-                if result.returncode != 0:
-                    print(f"    ⚠️  Failed to clone {repo_url}: {result.stderr}")
-                    return False
-            else:
-                print(f"    ♻️  Using cached repository for {module_path}")
+                # Clone repository if not already cached
+                if not repo_dir.exists():
+                    print(f"    📥 Cloning {repo_url} (first time)...")
+                    if not self._run_git_command_with_retry(
+                        ["git", "clone", repo_url, str(repo_dir)],
+                        cleanup=repo_dir,
+                        description=f"git clone {repo_url}"
+                    ):
+                        return False
+                else:
+                    print(f"    ♻️  Using cached repository for {module_path}")
+                    if not self._ensure_clean_worktree(repo_dir):
+                        print(f"    ♻️  Repository cache for {module_path} is dirty or locked; re-cloning...")
+                        shutil.rmtree(repo_dir, ignore_errors=True)
+                        if not self._run_git_command_with_retry(
+                            ["git", "clone", repo_url, str(repo_dir)],
+                            cleanup=repo_dir,
+                            description=f"git clone {repo_url}"
+                        ):
+                            return False
 
-            # Checkout specific commit
-            result = subprocess.run(["git", "checkout", commit], cwd=repo_dir, capture_output=True, text=True)
-            if result.returncode != 0:
-                # Try fetching if checkout fails (commit might not be in cache)
-                subprocess.run(["git", "fetch", "--all"], cwd=repo_dir, capture_output=True, text=True)
-                result = subprocess.run(["git", "checkout", commit], cwd=repo_dir, capture_output=True, text=True)
-                if result.returncode != 0:
-                    print(f"    ⚠️  Failed to checkout commit {commit} in {repo_url}")
-                    return False
+                # Checkout specific commit with retries and fetch fallbacks
+                checkout_result = self._run_git_command_with_retry(
+                    ["git", "checkout", "--force", commit],
+                    cwd=repo_dir,
+                    description=f"git checkout {commit}",
+                    retries=1
+                )
+                if not checkout_result:
+                    fallback_commands = [
+                        ["git", "fetch", "--all"],
+                        ["git", "fetch", "origin", commit],
+                        ["git", "fetch", "--tags", "--force"],
+                    ]
+                    for fallback_cmd in fallback_commands:
+                        fetch_result = self._run_git_command_with_retry(
+                            fallback_cmd,
+                            cwd=repo_dir,
+                            description=" ".join(fallback_cmd),
+                            retries=1
+                        )
+                        if not fetch_result:
+                            continue
+                        checkout_result = self._run_git_command_with_retry(
+                            ["git", "checkout", "--force", commit],
+                            cwd=repo_dir,
+                            description=f"git checkout {commit}",
+                            retries=1
+                        )
+                        if checkout_result:
+                            break
+
+                if not checkout_result:
+                    print(f"    ♻️  Re-cloning repository for {module_path} due to persistent checkout failures")
+                    shutil.rmtree(repo_dir, ignore_errors=True)
+                    if not self._run_git_command_with_retry(
+                        ["git", "clone", repo_url, str(repo_dir)],
+                        cleanup=repo_dir,
+                        description=f"git clone {repo_url}"
+                    ):
+                        return False
+                    checkout_result = self._run_git_command_with_retry(
+                        ["git", "checkout", "--force", commit],
+                        cwd=repo_dir,
+                        description=f"git checkout {commit}",
+                        retries=1
+                    )
+                    if not checkout_result:
+                        print(f"    ⚠️  Failed to checkout commit {commit} in {repo_url}")
+                        return False
 
             # Get file list from git repository (EXACT same method as module_cache_task.inc)
             work_path = repo_dir
@@ -4855,6 +5063,10 @@ Examples:
     parser.add_argument("--openembedded", action="store_true", 
                        help="Generate OpenEmbedded files (modules.txt, src_uri.inc, relocation.inc)")
     parser.add_argument("--gomodcache", help="Directory to use for Go module cache (overrides GOMODCACHE)")
+    parser.add_argument("--git-timeout", type=int, default=120,
+                        help="Timeout in seconds for git clone/fetch commands (default: 120)")
+    parser.add_argument("--git-retries", type=int, default=3,
+                        help="Number of attempts for git clone/fetch commands (default: 3)")
     
     scope_group = parser.add_mutually_exclusive_group()
     scope_group.add_argument("--include-indirect", action="store_true", help="Include all transitive dependencies")
@@ -4925,7 +5137,9 @@ Examples:
             args.openembedded,
             args.include_indirect,
             args.vendor_like,
-            args.gomodcache
+            args.gomodcache,
+            git_timeout=args.git_timeout,
+            git_retries=args.git_retries
         )
         fetcher.args = args  # Store args for later use
 
