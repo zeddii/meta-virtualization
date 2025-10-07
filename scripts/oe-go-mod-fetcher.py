@@ -84,6 +84,10 @@ class GoModuleFetcher:
         self.repo_lock_root = Path.home() / ".cache" / "oe-go-mod-fetcher" / "locks"
         self.repo_lock_root.mkdir(parents=True, exist_ok=True)
 
+        # Track repositories where shallow clones missed required commits
+        self.repos_requiring_deep_fetch: Set[str] = set()
+        self.repo_full_history_marker = ".oe-requires-full-history"
+
     def _check_rsync_available(self) -> bool:
         """Check if rsync is available for faster copying."""
         try:
@@ -91,6 +95,52 @@ class GoModuleFetcher:
             return True
         except (subprocess.CalledProcessError, FileNotFoundError):
             return False
+
+    def _normalize_repo_identifier(self, repo_url: Optional[str]) -> str:
+        """Normalize repository URLs so shallow requirements share the same key."""
+        if not repo_url:
+            return ""
+
+        normalized = repo_url.strip().rstrip('/')
+        if normalized.endswith('.git'):
+            normalized = normalized[:-4]
+        return normalized
+
+    def _mark_repo_requires_full_history(self, repo_dir: Optional[Path], repo_key: str) -> None:
+        """Remember that this repository cannot operate with shallow clones."""
+        if not repo_key:
+            return
+
+        if repo_key not in self.repos_requiring_deep_fetch:
+            self.repos_requiring_deep_fetch.add(repo_key)
+
+        if not repo_dir:
+            return
+
+        try:
+            marker_path = Path(repo_dir) / self.repo_full_history_marker
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            marker_path.touch(exist_ok=True)
+        except Exception as exc:  # pragma: no cover - best effort persistence
+            print(f"    ⚠️  Could not persist full-history marker for {repo_dir}: {exc}")
+
+    def _repo_requires_full_history(self, repo_dir: Optional[Path], repo_key: str) -> bool:
+        """Check if the repository needs a full clone (load persisted markers if present)."""
+        if not repo_key:
+            return False
+
+        if repo_key in self.repos_requiring_deep_fetch:
+            return True
+
+        if not repo_dir:
+            return False
+
+        marker_path = Path(repo_dir) / self.repo_full_history_marker
+        if marker_path.exists():
+            self.repos_requiring_deep_fetch.add(repo_key)
+            return True
+
+        return False
 
     def _clear_git_index_lock(self, cwd: Optional[Path]) -> None:
         """Remove a stale git index.lock if present."""
@@ -1017,8 +1067,14 @@ class GoModuleFetcher:
             print(f"    ❌ Git operation failed: {e}")
             return False
 
-    def _deepen_repository(self, repo_dir: Path) -> bool:
-        """Ensure a shallow clone has enough history for the required revision."""
+    def _deepen_repository(self, repo_dir: Path) -> Tuple[bool, bool]:
+        """
+        Ensure a shallow clone has enough history for the required revision.
+
+        Returns (success, was_shallow) so callers can propagate shallow restrictions.
+        """
+        was_shallow = False
+
         try:
             depth_check = subprocess.run(
                 ["git", "rev-parse", "--is-shallow-repository"],
@@ -1028,12 +1084,13 @@ class GoModuleFetcher:
                 check=True,
             )
         except subprocess.CalledProcessError:
-            return False
+            return False, False
 
         if depth_check.stdout.strip().lower() != "true":
             # Already have full history
-            return True
+            return True, False
 
+        was_shallow = True
         print("    Repository is shallow; fetching additional history for required revision...")
 
         # Try to upgrade the shallow clone; fall back to a full fetch if needed
@@ -1051,7 +1108,7 @@ class GoModuleFetcher:
                 description="git fetch --all --tags",
             )
             if not fetch_result:
-                return False
+                return False, True
 
         # Confirm repository is no longer shallow
         try:
@@ -1063,14 +1120,22 @@ class GoModuleFetcher:
                 check=True,
             )
         except subprocess.CalledProcessError:
-            return True
+            # If rev-parse fails after fetching, assume success but preserve shallow flag
+            return True, True
 
-        return depth_check.stdout.strip().lower() != "true"
+        return depth_check.stdout.strip().lower() != "true", True
 
-    def checkout_revision(self, repo_dir: Path, hash_val: str, ref: str, version: str) -> bool:
+    def checkout_revision(self, repo_dir: Path, hash_val: str, ref: str, version: str,
+                          repo_identifier: Optional[str] = None) -> bool:
         """Checkout specific revision in the repository."""
         try:
             deepened_history = False
+            repo_dir = Path(repo_dir)
+            repo_key = self._normalize_repo_identifier(repo_identifier)
+
+            # Load any persisted marker for this repository
+            if repo_key:
+                self._repo_requires_full_history(repo_dir, repo_key)
 
             def try_checkout(target: str) -> bool:
                 try:
@@ -1088,9 +1153,14 @@ class GoModuleFetcher:
                 nonlocal deepened_history
                 if deepened_history:
                     return True
-                deepened_history = self._deepen_repository(repo_dir)
+                deepened_history, was_shallow = self._deepen_repository(repo_dir)
+                if was_shallow and repo_key:
+                    print("    ℹ️  Required commit missing from shallow clone; marking repository as non-shallow")
+                    self._mark_repo_requires_full_history(repo_dir, repo_key)
                 if not deepened_history:
                     print("    ⚠️  Failed to automatically deepen repository history")
+                    if was_shallow and repo_key:
+                        self._mark_repo_requires_full_history(repo_dir, repo_key)
                 return deepened_history
 
             # Try hash first (most reliable)
@@ -2301,9 +2371,18 @@ class GoModuleFetcher:
         # For Go modules, use nobranch=1 for more reliable fetching by commit hash
         # This avoids branch detection issues common with Go module repositories
         src_uri = f'git://{clean_url};protocol=https'
-        src_uri += f';nobranch=1;rev={commit_hash};shallow=1;destsuffix=${{GO_SRCURI_DESTSUFFIX}}/modules/{safe_name}'
+        src_uri += f';nobranch=1;rev={commit_hash}'
 
-        print(f"    📁 Generated SRC_URI with commit {commit_hash[:8]} (nobranch, shallow)")
+        repo_key = self._normalize_repo_identifier(repo_url)
+        requires_full = self._repo_requires_full_history(repo_dir, repo_key)
+
+        if requires_full:
+            print(f"    📁 Generated SRC_URI with commit {commit_hash[:8]} (full history required)")
+        else:
+            src_uri += ';shallow=1'
+            print(f"    📁 Generated SRC_URI with commit {commit_hash[:8]} (nobranch, shallow)")
+
+        src_uri += f';destsuffix=${{GO_SRCURI_DESTSUFFIX}}/modules/{safe_name}'
         return src_uri
 
     def generate_gomodgit_src_uri(self, module_path: str, version: str, repo_url: str, commit_hash: str, subdir: str = None) -> str:
@@ -2335,10 +2414,13 @@ class GoModuleFetcher:
         # Add srcrev parameter
         src_uri += f';srcrev={commit_hash}'
 
-        # Add shallow=1 to force shallow clones (performance optimization)
-        src_uri += ';shallow=1'
-
-        print(f"    ✅ Generated gomodgit entry with embedded SRCREV {commit_hash[:8]} (shallow)")
+        repo_key = self._normalize_repo_identifier(repo_url)
+        if repo_key in self.repos_requiring_deep_fetch:
+            print(f"    ✅ Generated gomodgit entry with embedded SRCREV {commit_hash[:8]} (full history required)")
+        else:
+            # Add shallow=1 to force shallow clones (performance optimization)
+            src_uri += ';shallow=1'
+            print(f"    ✅ Generated gomodgit entry with embedded SRCREV {commit_hash[:8]} (shallow)")
 
         return src_uri
 
@@ -2595,6 +2677,7 @@ class GoModuleFetcher:
                 continue
 
             commit_hash = origin.get('Hash') if origin.get('Hash') else None
+            repo_key = self._normalize_repo_identifier(repo_url)
 
             safe_repo_name = self.safe_module_name(module_path)
             if self.repo_cache_dir:
@@ -2611,110 +2694,33 @@ class GoModuleFetcher:
                     failed_modules.append(module_path)
                     continue
 
-                checkout_success = False
+                if repo_key:
+                    self._repo_requires_full_history(repo_work_dir, repo_key)
 
-                if commit_hash:
-                    try:
-                        subprocess.run(
-                            ["git", "checkout", commit_hash],
-                            cwd=repo_work_dir,
-                            check=True,
-                            capture_output=True
-                        )
-                        checkout_success = True
-                        print(f"    ✅ Using proxy-reported commit {commit_hash[:8]}")
-                    except subprocess.CalledProcessError:
-                        print(f"    ⚠️  Failed to checkout proxy commit {commit_hash[:8]}, recalculating...")
-                        commit_hash = None
+                hash_val = commit_hash if commit_hash else ""
+                ref_val = origin.get('Ref', '') if origin else ''
 
-                # Get commit hash for the specific version when proxy metadata is unavailable
-                if not commit_hash:
-                    import re
-                    pseudo_version_match = re.match(r'v[0-9]+\.[0-9]+\.[0-9]+-[0-9]{14}-([0-9a-f]{12})', version)
+                if not self.checkout_revision(repo_work_dir, hash_val, ref_val, version, repo_url):
+                    failed_modules.append(module_path)
+                    continue
 
-                    if pseudo_version_match:
-                        # This is a pseudo-version - extract the commit hash
-                        short_hash = pseudo_version_match.group(1)
-                        print(f"    🔍 Detected pseudo-version, extracting commit: {short_hash}")
-                        try:
-                            commit_result = subprocess.run([
-                                "git", "rev-parse", short_hash
-                            ], cwd=repo_work_dir, capture_output=True, text=True, check=True)
-                            commit_hash = commit_result.stdout.strip()
-                            print(f"    ✅ Resolved pseudo-version commit to {commit_hash[:8]}")
-                        except subprocess.CalledProcessError:
-                            print(f"    ⚠️  Commit {short_hash} not in local cache, fetching...")
-                            try:
-                                subprocess.run(["git", "fetch", "--all"], cwd=repo_work_dir, capture_output=True, text=True)
-                                commit_result = subprocess.run([
-                                    "git", "rev-parse", short_hash
-                                ], cwd=repo_work_dir, capture_output=True, text=True, check=True)
-                                commit_hash = commit_result.stdout.strip()
-                                print(f"    ✅ Resolved pseudo-version commit to {commit_hash[:8]} (after fetch)")
-                            except subprocess.CalledProcessError:
-                                print(f"    ❌ Could not resolve pseudo-version commit {short_hash}")
-                    else:
-                        try:
-                            commit_result = subprocess.run([
-                                "git", "rev-list", "-n", "1", version
-                            ], cwd=repo_work_dir, capture_output=True, text=True, check=True)
-                            commit_hash = commit_result.stdout.strip()
-                            print(f"    ✅ Found commit {commit_hash[:8]} for tag {version}")
-                        except subprocess.CalledProcessError:
-                            print(f"    ⚠️  Tag {version} not found, trying remote fetch...")
-                            try:
-                                subprocess.run([
-                                    "git", "fetch", "origin", f"refs/tags/{version}:refs/tags/{version}"
-                                ], cwd=repo_work_dir, capture_output=True, text=True, check=True)
-
-                                commit_result = subprocess.run([
-                                    "git", "rev-list", "-n", "1", version
-                                ], cwd=repo_work_dir, capture_output=True, text=True, check=True)
-                                commit_hash = commit_result.stdout.strip()
-                                print(f"    ✅ Found commit {commit_hash[:8]} for tag {version} (after fetch)")
-                            except subprocess.CalledProcessError:
-                                print(f"    ❌ Failed to resolve tag {version} for {module_path}, falling back to HEAD")
-                                try:
-                                    commit_result = subprocess.run([
-                                        "git", "rev-parse", "HEAD"
-                                    ], cwd=repo_work_dir, capture_output=True, text=True, check=True)
-                                    commit_hash = commit_result.stdout.strip()
-                                    print(f"    ⚠️  Using HEAD commit {commit_hash[:8]} as fallback")
-                                except subprocess.CalledProcessError:
-                                    print(f"    ❌ Could not determine any commit hash for {module_path}")
-                                    failed_modules.append(module_path)
-                                    continue
+                commit_hash = self.get_commit_hash_from_repo(repo_work_dir, hash_val, ref_val, version)
 
                 # Ensure the final commit matches the version we're packaging.
                 expected_commit = self.resolve_commit_from_version(repo_work_dir, module_path, version)
-                if expected_commit:
-                    if commit_hash and commit_hash != expected_commit:
-                        print(
-                            f"    🔁 Aligning commit {commit_hash[:8]} to version-derived commit {expected_commit[:8]}"
-                        )
-                        checkout_success = False
-                    elif not commit_hash:
-                        print(f"    ✅ Using version-derived commit {expected_commit[:8]}")
-                    commit_hash = expected_commit
+                if expected_commit and commit_hash != expected_commit:
+                    print(
+                        f"    🔁 Aligning commit {commit_hash[:8] if commit_hash else '????'} to version-derived commit {expected_commit[:8]}"
+                    )
+                    if not self.checkout_revision(repo_work_dir, expected_commit, ref_val, version, repo_url):
+                        failed_modules.append(module_path)
+                        continue
+                    commit_hash = self.get_commit_hash_from_repo(repo_work_dir, expected_commit, ref_val, version)
 
                 if not commit_hash:
                     print(f"    ❌ Could not determine commit hash for {module_path}@{version}")
                     failed_modules.append(module_path)
                     continue
-
-                if not checkout_success:
-                    try:
-                        subprocess.run(
-                            ["git", "checkout", commit_hash],
-                            cwd=repo_work_dir,
-                            check=True,
-                            capture_output=True
-                        )
-                        print(f"    ✅ Checked out commit {commit_hash[:8]}")
-                    except subprocess.CalledProcessError:
-                        print(f"    ❌ Failed to checkout commit {commit_hash[:8]} for {module_path}")
-                        failed_modules.append(module_path)
-                        continue
 
                 # Detect subdir if module is not at repository root
                 subdir = self.detect_module_subdir(module_path, repo_work_dir)
@@ -2724,6 +2730,8 @@ class GoModuleFetcher:
                 failed_modules.append(module_path)
                 continue
 
+            repo_key = self._normalize_repo_identifier(repo_url)
+            requires_full = self._repo_requires_full_history(repo_work_dir, repo_key)
             module_data = {
                 'module': module_path,
                 'version': version,
@@ -2731,6 +2739,15 @@ class GoModuleFetcher:
                 'commit': commit_hash,
                 'subdir': subdir if subdir else ""
             }
+            try:
+                vcs_hash = hashlib.sha256(f"git3:{repo_url}".encode()).hexdigest()
+                module_data['vcs_hash'] = vcs_hash
+                module_data['fetch_name'] = f"git_{vcs_hash[:12]}"
+            except Exception:
+                # Fallback to a sanitized module-based fetch name if hashing fails
+                module_data['fetch_name'] = self.safe_module_name(module_path)
+            if requires_full:
+                module_data['requires_full_history'] = True
             modules_data.append(module_data)
 
             print(f"    ✅ {module_path} @ {version} (commit: {commit_hash[:8]})")
@@ -2766,9 +2783,10 @@ class GoModuleFetcher:
 
             # Generate hybrid solution
             src_uri_entries, cache_builder_task = cache_builder.generate_complete_solution(modules_data)
+            src_uri_entries = self._apply_shallow_overrides(modules_data, src_uri_entries)
 
             # Write src_uri.inc with git:// entries
-            self.write_hybrid_src_uri_inc(src_uri_entries, output_dir)
+            self.write_hybrid_src_uri_inc(src_uri_entries, modules_data, output_dir)
 
             # Write module cache builder task to separate file
             self.write_hybrid_cache_task(cache_builder_task, output_dir)
@@ -2826,7 +2844,7 @@ class GoModuleFetcher:
 
         print(f"    ✅ Generated {len(gomodgit_src_uris)} gomodgit:// entries")
 
-    def write_hybrid_src_uri_inc(self, src_uri_entries: List[str], output_dir: Path = None):
+    def write_hybrid_src_uri_inc(self, src_uri_entries: List[str], modules_data: List[Dict], output_dir: Path = None):
         """Write src_uri.inc with git:// entries for hybrid approach."""
         if output_dir is None:
             output_dir = Path(".")
@@ -2846,6 +2864,22 @@ class GoModuleFetcher:
                     f.write(f"    {src_uri} \\\n")
 
             f.write("\"\n")
+
+            # Emit shallow depth overrides for repositories requiring full history
+            full_history_names: Dict[str, str] = {}
+            for module in modules_data:
+                fetch_name = module.get('fetch_name')
+                if not fetch_name:
+                    continue
+                if module.get('requires_full_history'):
+                    full_history_names.setdefault(fetch_name, module['module'])
+
+            if full_history_names:
+                f.write("\n# Ensure specific repositories perform full-depth clones\n")
+                for name, module_path in sorted(full_history_names.items()):
+                    f.write(f"# {module_path}\n")
+                    f.write(f"BB_GIT_SHALLOW_DEPTH_{name} = \"0\"\n")
+                f.write("\n")
 
         print(f"    ✅ Generated {len(src_uri_entries)} git:// entries (hybrid approach)")
 
@@ -2886,6 +2920,66 @@ class GoModuleFetcher:
 
         print(f"    ✅ Generated module cache builder task")
         print(f"    ✅ Generated do_generate_go_sum task (calculates zip + go.mod Hash1 checksums)")
+
+    def _apply_shallow_overrides(self, modules_data: List[Dict], src_uri_entries: List[str]) -> List[str]:
+        """Remove shallow clone hints for repositories that required deep history."""
+        if not src_uri_entries:
+            return src_uri_entries
+
+        adjusted_entries = []
+        seen_repo_keys: Set[str] = set()
+
+        # Track commit diversity per repository so we can spot repos that can never work with depth=1
+        repo_commit_map: Dict[str, Set[str]] = {}
+        for module in modules_data:
+            repo_key = self._normalize_repo_identifier(module.get('repo_url'))
+            if not repo_key:
+                continue
+            commit = module.get('commit') or ''
+            if not commit:
+                continue
+            repo_commit_map.setdefault(repo_key, set()).add(commit)
+
+        for module, entry in zip(modules_data, src_uri_entries):
+            repo_key = self._normalize_repo_identifier(module.get('repo_url'))
+            requires_full = bool(module.get('requires_full_history'))
+            if not requires_full and repo_key:
+                requires_full = repo_key in self.repos_requiring_deep_fetch
+
+            multi_commit_repo = False
+            if repo_key:
+                commit_set = repo_commit_map.get(repo_key)
+                if commit_set and len(commit_set) > 1:
+                    multi_commit_repo = True
+                    requires_full = True
+
+            fetch_name = module.get('fetch_name')
+            if fetch_name and ';name=' not in entry:
+                entry = entry.replace(';destsuffix=', f';name={fetch_name};destsuffix=')
+                module['fetch_name'] = fetch_name
+
+            if requires_full and ';shallow=1' in entry:
+                # Cleanly remove the shallow flag regardless of position
+                updated_entry = entry.replace(';shallow=1;', ';')
+                if updated_entry.endswith(';shallow=1'):
+                    updated_entry = updated_entry[:-len(';shallow=1')]
+                updated_entry = updated_entry.replace(';shallow=1', '')
+                updated_entry = updated_entry.replace(';;', ';')
+                entry = updated_entry
+
+                if repo_key and repo_key not in seen_repo_keys:
+                    if multi_commit_repo and not module.get('requires_full_history'):
+                        print(f"    ⚠️  {module['module']} needs deep history (multiple commits for repository); removed shallow clone flag")
+                    else:
+                        print(f"    ⚠️  {module['module']} requires deep history; removed shallow clone flag")
+                    seen_repo_keys.add(repo_key)
+
+            if requires_full:
+                module['requires_full_history'] = True
+
+            adjusted_entries.append(entry)
+
+        return adjusted_entries
 
     def generate_do_generate_go_sum_task(self) -> str:
         """Generate the BitBake task code for do_generate_go_sum.
@@ -4589,16 +4683,20 @@ Checked out at: {datetime.datetime.now().isoformat()}
         # Create repository directory
         safe_name = self.safe_module_name(module_path)
         repo_dir = self.output_dir / safe_name
+        repo_key = self._normalize_repo_identifier(repo_url)
 
         # Clone or update repository
         if not self.clone_or_update_repo(repo_url, repo_dir):
             return False
 
+        if repo_key:
+            self._repo_requires_full_history(repo_dir, repo_key)
+
         # Checkout specific revision
         hash_val = origin.get('Hash', '') if origin else ''
         ref = origin.get('Ref', '') if origin else ''
 
-        if not self.checkout_revision(repo_dir, hash_val, ref, version):
+        if not self.checkout_revision(repo_dir, hash_val, ref, version, repo_url):
             return False
 
         # Mark this module as processed
@@ -4632,6 +4730,8 @@ Checked out at: {datetime.datetime.now().isoformat()}
                 'version': version,
                 'safe_name': self.safe_module_name(module_path)
             }
+            if repo_key and self._repo_requires_full_history(repo_dir, repo_key):
+                module_entry['requires_full_history'] = True
 
             src_uri = self.generate_oe_src_uri(module_path, repo_url, repo_dir)
             if src_uri:
@@ -5076,13 +5176,17 @@ Checked out at: {datetime.datetime.now().isoformat()}
             print(f"    ⚠️  Could not determine a commit for {repo_url}; skipping fallback")
             return None
 
-        src_uri = (
-            f"git://{repo_url.replace('https://', '')};protocol=https;"
-            f"nobranch=1;rev={commit_hash};shallow=1;"
-            f"destsuffix=${{GO_SRCURI_DESTSUFFIX}}/modules/{safe_name}"
-        )
+        base_url = repo_url.replace('https://', '').replace('http://', '')
+        src_uri = f"git://{base_url};protocol=https;nobranch=1;rev={commit_hash}"
 
-        print(f"    🔄 Generated fallback SRC_URI for {module_path}: {repo_url}@{commit_hash} (shallow)")
+        repo_key = self._normalize_repo_identifier(repo_url)
+        if repo_key in self.repos_requiring_deep_fetch:
+            print(f"    🔄 Generated fallback SRC_URI for {module_path}: {repo_url}@{commit_hash} (full history required)")
+        else:
+            src_uri += ';shallow=1'
+            print(f"    🔄 Generated fallback SRC_URI for {module_path}: {repo_url}@{commit_hash} (shallow)")
+
+        src_uri += f";destsuffix=${{GO_SRCURI_DESTSUFFIX}}/modules/{safe_name}"
         return src_uri
 
 
