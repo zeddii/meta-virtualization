@@ -4,7 +4,7 @@ HOMEPAGE = "https://k3s.io/"
 LICENSE = "Apache-2.0"
 LIC_FILES_CHKSUM = "file://${S}/src/import/LICENSE;md5=2ee41112a44fe7014dce33e26468ba93"
 
-SRC_URI = "git://github.com/rancher/k3s.git;branch=release-1.32;name=k3s;protocol=https;destsuffix=${GO_SRCURI_DESTSUFFIX} \
+SRC_URI = "git://github.com/rancher/k3s.git;branch=release-1.34;name=k3s;protocol=https;destsuffix=${GO_SRCURI_DESTSUFFIX} \
            file://k3s.service \
            file://k3s-agent.service \
            file://k3s-agent \
@@ -12,14 +12,13 @@ SRC_URI = "git://github.com/rancher/k3s.git;branch=release-1.32;name=k3s;protoco
            file://cni-containerd-net.conf \
            file://0001-Finding-host-local-in-usr-libexec.patch;patchdir=src/import \
            file://k3s-killall.sh \
-           file://modules.txt \
           "
 
 SRC_URI[k3s.md5sum] = "363d3a08dc0b72ba6e6577964f6e94a5"
-SRCREV_k3s = "39f4cbb3367544477e9e678626c0add76e731624"
+SRCREV_k3s = "54f28d21a6208b1f8f9c33e14cf1fc65c2030107"
 
 SRCREV_FORMAT = "k3s_fuse"
-PV = "v1.32.0-rc2+k3s1+git${SRCREV_k3s}"
+PV = "v1.34.1+k3s1+git"
 
 include src_uri.inc
 
@@ -46,35 +45,21 @@ REQUIRED_DISTRO_FEATURES ?= "seccomp"
 
 DEPENDS += "rsync-native"
 
-include relocation.inc
+# Go's PIE builds pull in cgo objects that still require text relocations.
+# Explicitly allow them at link time to avoid ld --fatal-warnings aborting the build.
+GO_EXTRA_LDFLAGS:append = " -Wl,-z,notext"
+
+include module_cache_task.inc
 
 do_compile() {
         export GOPATH="${S}/src/import/.gopath:${S}/src/import/vendor:${STAGING_DIR_TARGET}/${prefix}/local/go"
         export CGO_ENABLED="1"
-        export GOFLAGS="-mod=vendor"
+        # export GOFLAGS="-mod=vendor"
 
         # TAGS="static_build ctrd no_btrfs netcgo osusergo providerless"
 	TAGS="static_build netcgo osusergo providerless"
 
         cd ${S}/src/import
-
-	if ! [ -e vendor/.noclobber ]; then
-            ln -sf vendor.copy vendor
-	else
-	    echo "[INFO]: no clobber on vendor"
-	fi
-
-        # these are bad symlinks, go validates them and breaks the build if they are present
-        rm -f vendor/go.etcd.io/etcd/client/v*/example_*
-        rm -f vendor/go.etcd.io/etcd/client/v*/concurrency/example_*.go
-
-	# Note: if no_brtfs is used in the tags, we'll violate build
-	#       constraints, and the following files need to have them
-	#       removed for the build to continue:
-	#
-	#         vendor/github.com/containerd/containerd/snapshots/btrfs/plugin/*.go
-
-        cp ${UNPACKDIR}/modules.txt vendor/
 
         VERSION_GOLANG="$(go version | cut -d" " -f3)"
         ${GO} build -trimpath -tags "$TAGS" -ldflags "-X github.com/k3s-io/k3s/pkg/version.UpstreamGolang=$VERSION_GOLANG  ${GO_BUILD_LDFLAGS} -w -s" -o ./dist/artifacts/k3s ./cmd/server/main.go
