@@ -3223,9 +3223,20 @@ addtask generate_go_sum after do_create_module_cache before do_compile
         tag_candidates: List[str] = []
         module_parts = module_path.split('/')
         subpath_parts = module_parts[3:] if len(module_parts) > 3 else []
-        if subpath_parts:
-            tag_candidates.append(f"{'/'.join(subpath_parts)}/{version}")
-        tag_candidates.append(version)
+
+        base_versions: List[str] = [version]
+        if '+incompatible' in version:
+            stripped_version = version.split('+', 1)[0]
+            if stripped_version and stripped_version not in base_versions:
+                base_versions.append(stripped_version)
+
+        for base_version in base_versions:
+            if subpath_parts:
+                candidate = f"{'/'.join(subpath_parts)}/{base_version}"
+                if candidate not in tag_candidates:
+                    tag_candidates.append(candidate)
+            if base_version not in tag_candidates:
+                tag_candidates.append(base_version)
 
         for candidate in tag_candidates:
             for attempt in range(2):
