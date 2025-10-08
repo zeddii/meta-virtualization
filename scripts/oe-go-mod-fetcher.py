@@ -17,6 +17,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import textwrap
+from collections import OrderedDict
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
@@ -26,6 +28,552 @@ VERSION = "2.3.15"
 DIRHASH_REPO_URL = "https://go.googlesource.com/mod"
 DIRHASH_REPO_COMMIT = "f8a9fe217cff893cb67f4acad96a0021c13ee6e7"
 DIRHASH_HELPER_SOURCE = """package main\n\nimport (\n    \"fmt\"\n    \"os\"\n\n    \"golang.org/x/mod/sumdb/dirhash\"\n)\n\nfunc main() {\n    if len(os.Args) != 2 {\n        fmt.Fprintf(os.Stderr, \"Usage: %s <zip-file>\\n\", os.Args[0])\n        os.Exit(1)\n    }\n\n    zipPath := os.Args[1]\n    hash, err := dirhash.HashZip(zipPath, dirhash.DefaultHash)\n    if err != nil {\n        fmt.Fprintf(os.Stderr, \"Error: %v\\n\", err)\n        os.Exit(1)\n    }\n\n    fmt.Println(hash)\n}\n"""
+
+MODULE_CACHE_TASK_HEADER = textwrap.dedent('''\
+python do_create_module_cache() {
+    """
+    Build Go module cache from downloaded git repositories.
+    Fast parallel processing replaces BitBake's slow sequential gomodgit.
+    """
+    import hashlib
+    import os
+    import subprocess
+    import zipfile
+    import threading
+    import re
+    from pathlib import Path
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def create_vcs_info_file(vcs_path, repo_url):
+        """Create .info file for VCS cache entry"""
+        vcs_key = f"git3:{repo_url}"
+        with open(f"{vcs_path}.info", 'wb') as f:
+            f.write(vcs_key.encode())
+
+    def create_module_zip(module_path, version, vcs_path, subdir=None, alias_of=None):
+        """Create module zip file from git repository"""
+        # Calculate paths
+        # Use correct escaping function that matches BitBake's gomod.py
+        def escape_module_path(path):
+            """Escape capital letters using exclamation points (same as BitBake gomod.py)"""
+            import re
+            return re.sub(r'([A-Z])', lambda m: '!' + m.group(1).lower(), path)
+
+        def sanitize_module_name(name):
+            if not name:
+                return name
+            stripped = name.strip()
+            if len(stripped) >= 2 and stripped[0] == '"' and stripped[-1] == '"':
+                return stripped[1:-1]
+            return stripped
+
+        module_path = sanitize_module_name(module_path)
+        alias_of = sanitize_module_name(alias_of) if alias_of else None
+
+        escaped_module = escape_module_path(module_path)
+        escaped_version = escape_module_path(version)
+
+        alias_module = module_path
+        rewrite_to_alias = bool(alias_of)
+
+        download_dir = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_module / "@v"
+        download_dir.mkdir(parents=True, exist_ok=True)
+
+        zip_path = download_dir / f"{escaped_version}.zip"
+        mod_path = download_dir / f"{escaped_version}.mod"
+
+        module_decl_pattern = re.compile(r'(?m)^(module\s+)(\S+)(\s*)')
+
+        def rewrite_module_directive(text, new_module):
+            cleaned_module = sanitize_module_name(new_module)
+            def replacer(match):
+                existing = match.group(2)
+                if existing.startswith('"') and existing.endswith('"'):
+                    return f"{match.group(1)}{cleaned_module}{match.group(3)}"
+                return f"{match.group(1)}{cleaned_module}{match.group(3)}"
+
+            new_text, count = module_decl_pattern.subn(replacer, text, count=1)
+            return new_text if count else None
+
+        # Get file list from git repository
+        work_path = Path(vcs_path)
+        if subdir:
+            work_path = work_path / subdir
+
+        cmd = ["git", "ls-tree", "-r", "--name-only", "HEAD"]
+        if subdir:
+            cmd.append(subdir)
+
+        try:
+            files = subprocess.check_output(cmd, cwd=vcs_path, text=True).strip().split('\\n')
+            files = [f for f in files if f.strip()]
+        except subprocess.CalledProcessError:
+            bb.warn(f"Could not list files for {module_path}@{version}")
+            return
+
+        # Create module zip file
+        try:
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                module_prefix = f"{module_path}@{version}/"
+                expected_go_mod = f"{subdir}/go.mod" if subdir else "go.mod"
+
+                excluded_prefixes = []
+                for file_path in files:
+                    if file_path.endswith('go.mod') and file_path != expected_go_mod:
+                        dir_path = os.path.dirname(file_path)
+                        if dir_path:
+                            excluded_prefixes.append(f"{dir_path}/")
+
+                for file_path in files:
+                    if subdir and not file_path.startswith(subdir):
+                        continue
+                    if any(file_path.startswith(excluded_prefix) for excluded_prefix in excluded_prefixes):
+                        continue
+                    if file_path.endswith('go.mod') and file_path != expected_go_mod:
+                        continue
+                    try:
+                        content = subprocess.check_output(
+                            ["git", "cat-file", "blob", f"HEAD:{file_path}"],
+                            cwd=vcs_path
+                        )
+                        if rewrite_to_alias and file_path == expected_go_mod:
+                            try:
+                                content_text = content.decode()
+                                rewritten = rewrite_module_directive(content_text, alias_module)
+                                if rewritten is None:
+                                    rewritten = f"module {sanitize_module_name(alias_module)}\\n"
+                                content = rewritten.encode()
+                            except Exception:
+                                content = f"module {sanitize_module_name(alias_module)}\\n".encode()
+                        archive_path = module_prefix + (file_path[len(subdir)+1:] if subdir else file_path)
+                        zf.writestr(archive_path, content)
+                    except subprocess.CalledProcessError:
+                        continue
+
+            bb.note(f"Created {zip_path}")
+        except Exception as e:
+            bb.warn(f"Failed to create zip for {module_path}@{version}: {e}")
+
+        # Create go.mod file
+        # For +incompatible versions, ALWAYS create minimal synthetic .mod (like proxy.golang.org)
+        # This is CRITICAL for checksum matching!
+        try:
+            if '+incompatible' in version:
+                # Synthetic minimal .mod for pre-module versions
+                mod_content = f"module {alias_module}\\n".encode()
+                bb.note(f"Creating synthetic .mod for +incompatible version: {module_path}")
+            else:
+                # For proper module versions, use repository's go.mod
+                mod_file = "go.mod"
+                if subdir:
+                    mod_file = f"{subdir}/go.mod"
+
+                try:
+                    mod_content = subprocess.check_output(
+                        ["git", "cat-file", "blob", f"HEAD:{mod_file}"],
+                        cwd=vcs_path
+                    )
+                    if rewrite_to_alias:
+                        try:
+                            mod_text = mod_content.decode()
+                            rewritten = rewrite_module_directive(mod_text, alias_module)
+                            if rewritten is None:
+                                rewritten = f"module {sanitize_module_name(alias_module)}\\n"
+                            mod_content = rewritten.encode()
+                        except Exception:
+                            mod_content = f"module {sanitize_module_name(alias_module)}\\n".encode()
+                except subprocess.CalledProcessError:
+                    # Synthesize go.mod if not found
+                    mod_content = f"module {sanitize_module_name(alias_module)}\\n".encode()
+
+            with open(mod_path, 'wb') as f:
+                f.write(mod_content)
+
+            bb.note(f"Created {mod_path}")
+        except Exception as e:
+            bb.warn(f"Failed to create mod file for {module_path}@{version}: {e}")
+
+    # Module list with repository information
+    modules_data = [
+''')
+
+MODULE_CACHE_TASK_FOOTER = textwrap.dedent('''\
+    ]
+
+    s = d.getVar('S')
+    workdir = d.getVar('WORKDIR')
+
+    repo_locks = {}
+    repo_locks_lock = threading.Lock()
+
+    def acquire_repo_lock(path):
+        key = str(path)
+        with repo_locks_lock:
+            lock = repo_locks.get(key)
+            if not lock:
+                lock = threading.Lock()
+                repo_locks[key] = lock
+            return lock
+
+    # Process modules in parallel
+    def process_module(module_data):
+        module_path = module_data['module']
+        version = module_data['version']
+        repo_url = module_data['repo_url']
+        commit = module_data['commit']
+        subdir = module_data.get('subdir')
+
+        # Calculate VCS cache path
+        vcs_key = f"git3:{repo_url}"
+        vcs_hash = hashlib.sha256(vcs_key.encode()).hexdigest()
+        # VCS cache is downloaded to ${WORKDIR}/sources/vcs_cache/ by git:// fetcher
+        workdir = d.getVar('WORKDIR')
+        vcs_cache_path = Path(workdir) / "sources" / "vcs_cache" / vcs_hash
+
+        # VCS cache should already exist from git:// download
+        if vcs_cache_path.exists():
+            lock = acquire_repo_lock(vcs_cache_path)
+            with lock:
+                bb.note(f"Processing {module_path}@{version}")
+                create_vcs_info_file(str(vcs_cache_path), repo_url)
+                try:
+                    subprocess.run(["git", "checkout", commit], cwd=vcs_cache_path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                except subprocess.CalledProcessError:
+                    subprocess.run(["git", "fetch", "--all"], cwd=vcs_cache_path, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    subprocess.run(["git", "checkout", commit], cwd=vcs_cache_path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                alias_of = module_data.get('alias_of')
+                create_module_zip(module_path, version, str(vcs_cache_path), subdir, alias_of)
+
+                # Extract module to pkg/mod for offline Go builds
+                # The zip contains paths like "gopkg.in/yaml.v3@v3.0.4/..." so extract to pkg/mod directly
+                try:
+                    import zipfile
+                    import os
+                    def escape_module_path_local(path):
+                        import re
+                        return re.sub(r'([A-Z])', lambda m: '!' + m.group(1).lower(), path)
+
+                    escaped_module = escape_module_path_local(module_path)
+                    escaped_version = escape_module_path_local(version)
+
+                    zip_path = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_module / "@v" / f"{escaped_version}.zip"
+                    extract_dir = Path(d.getVar('S')) / "pkg" / "mod"
+
+                    # Handle version aliases (e.g., v3.0.1 pointing to v3.0.4)
+                    is_version_alias = module_data.get('is_version_alias', False)
+                    if is_version_alias:
+                        # This is a version alias - create symlink and copy cache files
+                        orig_ver = module_data.get('original_version')
+                        if orig_ver:
+                            # Create symlink in pkg/mod: yaml.v3@v3.0.1 -> yaml.v3@v3.0.4
+                            orig_dir = extract_dir / f"{module_path}@{orig_ver}"
+                            alias_dir = extract_dir / f"{module_path}@{version}"
+                            if orig_dir.exists() and not alias_dir.exists():
+                                os.symlink(f"{module_path}@{orig_ver}", alias_dir)
+                                bb.note(f"Created symlink {module_path}@{version} -> @{orig_ver}")
+
+                            # Copy cache files (.mod, .zip) for the alias version
+                            import shutil
+                            download_dir = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_module / "@v"
+                            orig_escaped_ver = escape_module_path_local(orig_ver)
+                            for ext in ['.mod', '.zip']:
+                                src = download_dir / f"{orig_escaped_ver}{ext}"
+                                dst = download_dir / f"{escaped_version}{ext}"
+                                if src.exists() and not dst.exists():
+                                    shutil.copy2(src, dst)
+                                    bb.note(f"Copied cache file {escaped_version}{ext}")
+                    elif zip_path.exists():
+                        # Normal extraction for non-alias modules
+                        extract_dir.mkdir(parents=True, exist_ok=True)
+                        with zipfile.ZipFile(zip_path, 'r') as zf:
+                            zf.extractall(extract_dir)
+                        bb.note(f"Extracted {module_path}@{version} to pkg/mod")
+                except Exception as e:
+                    bb.debug(1, f"Module extraction skipped for {module_path}: {e}")
+        else:
+            bb.warn(f"VCS cache missing for {module_path}: {vcs_cache_path}")
+
+    # Use ThreadPoolExecutor for parallel processing
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(process_module, module) for module in modules_data]
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                bb.warn(f"Module processing failed: {e}")
+
+    # Post-process to find version mismatches from transitive dependencies
+    # Use go.sum data to find what versions are needed, create symlinks for missing versions
+    bb.note("Checking for version mismatches using go.sum data...")
+
+    import re
+    import os
+    def escape_module_path_post(path):
+        return re.sub(r'([A-Z])', lambda m: '!' + m.group(1).lower(), path)
+
+    def canonicalize_module_path(module_path):
+        """Normalize alternate module paths to canonical form (e.g., go.yaml.in -> gopkg.in)"""
+        match = re.match(r'^go\.([^\.]+)\.in/(.+)$', module_path)
+        if match:
+            name, rest = match.groups()
+            parts = rest.split('/')
+            if len(parts) >= 2:
+                module_name = parts[0] or name
+                version = parts[1]
+                remainder = '/'.join(parts[2:])
+                canonical = f"gopkg.in/{module_name}.{version}"
+                if remainder:
+                    canonical = f"{canonical}/{remainder}"
+                return canonical
+            return f"gopkg.in/{name}.{rest}"
+        return module_path
+
+    # Track what versions we have extracted
+    # Map canonical path -> {actual_path: versions}
+    extracted_modules = {}  # canonical_path -> set of versions
+    actual_paths = {}  # canonical_path -> actual_extracted_path
+    pkg_mod_dir = Path(d.getVar('S')) / "pkg" / "mod"
+
+    # Scan extracted modules to see what we have
+    if pkg_mod_dir.exists():
+        for item in pkg_mod_dir.iterdir():
+            if item.is_dir() and '@' not in str(item.name):
+                # This is a module directory (e.g., "gopkg.in", "github.com", "go.yaml.in")
+                for subitem in item.rglob("*"):
+                    if subitem.is_dir() and '@' in subitem.name:
+                        # Found a versioned module (e.g., "yaml.v3@v3.0.4" or "go.yaml.in/yaml/v3@v3.0.4")
+                        rel_path = subitem.relative_to(pkg_mod_dir)
+                        parts = str(rel_path).rsplit('@', 1)
+                        if len(parts) == 2:
+                            actual_mod_path = parts[0]
+                            version = parts[1]
+
+                            # Track by canonical path so go.sum lookups work
+                            canonical_path = canonicalize_module_path(actual_mod_path)
+                            extracted_modules.setdefault(canonical_path, set()).add(version)
+
+                            # Remember the actual extracted path for creating symlinks
+                            if canonical_path not in actual_paths:
+                                actual_paths[canonical_path] = actual_mod_path
+
+    # Find mismatches: versions in go.sum but not extracted
+    missing_versions = []
+    for mod_path, req_versions in go_sum_requirements.items():
+        extracted = extracted_modules.get(mod_path, set())
+        for req_ver in req_versions:
+            if req_ver not in extracted:
+                # Find a version we DO have for this module
+                if extracted:
+                    base_ver = sorted(extracted)[-1]  # Use highest version
+                    actual_path = actual_paths.get(mod_path, mod_path)
+                    missing_versions.append((mod_path, actual_path, req_ver, base_ver))
+                else:
+                    bb.debug(1, f"go.sum requires {mod_path}@{req_ver} but no version extracted")
+
+    # Create symlinks and cache files for missing versions
+    if missing_versions:
+        bb.note(f"Found {len(missing_versions)} version mismatches from transitive dependencies")
+        for canonical_path, actual_path, missing_ver, base_ver in missing_versions:
+            try:
+                # Create symlink using actual extracted path (e.g., go.yaml.in/yaml/v3)
+                # module@missing_ver -> module@base_ver
+                base_dir = pkg_mod_dir / f"{actual_path}@{base_ver}"
+                missing_dir = pkg_mod_dir / f"{actual_path}@{missing_ver}"
+                if base_dir.exists() and not missing_dir.exists():
+                    os.symlink(f"{actual_path}@{base_ver}", missing_dir)
+                    bb.note(f"Created symlink: {actual_path}@{missing_ver} -> @{base_ver}")
+
+                # Also create at canonical path if different (e.g., gopkg.in/yaml.v3)
+                if canonical_path != actual_path:
+                    canonical_base = pkg_mod_dir / f"{canonical_path}@{base_ver}"
+                    canonical_missing = pkg_mod_dir / f"{canonical_path}@{missing_ver}"
+                    if base_dir.exists() and not canonical_missing.exists():
+                        # Link to actual extracted location
+                        canonical_missing.parent.mkdir(parents=True, exist_ok=True)
+                        os.symlink(f"../{actual_path}@{base_ver}", canonical_missing)
+                        bb.note(f"Created canonical symlink: {canonical_path}@{missing_ver} -> {actual_path}@{base_ver}")
+
+                # Create cache files with canonical module path by rewriting zips
+                escaped_actual = escape_module_path_post(actual_path)
+                escaped_canonical = escape_module_path_post(canonical_path)
+                escaped_missing = escape_module_path_post(missing_ver)
+                escaped_base = escape_module_path_post(base_ver)
+
+                # Source cache files are at actual_path location
+                src_cache_dir = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_actual / "@v"
+                # Destination cache files need to be at canonical_path location
+                dst_cache_dir = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_canonical / "@v"
+
+                if src_cache_dir.exists():
+                    dst_cache_dir.mkdir(parents=True, exist_ok=True)
+                    import shutil
+                    import zipfile
+                    import tempfile
+
+                    # Copy .mod file with rewritten module path
+                    src_mod = src_cache_dir / f"{escaped_base}.mod"
+                    dst_mod = dst_cache_dir / f"{escaped_missing}.mod"
+                    if src_mod.exists() and not dst_mod.exists():
+                        mod_content = src_mod.read_text()
+                        # Rewrite module directive to use canonical path using a replacement function
+                        import re
+                        def replace_module(match):
+                            return match.group(1) + canonical_path + match.group(3)
+
+                        mod_content = re.sub(
+                            r'^(module\s+)(' + re.escape(actual_path) + r')(\s*)',
+                            replace_module,
+                            mod_content,
+                            count=1,
+                            flags=re.MULTILINE
+                        )
+                        dst_mod.write_text(mod_content)
+                        bb.note(f"Created cache file: {canonical_path}@{missing_ver}.mod (rewritten)")
+
+                    # Create .zip file with canonical module paths
+                    src_zip = src_cache_dir / f"{escaped_base}.zip"
+                    dst_zip = dst_cache_dir / f"{escaped_missing}.zip"
+                    if src_zip.exists() and not dst_zip.exists():
+                        with tempfile.TemporaryDirectory() as tmpdir:
+                            tmppath = Path(tmpdir)
+                            # Extract source zip
+                            with zipfile.ZipFile(src_zip, 'r') as zf:
+                                zf.extractall(tmppath)
+
+                            # Find and rewrite go.mod
+                            for gomod in tmppath.rglob("go.mod"):
+                                content = gomod.read_text()
+                                def replace_in_zip(match):
+                                    return match.group(1) + canonical_path + match.group(3)
+
+                                content = re.sub(
+                                    r'^(module\s+)(' + re.escape(actual_path) + r')(\s*)',
+                                    replace_in_zip,
+                                    content,
+                                    count=1,
+                                    flags=re.MULTILINE
+                                )
+                                gomod.write_text(content)
+
+                            # Rename directory to use canonical path
+                            old_dir = tmppath / f"{actual_path}@{base_ver}"
+                            new_dir = tmppath / f"{canonical_path}@{missing_ver}"
+                            if old_dir.exists():
+                                new_dir.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.move(str(old_dir), str(new_dir))
+
+                            # Create new zip with canonical path
+                            with zipfile.ZipFile(dst_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
+                                for file in new_dir.rglob("*"):
+                                    if file.is_file():
+                                        arcname = str(file.relative_to(tmppath))
+                                        zf.write(file, arcname)
+
+                        bb.note(f"Created cache file: {canonical_path}@{missing_ver}.zip (rewritten)")
+            except Exception as e:
+                bb.debug(1, f"Could not create version alias for {canonical_path}@{missing_ver}: {e}")
+
+    bb.note("Module cache creation complete")
+}
+
+# Add task after do_unpack (when git repositories are available)
+addtask create_module_cache after do_unpack before do_configure
+''')
+
+
+class HybridModuleCacheBuilder:
+    """Generate hybrid git:// SRC_URI entries and module cache task code."""
+
+    def __init__(self, module_cache_dir: str, workdir: str, max_workers: int = 8):
+        self.module_cache_dir = Path(module_cache_dir)
+        self.workdir = Path(workdir)
+        self.max_workers = max_workers
+
+    def generate_complete_solution(self, modules_data: List[Dict], go_sum_requirements: Dict[str, Set[str]] = None) -> Tuple[List[str], str]:
+        """Return (src_uri_entries, module_cache_task_code)."""
+        src_uri_entries = self._generate_src_uri_entries(modules_data)
+        cache_task_code = self._render_module_cache_task(modules_data, go_sum_requirements)
+        return src_uri_entries, cache_task_code
+
+    def _generate_src_uri_entries(self, modules_data: List[Dict]) -> List[str]:
+        entries: "OrderedDict[Tuple[str, str], str]" = OrderedDict()
+
+        for module in modules_data:
+            if module.get('alias_of') or module.get('is_alias'):
+                continue
+            repo_url = module['repo_url']
+            commit = module['commit']
+            vcs_hash = hashlib.sha256(f"git3:{repo_url}".encode()).hexdigest()
+            fetch_name = module.get('fetch_name') or f"git_{vcs_hash[:12]}"
+            module['fetch_name'] = fetch_name
+            module['vcs_hash'] = vcs_hash
+
+            key = (repo_url, commit)
+            if key in entries:
+                continue
+
+            git_url = self._to_git_src_uri(repo_url)
+            entry = (
+                f"{git_url};protocol=https;nobranch=1;rev={commit};shallow=1;"
+                f"name={fetch_name};destsuffix=vcs_cache/{vcs_hash}"
+            )
+            entries[key] = entry
+
+        return list(entries.values())
+
+    def _to_git_src_uri(self, repo_url: str) -> str:
+        if repo_url.startswith('git://'):
+            return repo_url
+        if repo_url.startswith('https://'):
+            return 'git://' + repo_url[len('https://'):]
+        if repo_url.startswith('http://'):
+            return 'git://' + repo_url[len('http://'):]
+        return repo_url
+
+    def _render_module_cache_task(self, modules_data: List[Dict], go_sum_requirements: Dict[str, Set[str]] = None) -> str:
+        def escape(value: str) -> str:
+            return value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+
+        lines: List[str] = []
+        for index, module in enumerate(modules_data):
+            fields = [
+                f'"module": "{escape(module["module"])}"',
+                f'"version": "{escape(module["version"])}"',
+                f'"repo_url": "{escape(module["repo_url"])}"',
+                f'"commit": "{escape(module["commit"])}"',
+                f'"subdir": "{escape(module.get("subdir") or "")}"'
+            ]
+
+            if module.get('alias_of'):
+                fields.append(f'"alias_of": "{escape(module["alias_of"])}"')
+
+            entry = '        ({' + ', '.join(fields) + '})'
+            if index < len(modules_data) - 1:
+                entry += ','
+            lines.append(entry)
+
+        modules_block = "\n".join(lines)
+        if modules_block:
+            modules_block += "\n"
+
+        # Embed go.sum requirements as Python dict literal (inserted after list closes)
+        go_sum_block = ""
+        if go_sum_requirements:
+            go_sum_lines = []
+            for mod_path, versions in sorted(go_sum_requirements.items()):
+                versions_str = ', '.join(f'"{v}"' for v in sorted(versions))
+                go_sum_lines.append(f'        "{escape(mod_path)}": {{{versions_str}}}')
+            go_sum_block = "\n    # Version requirements from go.sum (for post-processing)\n"
+            go_sum_block += "    go_sum_requirements = {\n"
+            go_sum_block += ",\n".join(go_sum_lines)
+            go_sum_block += "\n    }\n"
+        else:
+            go_sum_block = "\n    # No go.sum data available\n    go_sum_requirements = {}\n"
+
+        # Build task: header + modules list + close list (footer) + go_sum dict + rest of task
+        # We need to split FOOTER to insert go_sum_block after the list closes
+        footer_lines = MODULE_CACHE_TASK_FOOTER.split('\n', 1)  # Split at first newline (the "]")
+        return MODULE_CACHE_TASK_HEADER + modules_block + footer_lines[0] + '\n' + go_sum_block + '\n' + footer_lines[1]
 
 
 class GoModuleFetcher:
@@ -613,11 +1161,12 @@ class GoModuleFetcher:
                     cwd=source_dir, env=env, text=True, timeout=30
                 )
                 go_mod = json.loads(go_mod_output)
-                module_path = go_mod['Module']['Path']
-                print(f"    🎯 Module path: {module_path}")
+                main_module_path = go_mod['Module']['Path']
+                main_module_path = self.canonicalize_module_path(main_module_path)
+                print(f"    🎯 Module path: {main_module_path}")
 
                 # Step 2: Use exact oe-core command (line 55 in go-mod-update-modules.bbclass)
-                go_list_target = f"{module_path}/..."
+                go_list_target = f"{main_module_path}/..."
                 print(f"    📦 Running go list with target: {go_list_target}")
                 print(f"    📁 Using GOMODCACHE: {mod_cache_dir}")
 
@@ -643,13 +1192,33 @@ class GoModuleFetcher:
 
                     module_info = pkg['Module']
                     module_path = module_info['Path']
+                    module_path = self.canonicalize_module_path(module_path)
+                    module_version = module_info.get('Version', 'v0.0.0')
+
+                    replace_info = module_info.get('Replace')
+                    if replace_info:
+                        # Ignore modules replaced by local directories (vendored via relative paths)
+                        if replace_info.get('Dir'):
+                            continue
+
+                        # Follow remote replacements so we package the actual module source
+                        module_path = replace_info.get('Path', module_path)
+                        module_version = replace_info.get('Version', module_version)
+
+                    module_path = self.canonicalize_module_path(module_path)
 
                     if module_path not in modules_info:
                         modules_info[module_path] = {
-                            'Version': module_info.get('Version', 'v0.0.0'),
-                            'Dir': module_info.get('Dir', ''),
-                            'Module': module_info
-                        }
+                                'Version': module_version,
+                                'Dir': module_info.get('Dir', ''),
+                                'Module': module_info
+                            }
+
+                if len(modules_info) <= 1:
+                    print("    ❌ Error: 'go list -deps' only returned the main module.")
+                    print("       Go is likely operating in vendor mode or missing module metadata.")
+                    print("       Check 'go env GOPROXY GOSUMDB GOFLAGS' and ensure Go can reach the proxy.")
+                    raise RuntimeError("go list -deps returned only the main module")
 
                 print(f"    🎯 Identified {len(modules_info)} unique modules")
                 return modules_info
@@ -1019,10 +1588,119 @@ class GoModuleFetcher:
             # golang.org/x packages are hosted on go.googlesource.com
             package_name = module_path.replace('golang.org/x/', '')
             return f"https://go.googlesource.com/{package_name}"
+        elif module_path.startswith('gopkg.in/'):
+            suffix = module_path[len('gopkg.in/'):]
+            parts = suffix.split('/')
+
+            def strip_version(segment: str) -> str:
+                return re.sub(r'\.v\d+$', '', segment)
+
+            if len(parts) == 1:
+                repo = strip_version(parts[0])
+                owner = f"go-{repo}"
+            else:
+                owner = parts[0]
+                repo = strip_version(parts[1])
+
+            return f"https://github.com/{owner}/{repo}"
         # Note: This is a fallback. The primary method uses 'go mod download' to get actual repository URLs.
 
         # If we can't derive it, return None
         return None
+
+    @staticmethod
+    def canonicalize_module_path(module_path: str) -> str:
+        """Normalize alternate module paths to their canonical form."""
+        match = re.match(r'^go\.([^\.]+)\.in/(.+)$', module_path)
+        if match:
+            name, rest = match.groups()
+            parts = rest.split('/')
+            if len(parts) >= 2:
+                module_name = parts[0] or name
+                version = parts[1]
+                remainder = '/'.join(parts[2:])
+                canonical = f"gopkg.in/{module_name}.{version}"
+                if remainder:
+                    canonical = f"{canonical}/{remainder}"
+                return canonical
+            return f"gopkg.in/{name}.{rest}"
+        return module_path
+
+    def _collect_modules_from_go_sum(self, go_sum_path: Path) -> List[Tuple[str, str, Optional[str]]]:
+        """
+        Parse go.sum and return (canonical_path, version, alias_path) tuples.
+        This finds ALL module versions including deep transitive dependencies.
+        """
+        results: List[Tuple[str, str, Optional[str]]] = []
+        seen: Set[Tuple[str, str]] = set()
+
+        try:
+            with open(go_sum_path, 'r') as f:
+                for raw_line in f:
+                    line = raw_line.strip()
+                    if not line or line.startswith('//'):
+                        continue
+
+                    parts = line.split()
+                    if len(parts) < 2:
+                        continue
+
+                    module_path, version = parts[0], parts[1]
+
+                    # go.sum has both "module v1.0.0" and "module v1.0.0/go.mod" entries
+                    if module_path.endswith('/go.mod'):
+                        module_path = module_path[:-7]
+
+                    canonical_path = self.canonicalize_module_path(module_path)
+
+                    # Skip standard library placeholders or synthetic package identifiers
+                    if canonical_path.startswith('std') or canonical_path in ('command-line-arguments',):
+                        continue
+
+                    key = (canonical_path, version)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    alias_path = module_path if module_path != canonical_path else None
+                    results.append((canonical_path, version, alias_path))
+        except FileNotFoundError:
+            return []
+
+        return results
+
+    def _collect_aliases_from_go_mod(self, direct: Dict[str, str], indirect: Dict[str, str]) -> Dict[str, Set[str]]:
+        """Collect module alias mappings discovered in go.mod requirements/replacements."""
+        alias_map: Dict[str, Set[str]] = {}
+
+        def record_alias(alias_path: str) -> None:
+            alias_path = alias_path.strip()
+            if not alias_path:
+                return
+            canonical = self.canonicalize_module_path(alias_path)
+            if canonical != alias_path:
+                alias_map.setdefault(canonical, set()).add(alias_path)
+
+        for module_path in list(direct.keys()) + list(indirect.keys()):
+            record_alias(module_path)
+
+        for alias_path, replacement in getattr(self, 'replace_directives', {}).items():
+            # Ignore local filesystem replacements (./, ../) which don't produce alternate modules
+            replacement = replacement.strip()
+            if not replacement or replacement.startswith('./') or replacement.startswith('../'):
+                record_alias(alias_path)
+                continue
+
+            replacement_path = replacement.split()[0]
+            if replacement_path.startswith('./') or replacement_path.startswith('../'):
+                record_alias(alias_path)
+                continue
+
+            canonical_target = self.canonicalize_module_path(replacement_path)
+            if canonical_target:
+                record_alias(alias_path)
+
+        return alias_map
 
     def safe_module_name(self, module_path: str) -> str:
         """Convert module path to safe directory name."""
@@ -2522,6 +3200,20 @@ class GoModuleFetcher:
             print("    ❌ No module information available from go list")
             return
 
+        alias_map: Dict[str, Set[str]] = {}
+        go_mod_path = source_dir / "go.mod"
+        if go_mod_path.exists():
+            try:
+                direct, indirect, replaces = self.parse_go_mod_detailed(str(go_mod_path))
+                self.direct_deps = direct
+                self.indirect_deps = indirect
+                self.replace_directives = replaces
+                alias_map = self._collect_aliases_from_go_mod(direct, indirect)
+            except Exception as e:
+                print(f"    ⚠️  Warning: Failed to parse go.mod for alias detection: {e}")
+        else:
+            print("    ⚠️  go.mod not found alongside source directory; skipping alias detection")
+
         module_items = list(modules_info.items())
         total_modules = len(module_items)
 
@@ -2652,10 +3344,62 @@ class GoModuleFetcher:
             print("    ❌ No module information available from go list")
             return
 
+        alias_map: Dict[str, Set[str]] = {}
+        non_canonical_modules = []
+
+        # Detect non-canonical module paths generically
+        go_mod_path = source_dir / "go.mod"
+        if go_mod_path.exists():
+            try:
+                content = go_mod_path.read_text()
+                import re
+                # Find all go.*.in patterns that might be non-canonical
+                non_canonical_patterns = re.findall(r'(go\.[a-z]+\.in/[^\s)"\']+)', content)
+                if non_canonical_patterns:
+                    print(f"    🔍 Detected potentially non-canonical module paths in go.mod:")
+                    for suspect_path in set(non_canonical_patterns):
+                        canonical_path = self.canonicalize_module_path(suspect_path)
+                        if suspect_path != canonical_path:
+                            print(f"       {suspect_path} → {canonical_path}")
+                            non_canonical_modules.append((suspect_path, canonical_path))
+                    print(f"    📝 These will be handled as aliases to ensure offline builds work")
+            except Exception as e:
+                print(f"    ⚠️  Warning: Could not scan go.mod for non-canonical paths: {e}")
+            try:
+                direct, indirect, replaces = self.parse_go_mod_detailed(str(go_mod_path))
+                self.direct_deps = direct
+                self.indirect_deps = indirect
+                self.replace_directives = replaces
+                alias_map = self._collect_aliases_from_go_mod(direct, indirect)
+            except Exception as e:
+                print(f"    ⚠️  Warning: Failed to parse go.mod for alias detection: {e}")
+        else:
+            print("    ⚠️  go.mod not found alongside source directory; skipping alias detection")
+
+        # Parse go.sum to find ALL version requirements (including deep transitive deps)
+        go_sum_path = source_dir / "go.sum"
+        go_sum_requirements: Dict[str, Set[str]] = {}  # canonical_path -> set of versions
+        if go_sum_path.exists():
+            try:
+                go_sum_modules = self._collect_modules_from_go_sum(go_sum_path)
+                print(f"    📋 Parsed go.sum: found {len(go_sum_modules)} module@version entries")
+                for canonical_path, version, alias_path in go_sum_modules:
+                    go_sum_requirements.setdefault(canonical_path, set()).add(version)
+                    if alias_path:
+                        alias_map.setdefault(canonical_path, set()).add(alias_path)
+                print(f"    🔍 Tracking {len(go_sum_requirements)} unique modules from go.sum for version mismatch detection")
+            except Exception as e:
+                print(f"    ⚠️  Warning: Failed to parse go.sum: {e}")
+        else:
+            print("    ⚠️  go.sum not found; version mismatch detection may be incomplete")
+
         module_items = list(modules_info.items())
         total_modules = len(module_items)
 
         print(f"    🎯 Processing {total_modules} modules from go list")
+
+        # Track version requirements from go list (will be augmented with go.sum data in post-processing)
+        version_requirements: Dict[str, Set[str]] = {}
 
         # Prepare modules list for hybrid approach
         modules_data = []
@@ -2750,9 +3494,98 @@ class GoModuleFetcher:
                 module_data['requires_full_history'] = True
             modules_data.append(module_data)
 
+            # Track version requirements for mismatch detection
+            canonical_path = self.canonicalize_module_path(module_path)
+            version_requirements.setdefault(canonical_path, set()).add(version)
+
+            # Preserve non-canonical module aliases (e.g. go.yaml.in/yaml/v3) so the
+            # module cache task creates zip/mod artifacts for both the canonical and
+            # aliased import paths. This keeps offline builds from trying to download
+            # the alias even though we already have the canonical module cached.
+            original_module_info = module_info.get('Module') if isinstance(module_info, dict) else None
+            if original_module_info and isinstance(original_module_info, dict):
+                original_path = original_module_info.get('Path')
+                if original_path:
+                    original_path = original_path.strip()
+                if original_path and original_path != module_path:
+                    if self.canonicalize_module_path(original_path) != original_path:
+                        alias_data = module_data.copy()
+                        alias_data['module'] = original_path
+                        alias_data['alias_of'] = module_data['module']
+                        alias_data['is_alias'] = True
+                        modules_data.append(alias_data)
+
             print(f"    ✅ {module_path} @ {version} (commit: {commit_hash[:8]})")
             if subdir:
                 print(f"       📂 Subdir: {subdir}")
+
+        if alias_map:
+            module_lookup = {entry['module']: entry for entry in modules_data}
+            existing_paths = set(module_lookup.keys())
+            alias_entries = []
+
+            for canonical, aliases in alias_map.items():
+                base_entry = module_lookup.get(canonical)
+                if not base_entry:
+                    for entry in modules_data:
+                        if self.canonicalize_module_path(entry.get('module', '')) == canonical:
+                            base_entry = entry
+                            break
+                if not base_entry:
+                    continue
+
+                for alias in aliases:
+                    if alias in existing_paths:
+                        existing_entry = module_lookup.get(alias)
+                        if existing_entry and not existing_entry.get('alias_of'):
+                            existing_entry['alias_of'] = base_entry['module']
+                            existing_entry['is_alias'] = True
+                        continue
+                    alias_entry = base_entry.copy()
+                    alias_entry['module'] = alias
+                    alias_entry['alias_of'] = base_entry['module']
+                    alias_entry['is_alias'] = True
+                    alias_entries.append(alias_entry)
+                    existing_paths.add(alias)
+
+            if alias_entries:
+                modules_data.extend(alias_entries)
+                print(f"    🔁 Added {len(alias_entries)} alias module entries from go.mod (e.g., go.yaml.in ➜ gopkg.in)")
+
+        # Detect and handle version mismatches generically
+        version_alias_modules = []
+        for canonical_path, versions in version_requirements.items():
+            if len(versions) > 1:
+                print(f"    🔍 Version mismatch detected for {canonical_path}:")
+                print(f"       Required versions: {', '.join(sorted(versions))}")
+                # Find the module entry we have (usually the highest version)
+                base_entry = None
+                base_ver = None
+                for md in modules_data:
+                    if self.canonicalize_module_path(md['module']) == canonical_path:
+                        if not md.get('is_alias'):
+                            base_entry = md
+                            base_ver = md['version']
+                            break
+                if base_entry:
+                    for req_ver in versions:
+                        if req_ver != base_ver:
+                            exists = any(
+                                self.canonicalize_module_path(m['module']) == canonical_path
+                                and m['version'] == req_ver
+                                for m in modules_data
+                            )
+                            if not exists:
+                                ver_alias = base_entry.copy()
+                                ver_alias['version'] = req_ver
+                                ver_alias['is_version_alias'] = True
+                                ver_alias['original_version'] = base_ver
+                                ver_alias['alias_of'] = base_entry['module']
+                                version_alias_modules.append(ver_alias)
+                                print(f"       📦 Creating cache for {canonical_path}@{req_ver} (based on @{base_ver})")
+        if version_alias_modules:
+            modules_data.extend(version_alias_modules)
+            print(f"    🔁 Added {len(version_alias_modules)} version alias entries")
 
         # Store processed modules for checksum generation
         self.processed_modules = []
@@ -2766,62 +3599,48 @@ class GoModuleFetcher:
             }
             self.processed_modules.append(processed_module)
 
-        # Import and use the hybrid module cache builder
-        try:
-            import sys
-            import os
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            sys.path.insert(0, script_dir)
-            from hybrid_module_cache_builder import HybridModuleCacheBuilder
+        # Generate hybrid module cache artifacts
+        cache_builder = HybridModuleCacheBuilder(
+            module_cache_dir=str(output_dir / "pkg" / "mod"),
+            workdir=str(output_dir / "workdir"),
+            max_workers=8
+        )
 
-            # Create hybrid module cache builder
-            cache_builder = HybridModuleCacheBuilder(
-                module_cache_dir=str(output_dir / "pkg" / "mod"),
-                workdir=str(output_dir / "workdir"),
-                max_workers=8
-            )
+        src_uri_entries, cache_builder_task = cache_builder.generate_complete_solution(modules_data, go_sum_requirements)
+        src_uri_entries = self._apply_shallow_overrides(modules_data, src_uri_entries)
 
-            # Generate hybrid solution
-            src_uri_entries, cache_builder_task = cache_builder.generate_complete_solution(modules_data)
-            src_uri_entries = self._apply_shallow_overrides(modules_data, src_uri_entries)
+        # Write src_uri.inc with git:// entries
+        self.write_hybrid_src_uri_inc(src_uri_entries, modules_data, output_dir)
 
-            # Write src_uri.inc with git:// entries
-            self.write_hybrid_src_uri_inc(src_uri_entries, modules_data, output_dir)
+        # Write module cache builder task to separate file
+        self.write_hybrid_cache_task(cache_builder_task, modules_data, output_dir)
 
-            # Write module cache builder task to separate file
-            self.write_hybrid_cache_task(cache_builder_task, output_dir)
+        print(f"\n🎉 Successfully bootstrapped hybrid infrastructure:")
+        print(f"    📄 {output_dir}/src_uri.inc - {len(src_uri_entries)} git:// entries (fast parallel)")
+        print(f"    📄 {output_dir}/module_cache_task.inc - Custom module cache builder")
+        print(f"    ⚡ Expected performance: ~2-3 minutes vs 20+ minutes (10x faster)")
+        print(f"    🔧 Integration: Include module_cache_task.inc in your BitBake recipe")
 
-            print(f"\n🎉 Successfully bootstrapped hybrid infrastructure:")
-            print(f"    📄 {output_dir}/src_uri.inc - {len(src_uri_entries)} git:// entries (fast parallel)")
-            print(f"    📄 {output_dir}/module_cache_task.inc - Custom module cache builder")
-            print(f"    ⚡ Expected performance: ~2-3 minutes vs 20+ minutes (10x faster)")
-            print(f"    🔧 Integration: Include module_cache_task.inc in your BitBake recipe")
+        if self.generate_gomodgit:
+            # Generate go.sum.gomodgit with hybrid-compatible checksums when requested
+            print(f"\n📝 Generating go.sum.gomodgit with hybrid-compatible checksums...")
+            original_cwd = os.getcwd()
+            try:
+                # Change to output directory so go.sum.gomodgit is created there
+                os.chdir(output_dir)
+                # Pass the source directory explicitly since the hybrid path uses a different temp structure
+                self.generate_gomodgit_go_sum_for_hybrid(source_dir)
+            finally:
+                os.chdir(original_cwd)
+        else:
+            print("\n⏭️  Skipping go.sum.gomodgit generation (use --generate-gomodgit to enable)")
 
-            if self.generate_gomodgit:
-                # Generate go.sum.gomodgit with hybrid-compatible checksums when requested
-                print(f"\n📝 Generating go.sum.gomodgit with hybrid-compatible checksums...")
-                original_cwd = os.getcwd()
-                try:
-                    # Change to output directory so go.sum.gomodgit is created there
-                    os.chdir(output_dir)
-                    # Pass the source directory explicitly since the hybrid path uses a different temp structure
-                    self.generate_gomodgit_go_sum_for_hybrid(source_dir)
-                finally:
-                    os.chdir(original_cwd)
-            else:
-                print("\n⏭️  Skipping go.sum.gomodgit generation (use --generate-gomodgit to enable)")
-
-            if failed_modules:
-                print(f"\n⚠️  {len(failed_modules)} modules could not be processed:")
-                for module in failed_modules[:5]:  # Show first 5
-                    print(f"    • {module}")
-                if len(failed_modules) > 5:
-                    print(f"    • ... and {len(failed_modules) - 5} more")
-
-        except ImportError as e:
-            print(f"    ❌ Could not import hybrid module cache builder: {e}")
-            print(f"    💡 Make sure hybrid_module_cache_builder.py is in the same directory")
-            return
+        if failed_modules:
+            print(f"\n⚠️  {len(failed_modules)} modules could not be processed:")
+            for module in failed_modules[:5]:  # Show first 5
+                print(f"    • {module}")
+            if len(failed_modules) > 5:
+                print(f"    • ... and {len(failed_modules) - 5} more")
 
     def write_gomodgit_src_uri_inc(self, gomodgit_src_uris: List[str], output_dir: Path = None):
         """Write src_uri.inc with gomodgit:// entries."""
@@ -2883,7 +3702,7 @@ class GoModuleFetcher:
 
         print(f"    ✅ Generated {len(src_uri_entries)} git:// entries (hybrid approach)")
 
-    def write_hybrid_cache_task(self, cache_task_code: str, output_dir: Path = None):
+    def write_hybrid_cache_task(self, cache_task_code: str, modules_data: List[Dict], output_dir: Path = None):
         """Write module cache builder task to separate include file."""
         if output_dir is None:
             output_dir = Path(".")
@@ -2894,6 +3713,8 @@ class GoModuleFetcher:
         go_sum_task_code = self.generate_do_generate_go_sum_task()
 
         compile_env_block = self.generate_compile_env_prepend_block()
+
+        cache_task_code = self._align_cache_task_module_paths(cache_task_code, modules_data)
 
         with open(task_file, 'w') as f:
             f.write("# Generated by oe-go-mod-fetcher.py --use-hybrid\n")
@@ -2906,6 +3727,8 @@ class GoModuleFetcher:
             f.write("GOMODCACHE = \"${S}/pkg/mod\"\n")
             f.write("GO_MOD_CACHE_DIR = \"${@os.path.relpath(d.getVar('GOMODCACHE'), d.getVar('UNPACKDIR'))}\"\n")
             f.write("do_unpack[cleandirs] += \"${GOMODCACHE}\"\n\n")
+            f.write("# Always rebuild the module cache from scratch for deterministic results\n")
+            f.write("do_create_module_cache[cleandirs] += \"${GOMODCACHE}/cache/download\"\n\n")
             f.write(cache_task_code)
             f.write("\n\n")
             f.write("# ============================================================\n")
@@ -2920,6 +3743,57 @@ class GoModuleFetcher:
 
         print(f"    ✅ Generated module cache builder task")
         print(f"    ✅ Generated do_generate_go_sum task (calculates zip + go.mod Hash1 checksums)")
+
+    def _align_cache_task_module_paths(self, cache_task_code: str, modules_data: List[Dict]) -> str:
+        """Ensure the rendered module list retains canonical module paths."""
+        if not cache_task_code or not modules_data:
+            return cache_task_code
+
+        try:
+            import ast
+            import re
+        except ImportError:
+            return cache_task_code
+
+        pattern = r"modules_data = \[(.*?)\]\n\s*#"
+        match = re.search(pattern, cache_task_code, re.S)
+        if not match:
+            return cache_task_code
+
+        literal_block = match.group(1)
+
+        try:
+            parsed_modules = ast.literal_eval('[' + literal_block + ']')
+        except Exception:
+            return cache_task_code
+
+        def module_key(entry: Dict[str, str]) -> tuple:
+            return (
+                entry.get('repo_url'),
+                entry.get('commit'),
+                entry.get('version'),
+                entry.get('subdir') or ''
+            )
+
+        lookup = {module_key(entry): entry for entry in modules_data}
+
+        replacements: List[tuple] = []
+        for parsed_entry in parsed_modules:
+            original = lookup.get(module_key(parsed_entry))
+            if not original:
+                continue
+            parsed_module = parsed_entry.get('module')
+            actual_module = original.get('module')
+            if parsed_module and actual_module and parsed_module != actual_module:
+                replacements.append((parsed_module, actual_module))
+
+        for current_module, desired_module in replacements:
+            cache_task_code = cache_task_code.replace(
+                f'"module": "{current_module}"',
+                f'"module": "{desired_module}"'
+            )
+
+        return cache_task_code
 
     def _apply_shallow_overrides(self, modules_data: List[Dict], src_uri_entries: List[str]) -> List[str]:
         """Remove shallow clone hints for repositories that required deep history."""
