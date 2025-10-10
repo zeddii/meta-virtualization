@@ -12,6 +12,9 @@ GOMODCACHE = "${S}/pkg/mod"
 GO_MOD_CACHE_DIR = "${@os.path.relpath(d.getVar('GOMODCACHE'), d.getVar('UNPACKDIR'))}"
 do_unpack[cleandirs] += "${GOMODCACHE}"
 
+# Uncomment this line to force rebuilding the module cache from scratch always
+#do_create_module_cache[cleandirs] += "${GOMODCACHE}/cache/download"
+
 
 python do_create_module_cache() {
     """
@@ -23,6 +26,7 @@ python do_create_module_cache() {
     import subprocess
     import zipfile
     import threading
+    import re
     from pathlib import Path
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -32,7 +36,7 @@ python do_create_module_cache() {
         with open(f"{vcs_path}.info", 'wb') as f:
             f.write(vcs_key.encode())
 
-    def create_module_zip(module_path, version, vcs_path, subdir=None):
+    def create_module_zip(module_path, version, vcs_path, subdir=None, alias_of=None):
         """Create module zip file from git repository"""
         # Calculate paths
         # Use correct escaping function that matches BitBake's gomod.py
@@ -41,14 +45,41 @@ python do_create_module_cache() {
             import re
             return re.sub(r'([A-Z])', lambda m: '!' + m.group(1).lower(), path)
 
+        def sanitize_module_name(name):
+            if not name:
+                return name
+            stripped = name.strip()
+            if len(stripped) >= 2 and stripped[0] == '"' and stripped[-1] == '"':
+                return stripped[1:-1]
+            return stripped
+
+        module_path = sanitize_module_name(module_path)
+        alias_of = sanitize_module_name(alias_of) if alias_of else None
+
         escaped_module = escape_module_path(module_path)
         escaped_version = escape_module_path(version)
+
+        alias_module = module_path
+        rewrite_to_alias = bool(alias_of)
 
         download_dir = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_module / "@v"
         download_dir.mkdir(parents=True, exist_ok=True)
 
         zip_path = download_dir / f"{escaped_version}.zip"
         mod_path = download_dir / f"{escaped_version}.mod"
+
+        module_decl_pattern = re.compile(r'(?m)^(module\s+)(\S+)(\s*)')
+
+        def rewrite_module_directive(text, new_module):
+            cleaned_module = sanitize_module_name(new_module)
+            def replacer(match):
+                existing = match.group(2)
+                if existing.startswith('"') and existing.endswith('"'):
+                    return f"{match.group(1)}{cleaned_module}{match.group(3)}"
+                return f"{match.group(1)}{cleaned_module}{match.group(3)}"
+
+            new_text, count = module_decl_pattern.subn(replacer, text, count=1)
+            return new_text if count else None
 
         # Get file list from git repository
         work_path = Path(vcs_path)
@@ -60,7 +91,7 @@ python do_create_module_cache() {
             cmd.append(subdir)
 
         try:
-            files = subprocess.check_output(cmd, cwd=vcs_path, text=True).strip().split('\n')
+            files = subprocess.check_output(cmd, cwd=vcs_path, text=True).strip().split('\\n')
             files = [f for f in files if f.strip()]
         except subprocess.CalledProcessError:
             bb.warn(f"Could not list files for {module_path}@{version}")
@@ -91,6 +122,15 @@ python do_create_module_cache() {
                             ["git", "cat-file", "blob", f"HEAD:{file_path}"],
                             cwd=vcs_path
                         )
+                        if rewrite_to_alias and file_path == expected_go_mod:
+                            try:
+                                content_text = content.decode()
+                                rewritten = rewrite_module_directive(content_text, alias_module)
+                                if rewritten is None:
+                                    rewritten = f"module {sanitize_module_name(alias_module)}\\n"
+                                content = rewritten.encode()
+                            except Exception:
+                                content = f"module {sanitize_module_name(alias_module)}\\n".encode()
                         archive_path = module_prefix + (file_path[len(subdir)+1:] if subdir else file_path)
                         zf.writestr(archive_path, content)
                     except subprocess.CalledProcessError:
@@ -106,7 +146,7 @@ python do_create_module_cache() {
         try:
             if '+incompatible' in version:
                 # Synthetic minimal .mod for pre-module versions
-                mod_content = f"module {module_path}\n".encode()
+                mod_content = f"module {alias_module}\\n".encode()
                 bb.note(f"Creating synthetic .mod for +incompatible version: {module_path}")
             else:
                 # For proper module versions, use repository's go.mod
@@ -119,9 +159,18 @@ python do_create_module_cache() {
                         ["git", "cat-file", "blob", f"HEAD:{mod_file}"],
                         cwd=vcs_path
                     )
+                    if rewrite_to_alias:
+                        try:
+                            mod_text = mod_content.decode()
+                            rewritten = rewrite_module_directive(mod_text, alias_module)
+                            if rewritten is None:
+                                rewritten = f"module {sanitize_module_name(alias_module)}\\n"
+                            mod_content = rewritten.encode()
+                        except Exception:
+                            mod_content = f"module {sanitize_module_name(alias_module)}\\n".encode()
                 except subprocess.CalledProcessError:
                     # Synthesize go.mod if not found
-                    mod_content = f"module {module_path}\n".encode()
+                    mod_content = f"module {sanitize_module_name(alias_module)}\\n".encode()
 
             with open(mod_path, 'wb') as f:
                 f.write(mod_content)
@@ -131,19 +180,20 @@ python do_create_module_cache() {
             bb.warn(f"Failed to create mod file for {module_path}@{version}: {e}")
 
     # Module list with repository information
-    modules_data = [({"module": "github.com/docker/cli", "version": "v28.5.0+incompatible", "repo_url": "https://github.com/docker/cli", "commit": "887030fbe83f5368566ec3b35e15a4ba13267a62", "subdir": ""}),
+    modules_data = [
+        ({"module": "github.com/docker/cli", "version": "v28.5.1+incompatible", "repo_url": "https://github.com/docker/cli", "commit": "e180ab8ab82d22b7895a3e6e110cf6dd5c45f1d7", "subdir": ""}),
         ({"module": "github.com/opencontainers/go-digest", "version": "v1.0.0", "repo_url": "https://github.com/opencontainers/go-digest.git", "commit": "ea51bea511f75cfa3ef6098cc253c5c3609b037a", "subdir": ""}),
         ({"module": "github.com/distribution/reference", "version": "v0.6.0", "repo_url": "https://github.com/distribution/reference", "commit": "ff14fafe2236e51c2894ac07d4bdfc778e96d682", "subdir": ""}),
         ({"module": "github.com/docker/docker-credential-helpers", "version": "v0.9.3", "repo_url": "https://github.com/docker/docker-credential-helpers", "commit": "f9d3010165b642df37215b1be945552f2c6f0e3b", "subdir": ""}),
         ({"module": "github.com/pkg/errors", "version": "v0.9.1", "repo_url": "https://github.com/pkg/errors.git", "commit": "614d223910a179a466c1767a985424175c39b465", "subdir": ""}),
-        ({"module": "golang.org/x/sys", "version": "v0.36.0", "repo_url": "https://go.googlesource.com/sys", "commit": "b06ce0514ea5467cf3ac72ad85e4d1845c51fbad", "subdir": ""}),
+        ({"module": "golang.org/x/sys", "version": "v0.37.0", "repo_url": "https://go.googlesource.com/sys", "commit": "1edeebeea09c66c5a886ccfefb1be5dafac5c893", "subdir": ""}),
         ({"module": "github.com/sirupsen/logrus", "version": "v1.9.3", "repo_url": "https://github.com/sirupsen/logrus", "commit": "d40e25cd45ed9c6b2b66e6b97573a0413e4c23bd", "subdir": ""}),
         ({"module": "github.com/containerd/errdefs", "version": "v1.0.0", "repo_url": "https://github.com/containerd/errdefs", "commit": "4817405e4a3caeb7aee9dac68ed55339c59cb635", "subdir": ""}),
         ({"module": "github.com/fvbommel/sortorder", "version": "v1.1.0", "repo_url": "https://github.com/fvbommel/sortorder", "commit": "a8d9302c17f9f46c6580b82b919672e58ef6e396", "subdir": ""}),
         ({"module": "github.com/moby/sys/sequential", "version": "v0.6.0", "repo_url": "https://github.com/moby/sys", "commit": "cafbe42351600ca9b363e220722f66d96f6e71f4", "subdir": "sequential"}),
         ({"module": "github.com/moby/sys/atomicwriter", "version": "v0.1.0", "repo_url": "https://github.com/moby/sys", "commit": "4a75548218baa36bdbaaed1371a3e8a9cdfcffa0", "subdir": "atomicwriter"}),
         ({"module": "github.com/containerd/errdefs/pkg", "version": "v0.3.0", "repo_url": "https://github.com/containerd/errdefs", "commit": "4817405e4a3caeb7aee9dac68ed55339c59cb635", "subdir": "pkg"}),
-        ({"module": "github.com/docker/docker", "version": "v28.5.0+incompatible", "repo_url": "https://github.com/docker/docker", "commit": "cd048300a48700294339c9c91d2dcc691cb8f63b", "subdir": ""}),
+        ({"module": "github.com/docker/docker", "version": "v28.5.1+incompatible", "repo_url": "https://github.com/docker/docker", "commit": "f8215cc266744ef195a50a70d427c345da2acdbb", "subdir": ""}),
         ({"module": "github.com/docker/go-connections", "version": "v0.6.0", "repo_url": "https://github.com/docker/go-connections", "commit": "42faf792bde28c414a060127d6351769408a675f", "subdir": ""}),
         ({"module": "github.com/docker/go-units", "version": "v0.5.0", "repo_url": "https://github.com/docker/go-units", "commit": "e682442797b36348f8e1f98defdbf32bac0b6c6f", "subdir": ""}),
         ({"module": "github.com/opencontainers/image-spec", "version": "v1.1.1", "repo_url": "https://github.com/opencontainers/image-spec", "commit": "147f9c13cedb47a0c4d9a11a222961073d585877", "subdir": ""}),
@@ -181,7 +231,8 @@ python do_create_module_cache() {
         ({"module": "github.com/go-viper/mapstructure/v2", "version": "v2.4.0", "repo_url": "https://github.com/go-viper/mapstructure", "commit": "b9794a5f0e73d425210d6614ed833067029155f5", "subdir": ""}),
         ({"module": "github.com/mattn/go-shellwords", "version": "v1.0.12", "repo_url": "https://github.com/mattn/go-shellwords.git", "commit": "973b9d5391598d4ee601db46fa32f6e186a356ac", "subdir": ""}),
         ({"module": "github.com/xhit/go-str2duration/v2", "version": "v2.1.0", "repo_url": "https://github.com/xhit/go-str2duration", "commit": "017325bfda0895fe02177e4ebb07962e58735bbf", "subdir": ""}),
-        ({"module": "go.yaml.in/yaml/v3", "version": "v3.0.4", "repo_url": "https://github.com/yaml/go-yaml", "commit": "c3552c15f996075a7634df5159d9161c67bf3d76", "subdir": ""}),
+        ({"module": "go.yaml.in/yaml/v3", "version": "v3.0.4", "repo_url": "https://github.com/go-yaml/yaml", "commit": "944c86a7d29391925ed6ac33bee98a0516f1287a", "subdir": ""}),
+        ({"module": "go.yaml.in/yaml/v3", "version": "v3.0.4", "repo_url": "https://github.com/go-yaml/yaml", "commit": "944c86a7d29391925ed6ac33bee98a0516f1287a", "subdir": "", "alias_of": "gopkg.in/yaml.v3"}),
         ({"module": "golang.org/x/sync", "version": "v0.17.0", "repo_url": "https://go.googlesource.com/sync", "commit": "04914c200cb38d4ea960ee6a4c314a028c632991", "subdir": ""}),
         ({"module": "github.com/santhosh-tekuri/jsonschema/v6", "version": "v6.0.1", "repo_url": "https://github.com/santhosh-tekuri/jsonschema", "commit": "87df339550a7b2440ff7da286bd34ece7d74039b", "subdir": ""}),
         ({"module": "github.com/containerd/log", "version": "v0.1.0", "repo_url": "https://github.com/containerd/log", "commit": "0fc1e28871fdf2786e2cc51bbe4133db6547a199", "subdir": ""}),
@@ -214,7 +265,7 @@ python do_create_module_cache() {
         ({"module": "tags.cncf.io/container-device-interface", "version": "v1.0.1", "repo_url": "https://github.com/cncf-tags/container-device-interface", "commit": "79790445c2d70820f6824eb42832d2efd0f08dd2", "subdir": ""}),
         ({"module": "github.com/acarl005/stripansi", "version": "v0.0.0-20180116102854-5a71ef0e047d", "repo_url": "https://github.com/acarl005/stripansi.git", "commit": "5a71ef0e047df0427e87a79f27009029921f1f9b", "subdir": ""}),
         ({"module": "github.com/buger/goterm", "version": "v1.0.4", "repo_url": "https://github.com/buger/goterm.git", "commit": "a73545aae7d693f786ce4cc687460efca4845f31", "subdir": ""}),
-        ({"module": "github.com/docker/compose/v2", "version": "v0.0.0", "repo_url": "https://github.com/docker/compose.git", "commit": "fa7e85ed839ae5e38aeafa9ef6ea81894d5f8dc0", "subdir": ""}),
+        ({"module": "github.com/docker/compose/v2", "version": "v0.0.0", "repo_url": "https://github.com/docker/compose.git", "commit": "a07f2b8ded4a25bfe83522d3421294db5e1ec8dc", "subdir": ""}),
         ({"module": "go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp", "version": "v1.35.0", "repo_url": "https://github.com/open-telemetry/opentelemetry-go", "commit": "5ba5e7a449f36c1c02710bbaa517263797046db0", "subdir": "exporters/otlp/otlpmetric/otlpmetrichttp"}),
         ({"module": "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp", "version": "v1.35.0", "repo_url": "https://github.com/open-telemetry/opentelemetry-go", "commit": "5ba5e7a449f36c1c02710bbaa517263797046db0", "subdir": "exporters/otlp/otlptrace/otlptracehttp"}),
         ({"module": "github.com/moby/buildkit", "version": "v0.24.0", "repo_url": "https://github.com/moby/buildkit", "commit": "b772c318368090fb2ffc9c0fed92e0a35bf82389", "subdir": ""}),
@@ -284,6 +335,7 @@ python do_create_module_cache() {
         ({"module": "sigs.k8s.io/structured-merge-diff/v4", "version": "v4.4.2", "repo_url": "https://github.com/kubernetes-sigs/structured-merge-diff", "commit": "ccf7a061f165cd3feee92af191157c053154d8bc", "subdir": ""}),
         ({"module": "k8s.io/utils", "version": "v0.0.0-20241104100929-3ea5e8cea738", "repo_url": "https://github.com/kubernetes/utils", "commit": "3ea5e8cea73810f6d2951b37183cf91e19f63455", "subdir": ""}),
         ({"module": "github.com/google/gofuzz", "version": "v1.2.0", "repo_url": "https://github.com/google/gofuzz.git", "commit": "379e164120fbc98885a8f494b5aa41ba94f64c56", "subdir": ""}),
+        ({"module": "gopkg.in/inf.v0", "version": "v0.9.1", "repo_url": "https://github.com/go-inf/inf", "commit": "d2d2541c53f18d2a059457998ce2876cc8e67cbf", "subdir": ""}),
         ({"module": "k8s.io/client-go", "version": "v0.32.3", "repo_url": "https://github.com/kubernetes/client-go", "commit": "c106b23895edc59ff05c65770a17e6a6d3caee66", "subdir": ""}),
         ({"module": "golang.org/x/oauth2", "version": "v0.30.0", "repo_url": "https://go.googlesource.com/oauth2", "commit": "cf1431934151b3a93e0b3286eb6798ca08ea3770", "subdir": ""}),
         ({"module": "k8s.io/api", "version": "v0.32.3", "repo_url": "https://github.com/kubernetes/api", "commit": "22c1e39ad8694905cfaad52a473d81f230d61bcb", "subdir": ""}),
@@ -299,6 +351,7 @@ python do_create_module_cache() {
         ({"module": "github.com/go-openapi/jsonpointer", "version": "v0.21.0", "repo_url": "https://github.com/go-openapi/jsonpointer", "commit": "8b546b950409bd7b131488a88613339cd8937b7f", "subdir": ""}),
         ({"module": "github.com/go-openapi/jsonreference", "version": "v0.20.2", "repo_url": "https://github.com/go-openapi/jsonreference", "commit": "1f158e563669961b8e54817e3ea57978d439ffff", "subdir": ""}),
         ({"module": "github.com/emicklei/go-restful/v3", "version": "v3.11.0", "repo_url": "https://github.com/emicklei/go-restful", "commit": "30bec7807481e62e1e1e59ad57e7f22054806966", "subdir": ""}),
+        ({"module": "gopkg.in/evanphx/json-patch.v4", "version": "v4.12.0", "repo_url": "https://github.com/evanphx/json-patch", "commit": "50fdc0b4c9ab36933e6a0c9288fef3ac5df2b907", "subdir": ""}),
         ({"module": "github.com/mattn/go-isatty", "version": "v0.0.20", "repo_url": "https://github.com/mattn/go-isatty", "commit": "a7c02353c47bc4ec6b30dc9628154ae4fe760c11", "subdir": ""}),
         ({"module": "github.com/mattn/go-colorable", "version": "v0.1.13", "repo_url": "https://github.com/mattn/go-colorable", "commit": "11a925cff3d38c293ddc8c05a16b504e3e2c63be", "subdir": ""}),
         ({"module": "github.com/mgutz/ansi", "version": "v0.0.0-20170206155736-9520e82c474b", "repo_url": "https://github.com/mgutz/ansi.git", "commit": "9520e82c474b0a04dd04f8a40959027271bab992", "subdir": ""}),
@@ -312,7 +365,291 @@ python do_create_module_cache() {
         ({"module": "github.com/cpuguy83/go-md2man/v2", "version": "v2.0.7", "repo_url": "https://github.com/cpuguy83/go-md2man", "commit": "061b6c7cbecd6752049221aa15b7a05160796698", "subdir": ""}),
         ({"module": "github.com/otiai10/copy", "version": "v1.14.1", "repo_url": "https://github.com/otiai10/copy", "commit": "5ef5923d6ff098ea7a51792c1ec963d04fad9794", "subdir": ""}),
         ({"module": "gotest.tools/v3", "version": "v3.5.2", "repo_url": "https://github.com/gotestyourself/gotest.tools", "commit": "0b81523ff268a1f1b0baf4a5da67e42fbb86880b", "subdir": ""})
+
     ]
+
+    # Version requirements from go.sum (for post-processing)
+    go_sum_requirements = {
+        "github.com/AdaLogics/go-fuzz-headers": {"v0.0.0-20240806141605-e8a1dd7889d6", "v0.0.0-20240806141605-e8a1dd7889d6/go.mod"},
+        "github.com/AlecAivazis/survey/v2": {"v2.3.7", "v2.3.7/go.mod"},
+        "github.com/Azure/go-ansiterm": {"v0.0.0-20250102033503-faa5f7b0171c", "v0.0.0-20250102033503-faa5f7b0171c/go.mod"},
+        "github.com/BurntSushi/toml": {"v0.3.1", "v0.3.1/go.mod"},
+        "github.com/DefangLabs/secret-detector": {"v0.0.0-20250403165618-22662109213e", "v0.0.0-20250403165618-22662109213e/go.mod"},
+        "github.com/Masterminds/semver/v3": {"v3.4.0", "v3.4.0/go.mod"},
+        "github.com/Microsoft/go-winio": {"v0.6.2", "v0.6.2/go.mod"},
+        "github.com/Microsoft/hcsshim": {"v0.13.0", "v0.13.0/go.mod"},
+        "github.com/Netflix/go-expect": {"v0.0.0-20220104043353-73e0943537d2", "v0.0.0-20220104043353-73e0943537d2/go.mod"},
+        "github.com/Shopify/logrus-bugsnag": {"v0.0.0-20170309145241-6dbc35f2c30d", "v0.0.0-20170309145241-6dbc35f2c30d/go.mod"},
+        "github.com/acarl005/stripansi": {"v0.0.0-20180116102854-5a71ef0e047d", "v0.0.0-20180116102854-5a71ef0e047d/go.mod"},
+        "github.com/alecthomas/template": {"v0.0.0-20160405071501-a0175ee3bccc/go.mod"},
+        "github.com/alecthomas/units": {"v0.0.0-20151022065526-2efee857e7cf/go.mod"},
+        "github.com/anchore/go-struct-converter": {"v0.0.0-20221118182256-c68fdcfa2092", "v0.0.0-20221118182256-c68fdcfa2092/go.mod"},
+        "github.com/apparentlymart/go-textseg/v15": {"v15.0.0", "v15.0.0/go.mod"},
+        "github.com/armon/go-socks5": {"v0.0.0-20160902184237-e75332964ef5", "v0.0.0-20160902184237-e75332964ef5/go.mod"},
+        "github.com/aws/aws-sdk-go-v2": {"v1.30.3", "v1.30.3/go.mod"},
+        "github.com/aws/aws-sdk-go-v2/config": {"v1.27.27", "v1.27.27/go.mod"},
+        "github.com/aws/aws-sdk-go-v2/credentials": {"v1.17.27", "v1.17.27/go.mod"},
+        "github.com/aws/aws-sdk-go-v2/feature/ec2/imds": {"v1.16.11", "v1.16.11/go.mod"},
+        "github.com/aws/aws-sdk-go-v2/internal/configsources": {"v1.3.15", "v1.3.15/go.mod"},
+        "github.com/aws/aws-sdk-go-v2/internal/endpoints/v2": {"v2.6.15", "v2.6.15/go.mod"},
+        "github.com/aws/aws-sdk-go-v2/internal/ini": {"v1.8.0", "v1.8.0/go.mod"},
+        "github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding": {"v1.11.3", "v1.11.3/go.mod"},
+        "github.com/aws/aws-sdk-go-v2/service/internal/presigned-url": {"v1.11.17", "v1.11.17/go.mod"},
+        "github.com/aws/aws-sdk-go-v2/service/sso": {"v1.22.4", "v1.22.4/go.mod"},
+        "github.com/aws/aws-sdk-go-v2/service/ssooidc": {"v1.26.4", "v1.26.4/go.mod"},
+        "github.com/aws/aws-sdk-go-v2/service/sts": {"v1.30.3", "v1.30.3/go.mod"},
+        "github.com/aws/smithy-go": {"v1.20.3", "v1.20.3/go.mod"},
+        "github.com/beorn7/perks": {"v0.0.0-20150223135152-b965b613227f/go.mod", "v0.0.0-20180321164747-3a771d992973/go.mod", "v1.0.0/go.mod", "v1.0.1", "v1.0.1/go.mod"},
+        "github.com/bitly/go-hostpool": {"v0.1.0/go.mod"},
+        "github.com/bitly/go-simplejson": {"v0.5.0/go.mod"},
+        "github.com/bmizerany/assert": {"v0.0.0-20160611221934-b7ed37b82869/go.mod"},
+        "github.com/buger/goterm": {"v1.0.4", "v1.0.4/go.mod"},
+        "github.com/bugsnag/bugsnag-go": {"v1.0.5-0.20150529004307-13fd6b8acda0", "v1.0.5-0.20150529004307-13fd6b8acda0/go.mod"},
+        "github.com/bugsnag/osext": {"v0.0.0-20130617224835-0dd3f918b21b", "v0.0.0-20130617224835-0dd3f918b21b/go.mod"},
+        "github.com/bugsnag/panicwrap": {"v0.0.0-20151223152923-e2c28503fcd0", "v0.0.0-20151223152923-e2c28503fcd0/go.mod"},
+        "github.com/cenkalti/backoff/v4": {"v4.3.0", "v4.3.0/go.mod"},
+        "github.com/cespare/xxhash/v2": {"v2.3.0", "v2.3.0/go.mod"},
+        "github.com/cloudflare/cfssl": {"v0.0.0-20180223231731-4e2dcbde5004", "v0.0.0-20180223231731-4e2dcbde5004/go.mod"},
+        "github.com/codahale/rfc6979": {"v0.0.0-20141003034818-6a90f24967eb", "v0.0.0-20141003034818-6a90f24967eb/go.mod"},
+        "github.com/compose-spec/compose-go/v2": {"v2.9.0", "v2.9.0/go.mod"},
+        "github.com/containerd/cgroups/v3": {"v3.0.5", "v3.0.5/go.mod"},
+        "github.com/containerd/console": {"v1.0.5", "v1.0.5/go.mod"},
+        "github.com/containerd/containerd/api": {"v1.9.0", "v1.9.0/go.mod"},
+        "github.com/containerd/containerd/v2": {"v2.1.4", "v2.1.4/go.mod"},
+        "github.com/containerd/continuity": {"v0.4.5", "v0.4.5/go.mod"},
+        "github.com/containerd/errdefs": {"v1.0.0", "v1.0.0/go.mod"},
+        "github.com/containerd/errdefs/pkg": {"v0.3.0", "v0.3.0/go.mod"},
+        "github.com/containerd/fifo": {"v1.1.0", "v1.1.0/go.mod"},
+        "github.com/containerd/log": {"v0.1.0", "v0.1.0/go.mod"},
+        "github.com/containerd/nydus-snapshotter": {"v0.15.2", "v0.15.2/go.mod"},
+        "github.com/containerd/platforms": {"v1.0.0-rc.1", "v1.0.0-rc.1/go.mod"},
+        "github.com/containerd/plugin": {"v1.0.0", "v1.0.0/go.mod"},
+        "github.com/containerd/stargz-snapshotter": {"v0.16.3"},
+        "github.com/containerd/stargz-snapshotter/estargz": {"v0.16.3", "v0.16.3/go.mod"},
+        "github.com/containerd/ttrpc": {"v1.2.7", "v1.2.7/go.mod"},
+        "github.com/containerd/typeurl/v2": {"v2.2.3", "v2.2.3/go.mod"},
+        "github.com/cpuguy83/go-md2man/v2": {"v2.0.6/go.mod", "v2.0.7", "v2.0.7/go.mod"},
+        "github.com/creack/pty": {"v1.1.17/go.mod", "v1.1.24", "v1.1.24/go.mod", "v1.1.9/go.mod"},
+        "github.com/davecgh/go-spew": {"v1.1.0/go.mod", "v1.1.1", "v1.1.1/go.mod"},
+        "github.com/denisenkom/go-mssqldb": {"v0.0.0-20191128021309-1d7a30a10f73/go.mod"},
+        "github.com/distribution/reference": {"v0.6.0", "v0.6.0/go.mod"},
+        "github.com/dlclark/regexp2": {"v1.11.0", "v1.11.0/go.mod"},
+        "github.com/docker/buildx": {"v0.28.0", "v0.28.0/go.mod"},
+        "github.com/docker/cli": {"v28.5.1+incompatible", "v28.5.1+incompatible/go.mod"},
+        "github.com/docker/cli-docs-tool": {"v0.10.0", "v0.10.0/go.mod"},
+        "github.com/docker/distribution": {"v2.7.1+incompatible/go.mod", "v2.8.3+incompatible", "v2.8.3+incompatible/go.mod"},
+        "github.com/docker/docker": {"v28.5.1+incompatible", "v28.5.1+incompatible/go.mod"},
+        "github.com/docker/docker-credential-helpers": {"v0.9.3", "v0.9.3/go.mod"},
+        "github.com/docker/go": {"v1.5.1-1.0.20160303222718-d30aec9fd63c", "v1.5.1-1.0.20160303222718-d30aec9fd63c/go.mod"},
+        "github.com/docker/go-connections": {"v0.4.0/go.mod", "v0.6.0", "v0.6.0/go.mod"},
+        "github.com/docker/go-metrics": {"v0.0.0-20180209012529-399ea8c73916/go.mod", "v0.0.1", "v0.0.1/go.mod"},
+        "github.com/docker/go-units": {"v0.5.0", "v0.5.0/go.mod"},
+        "github.com/docker/libtrust": {"v0.0.0-20160708172513-aabc10ec26b7", "v0.0.0-20160708172513-aabc10ec26b7/go.mod"},
+        "github.com/dvsekhvalnov/jose2go": {"v0.0.0-20170216131308-f21a8cedbbae/go.mod"},
+        "github.com/eiannone/keyboard": {"v0.0.0-20220611211555-0d226195f203", "v0.0.0-20220611211555-0d226195f203/go.mod"},
+        "github.com/emicklei/go-restful/v3": {"v3.11.0", "v3.11.0/go.mod"},
+        "github.com/erikstmartin/go-testdb": {"v0.0.0-20160219214506-8d10e4a1bae5/go.mod"},
+        "github.com/felixge/httpsnoop": {"v1.0.4", "v1.0.4/go.mod"},
+        "github.com/fsnotify/fsevents": {"v0.2.0", "v0.2.0/go.mod"},
+        "github.com/fsnotify/fsnotify": {"v1.4.7/go.mod"},
+        "github.com/fvbommel/sortorder": {"v1.1.0", "v1.1.0/go.mod"},
+        "github.com/fxamacker/cbor/v2": {"v2.7.0", "v2.7.0/go.mod"},
+        "github.com/go-kit/kit": {"v0.8.0/go.mod"},
+        "github.com/go-logfmt/logfmt": {"v0.3.0/go.mod", "v0.4.0/go.mod"},
+        "github.com/go-logr/logr": {"v1.2.2/go.mod", "v1.4.3", "v1.4.3/go.mod"},
+        "github.com/go-logr/stdr": {"v1.2.2", "v1.2.2/go.mod"},
+        "github.com/go-openapi/jsonpointer": {"v0.19.6/go.mod", "v0.21.0", "v0.21.0/go.mod"},
+        "github.com/go-openapi/jsonreference": {"v0.20.2", "v0.20.2/go.mod"},
+        "github.com/go-openapi/swag": {"v0.22.3/go.mod", "v0.23.0", "v0.23.0/go.mod"},
+        "github.com/go-sql-driver/mysql": {"v1.3.0", "v1.3.0/go.mod"},
+        "github.com/go-stack/stack": {"v1.8.0/go.mod"},
+        "github.com/go-task/slim-sprig/v3": {"v3.0.0", "v3.0.0/go.mod"},
+        "github.com/go-viper/mapstructure/v2": {"v2.4.0", "v2.4.0/go.mod"},
+        "github.com/gofrs/flock": {"v0.12.1", "v0.12.1/go.mod"},
+        "github.com/gogo/protobuf": {"v1.0.0/go.mod", "v1.1.1/go.mod", "v1.3.2", "v1.3.2/go.mod"},
+        "github.com/golang-jwt/jwt/v5": {"v5.2.2", "v5.2.2/go.mod"},
+        "github.com/golang-sql/civil": {"v0.0.0-20190719163853-cb61b32ac6fe/go.mod"},
+        "github.com/golang/groupcache": {"v0.0.0-20210331224755-41bb18bfe9da", "v0.0.0-20210331224755-41bb18bfe9da/go.mod"},
+        "github.com/golang/protobuf": {"v1.2.0/go.mod", "v1.3.1/go.mod", "v1.3.2/go.mod", "v1.3.4/go.mod", "v1.5.4", "v1.5.4/go.mod"},
+        "github.com/google/certificate-transparency-go": {"v1.0.10-0.20180222191210-5ab67e519c93", "v1.0.10-0.20180222191210-5ab67e519c93/go.mod"},
+        "github.com/google/gnostic-models": {"v0.6.8", "v0.6.8/go.mod"},
+        "github.com/google/go-cmp": {"v0.3.0/go.mod", "v0.5.9/go.mod", "v0.7.0", "v0.7.0/go.mod"},
+        "github.com/google/gofuzz": {"v1.0.0/go.mod", "v1.2.0", "v1.2.0/go.mod"},
+        "github.com/google/pprof": {"v0.0.0-20250403155104-27863c87afa6", "v0.0.0-20250403155104-27863c87afa6/go.mod"},
+        "github.com/google/shlex": {"v0.0.0-20191202100458-e7afc7fbc510", "v0.0.0-20191202100458-e7afc7fbc510/go.mod"},
+        "github.com/google/uuid": {"v1.6.0", "v1.6.0/go.mod"},
+        "github.com/gorilla/mux": {"v1.7.0/go.mod", "v1.8.1", "v1.8.1/go.mod"},
+        "github.com/gorilla/websocket": {"v1.5.0", "v1.5.0/go.mod"},
+        "github.com/grpc-ecosystem/grpc-gateway/v2": {"v2.26.1", "v2.26.1/go.mod"},
+        "github.com/hailocab/go-hostpool": {"v0.0.0-20160125115350-e80d13ce29ed", "v0.0.0-20160125115350-e80d13ce29ed/go.mod"},
+        "github.com/hashicorp/errwrap": {"v1.0.0/go.mod", "v1.1.0", "v1.1.0/go.mod"},
+        "github.com/hashicorp/go-cleanhttp": {"v0.5.2", "v0.5.2/go.mod"},
+        "github.com/hashicorp/go-multierror": {"v1.1.1", "v1.1.1/go.mod"},
+        "github.com/hashicorp/go-version": {"v1.7.0", "v1.7.0/go.mod"},
+        "github.com/hinshun/vt10x": {"v0.0.0-20220119200601-820417d04eec", "v0.0.0-20220119200601-820417d04eec/go.mod"},
+        "github.com/hpcloud/tail": {"v1.0.0/go.mod"},
+        "github.com/in-toto/in-toto-golang": {"v0.9.0", "v0.9.0/go.mod"},
+        "github.com/inconshreveable/mousetrap": {"v1.0.0/go.mod", "v1.1.0", "v1.1.0/go.mod"},
+        "github.com/inhies/go-bytesize": {"v0.0.0-20220417184213-4913239db9cf", "v0.0.0-20220417184213-4913239db9cf/go.mod"},
+        "github.com/jinzhu/gorm": {"v0.0.0-20170222002820-5409931a1bb8", "v0.0.0-20170222002820-5409931a1bb8/go.mod"},
+        "github.com/jinzhu/inflection": {"v0.0.0-20170102125226-1c35d901db3d", "v0.0.0-20170102125226-1c35d901db3d/go.mod"},
+        "github.com/jinzhu/now": {"v1.1.1/go.mod"},
+        "github.com/jonboulle/clockwork": {"v0.5.0", "v0.5.0/go.mod"},
+        "github.com/josharian/intern": {"v1.0.0", "v1.0.0/go.mod"},
+        "github.com/json-iterator/go": {"v1.1.12", "v1.1.12/go.mod", "v1.1.6/go.mod", "v1.1.7/go.mod"},
+        "github.com/juju/loggo": {"v0.0.0-20190526231331-6e530bcce5d8/go.mod"},
+        "github.com/julienschmidt/httprouter": {"v1.2.0/go.mod"},
+        "github.com/kballard/go-shellquote": {"v0.0.0-20180428030007-95032a82bc51", "v0.0.0-20180428030007-95032a82bc51/go.mod"},
+        "github.com/kisielk/errcheck": {"v1.5.0/go.mod"},
+        "github.com/kisielk/gotool": {"v1.0.0/go.mod"},
+        "github.com/klauspost/compress": {"v1.18.0", "v1.18.0/go.mod"},
+        "github.com/konsorten/go-windows-terminal-sequences": {"v1.0.1/go.mod", "v1.0.2/go.mod"},
+        "github.com/kr/logfmt": {"v0.0.0-20140226030751-b84e30acd515/go.mod"},
+        "github.com/kr/pretty": {"v0.1.0/go.mod", "v0.2.1/go.mod", "v0.3.1", "v0.3.1/go.mod"},
+        "github.com/kr/pty": {"v1.1.1/go.mod"},
+        "github.com/kr/text": {"v0.1.0/go.mod", "v0.2.0", "v0.2.0/go.mod"},
+        "github.com/kylelemons/godebug": {"v1.1.0", "v1.1.0/go.mod"},
+        "github.com/lib/pq": {"v0.0.0-20150723085316-0dad96c0b94f/go.mod"},
+        "github.com/magiconair/properties": {"v1.5.3/go.mod", "v1.8.9", "v1.8.9/go.mod"},
+        "github.com/mailru/easyjson": {"v0.7.7", "v0.7.7/go.mod"},
+        "github.com/mattn/go-colorable": {"v0.1.13", "v0.1.13/go.mod", "v0.1.2/go.mod"},
+        "github.com/mattn/go-isatty": {"v0.0.16/go.mod", "v0.0.20", "v0.0.20/go.mod", "v0.0.8/go.mod"},
+        "github.com/mattn/go-runewidth": {"v0.0.16", "v0.0.16/go.mod"},
+        "github.com/mattn/go-shellwords": {"v1.0.12", "v1.0.12/go.mod"},
+        "github.com/mattn/go-sqlite3": {"v1.6.0/go.mod"},
+        "github.com/matttproud/golang_protobuf_extensions": {"v1.0.1/go.mod"},
+        "github.com/mgutz/ansi": {"v0.0.0-20170206155736-9520e82c474b", "v0.0.0-20170206155736-9520e82c474b/go.mod"},
+        "github.com/miekg/pkcs11": {"v1.0.2/go.mod", "v1.1.1", "v1.1.1/go.mod"},
+        "github.com/mitchellh/go-ps": {"v1.0.0", "v1.0.0/go.mod"},
+        "github.com/mitchellh/hashstructure/v2": {"v2.0.2", "v2.0.2/go.mod"},
+        "github.com/mitchellh/mapstructure": {"v0.0.0-20150613213606-2caf8efc9366/go.mod", "v1.5.0", "v1.5.0/go.mod"},
+        "github.com/moby/buildkit": {"v0.24.0", "v0.24.0/go.mod"},
+        "github.com/moby/docker-image-spec": {"v1.3.1", "v1.3.1/go.mod"},
+        "github.com/moby/go-archive": {"v0.1.0", "v0.1.0/go.mod"},
+        "github.com/moby/locker": {"v1.0.1", "v1.0.1/go.mod"},
+        "github.com/moby/patternmatcher": {"v0.6.0", "v0.6.0/go.mod"},
+        "github.com/moby/spdystream": {"v0.5.0", "v0.5.0/go.mod"},
+        "github.com/moby/sys/atomicwriter": {"v0.1.0", "v0.1.0/go.mod"},
+        "github.com/moby/sys/capability": {"v0.4.0", "v0.4.0/go.mod"},
+        "github.com/moby/sys/mountinfo": {"v0.7.2", "v0.7.2/go.mod"},
+        "github.com/moby/sys/sequential": {"v0.6.0", "v0.6.0/go.mod"},
+        "github.com/moby/sys/signal": {"v0.7.1", "v0.7.1/go.mod"},
+        "github.com/moby/sys/symlink": {"v0.3.0", "v0.3.0/go.mod"},
+        "github.com/moby/sys/user": {"v0.4.0", "v0.4.0/go.mod"},
+        "github.com/moby/sys/userns": {"v0.1.0", "v0.1.0/go.mod"},
+        "github.com/moby/term": {"v0.5.2", "v0.5.2/go.mod"},
+        "github.com/modern-go/concurrent": {"v0.0.0-20180228061459-e0a39a4cb421/go.mod", "v0.0.0-20180306012644-bacd9c7ef1dd", "v0.0.0-20180306012644-bacd9c7ef1dd/go.mod"},
+        "github.com/modern-go/reflect2": {"v0.0.0-20180701023420-4b7aa43c6742/go.mod", "v1.0.1/go.mod", "v1.0.2", "v1.0.2/go.mod"},
+        "github.com/morikuni/aec": {"v1.0.0", "v1.0.0/go.mod"},
+        "github.com/munnerz/goautoneg": {"v0.0.0-20191010083416-a7dc8b61c822", "v0.0.0-20191010083416-a7dc8b61c822/go.mod"},
+        "github.com/mwitkow/go-conntrack": {"v0.0.0-20161129095857-cc309e4a2223/go.mod"},
+        "github.com/mxk/go-flowrate": {"v0.0.0-20140419014527-cca7078d478f", "v0.0.0-20140419014527-cca7078d478f/go.mod"},
+        "github.com/niemeyer/pretty": {"v0.0.0-20200227124842-a10e7caefd8e/go.mod"},
+        "github.com/onsi/ginkgo": {"v1.12.0", "v1.12.0/go.mod", "v1.6.0/go.mod"},
+        "github.com/onsi/ginkgo/v2": {"v2.21.0", "v2.21.0/go.mod"},
+        "github.com/onsi/gomega": {"v1.35.1", "v1.35.1/go.mod", "v1.7.1/go.mod", "v1.9.0/go.mod"},
+        "github.com/opencontainers/go-digest": {"v0.0.0-20170106003457-a6d0ee40d420/go.mod", "v1.0.0", "v1.0.0/go.mod"},
+        "github.com/opencontainers/image-spec": {"v1.0.1/go.mod", "v1.1.1", "v1.1.1/go.mod"},
+        "github.com/opencontainers/runtime-spec": {"v1.2.1", "v1.2.1/go.mod"},
+        "github.com/opencontainers/selinux": {"v1.12.0", "v1.12.0/go.mod"},
+        "github.com/opentracing/opentracing-go": {"v1.1.0", "v1.1.0/go.mod"},
+        "github.com/otiai10/copy": {"v1.14.1", "v1.14.1/go.mod"},
+        "github.com/otiai10/mint": {"v1.6.3", "v1.6.3/go.mod"},
+        "github.com/pelletier/go-toml": {"v1.9.5", "v1.9.5/go.mod"},
+        "github.com/pkg/errors": {"v0.8.0/go.mod", "v0.8.1/go.mod", "v0.9.1", "v0.9.1/go.mod"},
+        "github.com/planetscale/vtprotobuf": {"v0.6.1-0.20240319094008-0393e58bdf10", "v0.6.1-0.20240319094008-0393e58bdf10/go.mod"},
+        "github.com/pmezard/go-difflib": {"v1.0.0", "v1.0.0/go.mod"},
+        "github.com/prometheus/client_golang": {"v0.9.0-pre1.0.20180209125602-c332b6f63c06/go.mod", "v0.9.1/go.mod", "v1.0.0/go.mod", "v1.1.0/go.mod", "v1.22.0", "v1.22.0/go.mod"},
+        "github.com/prometheus/client_model": {"v0.0.0-20171117100541-99fa1f4be8e5/go.mod", "v0.0.0-20180712105110-5c3871d89910/go.mod", "v0.0.0-20190129233127-fd36f4220a90/go.mod", "v0.6.1", "v0.6.1/go.mod"},
+        "github.com/prometheus/common": {"v0.0.0-20180110214958-89604d197083/go.mod", "v0.4.1/go.mod", "v0.6.0/go.mod", "v0.62.0", "v0.62.0/go.mod"},
+        "github.com/prometheus/procfs": {"v0.0.0-20180125133057-cb4147076ac7/go.mod", "v0.0.0-20181005140218-185b4288413d/go.mod", "v0.0.2/go.mod", "v0.0.3/go.mod", "v0.15.1", "v0.15.1/go.mod"},
+        "github.com/rivo/uniseg": {"v0.2.0", "v0.2.0/go.mod"},
+        "github.com/rogpeppe/go-internal": {"v1.13.1", "v1.13.1/go.mod"},
+        "github.com/russross/blackfriday/v2": {"v2.1.0", "v2.1.0/go.mod"},
+        "github.com/santhosh-tekuri/jsonschema/v6": {"v6.0.1", "v6.0.1/go.mod"},
+        "github.com/secure-systems-lab/go-securesystemslib": {"v0.6.0", "v0.6.0/go.mod"},
+        "github.com/serialx/hashring": {"v0.0.0-20200727003509-22c0c7ab6b1b", "v0.0.0-20200727003509-22c0c7ab6b1b/go.mod"},
+        "github.com/shibumi/go-pathspec": {"v1.3.0", "v1.3.0/go.mod"},
+        "github.com/sirupsen/logrus": {"v1.0.6/go.mod", "v1.2.0/go.mod", "v1.4.1/go.mod", "v1.9.3", "v1.9.3/go.mod"},
+        "github.com/skratchdot/open-golang": {"v0.0.0-20200116055534-eef842397966", "v0.0.0-20200116055534-eef842397966/go.mod"},
+        "github.com/spdx/tools-golang": {"v0.5.5", "v0.5.5/go.mod"},
+        "github.com/spf13/cast": {"v0.0.0-20150508191742-4d07383ffe94", "v0.0.0-20150508191742-4d07383ffe94/go.mod"},
+        "github.com/spf13/cobra": {"v0.0.1/go.mod", "v1.10.1", "v1.10.1/go.mod"},
+        "github.com/spf13/jwalterweatherman": {"v0.0.0-20141219030609-3d60171a6431", "v0.0.0-20141219030609-3d60171a6431/go.mod"},
+        "github.com/spf13/pflag": {"v1.0.0/go.mod", "v1.0.10", "v1.0.10/go.mod", "v1.0.9/go.mod"},
+        "github.com/spf13/viper": {"v0.0.0-20150530192845-be5ff3e4840c", "v0.0.0-20150530192845-be5ff3e4840c/go.mod"},
+        "github.com/stretchr/objx": {"v0.1.0/go.mod", "v0.1.1/go.mod", "v0.2.0/go.mod", "v0.4.0/go.mod", "v0.5.0/go.mod"},
+        "github.com/stretchr/testify": {"v1.11.1", "v1.11.1/go.mod", "v1.2.2/go.mod", "v1.3.0/go.mod", "v1.4.0/go.mod", "v1.5.1/go.mod", "v1.6.1/go.mod", "v1.7.0/go.mod", "v1.7.1/go.mod", "v1.8.0/go.mod", "v1.8.1/go.mod"},
+        "github.com/theupdateframework/notary": {"v0.7.0", "v0.7.0/go.mod"},
+        "github.com/tilt-dev/fsnotify": {"v1.4.8-0.20220602155310-fff9c274a375", "v1.4.8-0.20220602155310-fff9c274a375/go.mod"},
+        "github.com/tonistiigi/dchapes-mode": {"v0.0.0-20250318174251-73d941a28323", "v0.0.0-20250318174251-73d941a28323/go.mod"},
+        "github.com/tonistiigi/fsutil": {"v0.0.0-20250605211040-586307ad452f", "v0.0.0-20250605211040-586307ad452f/go.mod"},
+        "github.com/tonistiigi/go-csvvalue": {"v0.0.0-20240814133006-030d3b2625d0", "v0.0.0-20240814133006-030d3b2625d0/go.mod"},
+        "github.com/tonistiigi/units": {"v0.0.0-20180711220420-6950e57a87ea", "v0.0.0-20180711220420-6950e57a87ea/go.mod"},
+        "github.com/tonistiigi/vt100": {"v0.0.0-20240514184818-90bafcd6abab", "v0.0.0-20240514184818-90bafcd6abab/go.mod"},
+        "github.com/vbatts/tar-split": {"v0.12.1", "v0.12.1/go.mod"},
+        "github.com/x448/float16": {"v0.8.4", "v0.8.4/go.mod"},
+        "github.com/xhit/go-str2duration/v2": {"v2.1.0", "v2.1.0/go.mod"},
+        "github.com/yuin/goldmark": {"v1.1.27/go.mod", "v1.2.1/go.mod", "v1.4.13/go.mod"},
+        "github.com/zclconf/go-cty": {"v1.16.2", "v1.16.2/go.mod"},
+        "go.opencensus.io": {"v0.24.0", "v0.24.0/go.mod"},
+        "go.opentelemetry.io/auto/sdk": {"v1.1.0", "v1.1.0/go.mod"},
+        "go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc": {"v0.60.0", "v0.60.0/go.mod"},
+        "go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace": {"v0.60.0", "v0.60.0/go.mod"},
+        "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp": {"v0.60.0", "v0.60.0/go.mod"},
+        "go.opentelemetry.io/otel": {"v1.36.0", "v1.36.0/go.mod"},
+        "go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc": {"v1.35.0", "v1.35.0/go.mod"},
+        "go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp": {"v1.35.0", "v1.35.0/go.mod"},
+        "go.opentelemetry.io/otel/exporters/otlp/otlptrace": {"v1.35.0", "v1.35.0/go.mod"},
+        "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc": {"v1.35.0", "v1.35.0/go.mod"},
+        "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp": {"v1.35.0", "v1.35.0/go.mod"},
+        "go.opentelemetry.io/otel/metric": {"v1.36.0", "v1.36.0/go.mod"},
+        "go.opentelemetry.io/otel/sdk": {"v1.36.0", "v1.36.0/go.mod"},
+        "go.opentelemetry.io/otel/sdk/metric": {"v1.36.0", "v1.36.0/go.mod"},
+        "go.opentelemetry.io/otel/trace": {"v1.36.0", "v1.36.0/go.mod"},
+        "go.opentelemetry.io/proto/otlp": {"v1.5.0", "v1.5.0/go.mod"},
+        "go.uber.org/goleak": {"v1.3.0", "v1.3.0/go.mod"},
+        "go.uber.org/mock": {"v0.6.0", "v0.6.0/go.mod"},
+        "golang.org/x/crypto": {"v0.0.0-20180904163835-0709b304e793/go.mod", "v0.0.0-20190308221718-c2843e01d9a2/go.mod", "v0.0.0-20190325154230-a5d413f7728c/go.mod", "v0.0.0-20191011191535-87dc89f01550/go.mod", "v0.0.0-20200302210943-78000ba7a073/go.mod", "v0.0.0-20200622213623-75b288015ac9/go.mod", "v0.0.0-20201117144127-c1f2f97bffc9/go.mod", "v0.0.0-20210921155107-089bfa567519/go.mod", "v0.38.0", "v0.38.0/go.mod"},
+        "golang.org/x/mod": {"v0.2.0/go.mod", "v0.27.0", "v0.27.0/go.mod", "v0.3.0/go.mod", "v0.6.0-dev.0.20220419223038-86c51ed26bb4/go.mod"},
+        "golang.org/x/net": {"v0.0.0-20180906233101-161cd47e91fd/go.mod", "v0.0.0-20181114220301-adae6a3d119a/go.mod", "v0.0.0-20190404232315-eb5bcb51f2a3/go.mod", "v0.0.0-20190613194153-d28f0bde5980/go.mod", "v0.0.0-20190620200207-3b0461eec859/go.mod", "v0.0.0-20200226121028-0de0cce0169b/go.mod", "v0.0.0-20201021035429-f5854403a974/go.mod", "v0.0.0-20210226172049-e18ecbb05110/go.mod", "v0.0.0-20220722155237-a158d28d115b/go.mod", "v0.40.0", "v0.40.0/go.mod"},
+        "golang.org/x/oauth2": {"v0.30.0", "v0.30.0/go.mod"},
+        "golang.org/x/sync": {"v0.0.0-20180314180146-1d60e4601c6f/go.mod", "v0.0.0-20181108010431-42b317875d0f/go.mod", "v0.0.0-20181221193216-37e7f081c4d4/go.mod", "v0.0.0-20190423024810-112230192c58/go.mod", "v0.0.0-20190911185100-cd5d95a43a6e/go.mod", "v0.0.0-20201020160332-67f06af15bc9/go.mod", "v0.0.0-20220722155255-886fb9371eb4/go.mod", "v0.17.0", "v0.17.0/go.mod"},
+        "golang.org/x/sys": {"v0.0.0-20180905080454-ebe1bf3edb33/go.mod", "v0.0.0-20180909124046-d0be0721c37e/go.mod", "v0.0.0-20181116152217-5ac8a444bdc5/go.mod", "v0.0.0-20190215142949-d0b11bdaac8a/go.mod", "v0.0.0-20190222072716-a9d3bda3a223/go.mod", "v0.0.0-20190412213103-97732733099d/go.mod", "v0.0.0-20190801041406-cbf593c0f2f3/go.mod", "v0.0.0-20191026070338-33540a1f6037/go.mod", "v0.0.0-20191120155948-bd437916bb0e/go.mod", "v0.0.0-20200930185726-fdedc70b468f/go.mod", "v0.0.0-20201119102817-f84b799fce68/go.mod", "v0.0.0-20210331175145-43e1dd70ce54/go.mod", "v0.0.0-20210615035016-665e8c7367d1/go.mod", "v0.0.0-20210616094352-59db8d763f22/go.mod", "v0.0.0-20220412211240-33da011f77ad/go.mod", "v0.0.0-20220520151302-bc2c85ada10a/go.mod", "v0.0.0-20220715151400-c0bba94af5f8/go.mod", "v0.0.0-20220722155257-8c9f86f7a55f/go.mod", "v0.0.0-20220811171246-fbc7d0a398ab/go.mod", "v0.1.0/go.mod", "v0.37.0", "v0.37.0/go.mod", "v0.6.0/go.mod"},
+        "golang.org/x/term": {"v0.0.0-20201117132131-f5c789dd3221/go.mod", "v0.0.0-20201126162022-7de9c90e9dd1/go.mod", "v0.0.0-20210927222741-03fcf44c2211/go.mod", "v0.32.0", "v0.32.0/go.mod"},
+        "golang.org/x/text": {"v0.25.0", "v0.25.0/go.mod", "v0.3.0/go.mod", "v0.3.3/go.mod", "v0.3.7/go.mod", "v0.4.0/go.mod"},
+        "golang.org/x/time": {"v0.11.0", "v0.11.0/go.mod"},
+        "golang.org/x/tools": {"v0.0.0-20180917221912-90fa682c2a6e/go.mod", "v0.0.0-20191119224855-298f0cb1881e/go.mod", "v0.0.0-20200619180055-7c47624df98f/go.mod", "v0.0.0-20210106214847-113979e3529a/go.mod", "v0.1.12/go.mod", "v0.36.0", "v0.36.0/go.mod"},
+        "golang.org/x/xerrors": {"v0.0.0-20190717185122-a985d3407aa7/go.mod", "v0.0.0-20191011141410-1b5146add898/go.mod", "v0.0.0-20191204190536-9bdfabe68543/go.mod", "v0.0.0-20200804184101-5ec99f83aff1/go.mod"},
+        "google.golang.org/genproto/googleapis/api": {"v0.0.0-20250528174236-200df99c418a", "v0.0.0-20250528174236-200df99c418a/go.mod"},
+        "google.golang.org/genproto/googleapis/rpc": {"v0.0.0-20250528174236-200df99c418a", "v0.0.0-20250528174236-200df99c418a/go.mod"},
+        "google.golang.org/grpc": {"v1.0.5/go.mod", "v1.74.2", "v1.74.2/go.mod"},
+        "google.golang.org/protobuf": {"v1.36.6", "v1.36.6/go.mod"},
+        "gopkg.in/airbrake/gobrake.v2": {"v2.0.9/go.mod"},
+        "gopkg.in/alecthomas/kingpin.v2": {"v2.2.6/go.mod"},
+        "gopkg.in/cenkalti/backoff.v2": {"v2.2.1", "v2.2.1/go.mod"},
+        "gopkg.in/check.v1": {"v0.0.0-20161208181325-20d25e280405/go.mod", "v1.0.0-20200227125254-8fa46927fb4f/go.mod", "v1.0.0-20201130134442-10cb98267c6c", "v1.0.0-20201130134442-10cb98267c6c/go.mod"},
+        "gopkg.in/evanphx/json-patch.v4": {"v4.12.0", "v4.12.0/go.mod"},
+        "gopkg.in/fsnotify.v1": {"v1.4.7/go.mod"},
+        "gopkg.in/gemnasium/logrus-airbrake-hook.v2": {"v2.1.2/go.mod"},
+        "gopkg.in/inf.v0": {"v0.9.1", "v0.9.1/go.mod"},
+        "gopkg.in/ini.v1": {"v1.67.0", "v1.67.0/go.mod"},
+        "gopkg.in/rethinkdb/rethinkdb-go.v6": {"v6.2.1", "v6.2.1/go.mod"},
+        "gopkg.in/tomb.v1": {"v1.0.0-20141024135613-dd632973f1e7/go.mod"},
+        "gopkg.in/yaml.v2": {"v2.2.1/go.mod", "v2.2.2/go.mod", "v2.2.4/go.mod", "v2.2.8/go.mod", "v2.4.0", "v2.4.0/go.mod"},
+        "gopkg.in/yaml.v3": {"v3.0.0-20200313102051-9f266ea9e77c/go.mod", "v3.0.1", "v3.0.1/go.mod", "v3.0.4", "v3.0.4/go.mod"},
+        "gotest.tools/v3": {"v3.5.2", "v3.5.2/go.mod"},
+        "k8s.io/api": {"v0.32.3", "v0.32.3/go.mod"},
+        "k8s.io/apimachinery": {"v0.32.3", "v0.32.3/go.mod"},
+        "k8s.io/client-go": {"v0.32.3", "v0.32.3/go.mod"},
+        "k8s.io/klog/v2": {"v2.130.1", "v2.130.1/go.mod"},
+        "k8s.io/kube-openapi": {"v0.0.0-20241105132330-32ad38e42d3f", "v0.0.0-20241105132330-32ad38e42d3f/go.mod"},
+        "k8s.io/utils": {"v0.0.0-20241104100929-3ea5e8cea738", "v0.0.0-20241104100929-3ea5e8cea738/go.mod"},
+        "sigs.k8s.io/json": {"v0.0.0-20241010143419-9aa6b5e7a4b3", "v0.0.0-20241010143419-9aa6b5e7a4b3/go.mod"},
+        "sigs.k8s.io/structured-merge-diff/v4": {"v4.4.2", "v4.4.2/go.mod"},
+        "sigs.k8s.io/yaml": {"v1.4.0", "v1.4.0/go.mod"},
+        "tags.cncf.io/container-device-interface": {"v1.0.1", "v1.0.1/go.mod"}
+    }
 
     s = d.getVar('S')
     workdir = d.getVar('WORKDIR')
@@ -321,58 +658,277 @@ python do_create_module_cache() {
     repo_locks_lock = threading.Lock()
 
     def acquire_repo_lock(path):
-        key = str(path)
-        with repo_locks_lock:
-            lock = repo_locks.get(key)
-            if not lock:
-                lock = threading.Lock()
-                repo_locks[key] = lock
-            return lock
+    key = str(path)
+    with repo_locks_lock:
+    lock = repo_locks.get(key)
+    if not lock:
+    lock = threading.Lock()
+    repo_locks[key] = lock
+    return lock
 
     # Process modules in parallel
     def process_module(module_data):
-        module_path = module_data['module']
-        version = module_data['version']
-        repo_url = module_data['repo_url']
-        commit = module_data['commit']
-        subdir = module_data.get('subdir')
+    module_path = module_data['module']
+    version = module_data['version']
+    repo_url = module_data['repo_url']
+    commit = module_data['commit']
+    subdir = module_data.get('subdir')
 
-        # Calculate VCS cache path
-        vcs_key = f"git3:{repo_url}"
-        vcs_hash = hashlib.sha256(vcs_key.encode()).hexdigest()
-        # VCS cache is downloaded to ${WORKDIR}/sources/vcs_cache/ by git:// fetcher
-        workdir = d.getVar('WORKDIR')
-        vcs_cache_path = Path(workdir) / "sources" / "vcs_cache" / vcs_hash
+    # Calculate VCS cache path
+    vcs_key = f"git3:{repo_url}"
+    vcs_hash = hashlib.sha256(vcs_key.encode()).hexdigest()
+    # VCS cache is downloaded to ${WORKDIR}/sources/vcs_cache/ by git:// fetcher
+    workdir = d.getVar('WORKDIR')
+    vcs_cache_path = Path(workdir) / "sources" / "vcs_cache" / vcs_hash
 
-        # VCS cache should already exist from git:// download
-        if vcs_cache_path.exists():
-            lock = acquire_repo_lock(vcs_cache_path)
-            with lock:
-                bb.note(f"Processing {module_path}@{version}")
-                create_vcs_info_file(str(vcs_cache_path), repo_url)
-                try:
-                    subprocess.run(["git", "checkout", commit], cwd=vcs_cache_path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                except subprocess.CalledProcessError:
-                    subprocess.run(["git", "fetch", "--all"], cwd=vcs_cache_path, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    subprocess.run(["git", "checkout", commit], cwd=vcs_cache_path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                create_module_zip(module_path, version, str(vcs_cache_path), subdir)
-        else:
-            bb.warn(f"VCS cache missing for {module_path}: {vcs_cache_path}")
+    # VCS cache should already exist from git:// download
+    if vcs_cache_path.exists():
+    lock = acquire_repo_lock(vcs_cache_path)
+    with lock:
+    bb.note(f"Processing {module_path}@{version}")
+    create_vcs_info_file(str(vcs_cache_path), repo_url)
+    try:
+    subprocess.run(["git", "checkout", commit], cwd=vcs_cache_path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError:
+    subprocess.run(["git", "fetch", "--all"], cwd=vcs_cache_path, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    subprocess.run(["git", "checkout", commit], cwd=vcs_cache_path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    alias_of = module_data.get('alias_of')
+    create_module_zip(module_path, version, str(vcs_cache_path), subdir, alias_of)
+
+    # Extract module to pkg/mod for offline Go builds
+    # The zip contains paths like "gopkg.in/yaml.v3@v3.0.4/..." so extract to pkg/mod directly
+    try:
+    import zipfile
+    import os
+    def escape_module_path_local(path):
+    import re
+    return re.sub(r'([A-Z])', lambda m: '!' + m.group(1).lower(), path)
+
+    escaped_module = escape_module_path_local(module_path)
+    escaped_version = escape_module_path_local(version)
+
+    zip_path = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_module / "@v" / f"{escaped_version}.zip"
+    extract_dir = Path(d.getVar('S')) / "pkg" / "mod"
+
+    # Handle version aliases (e.g., v3.0.1 pointing to v3.0.4)
+    is_version_alias = module_data.get('is_version_alias', False)
+    if is_version_alias:
+    # This is a version alias - create symlink and copy cache files
+    orig_ver = module_data.get('original_version')
+    if orig_ver:
+    # Create symlink in pkg/mod: yaml.v3@v3.0.1 -> yaml.v3@v3.0.4
+    orig_dir = extract_dir / f"{module_path}@{orig_ver}"
+    alias_dir = extract_dir / f"{module_path}@{version}"
+    if orig_dir.exists() and not alias_dir.exists():
+    os.symlink(f"{module_path}@{orig_ver}", alias_dir)
+    bb.note(f"Created symlink {module_path}@{version} -> @{orig_ver}")
+
+    # Copy cache files (.mod, .zip) for the alias version
+    import shutil
+    download_dir = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_module / "@v"
+    orig_escaped_ver = escape_module_path_local(orig_ver)
+    for ext in ['.mod', '.zip']:
+    src = download_dir / f"{orig_escaped_ver}{ext}"
+    dst = download_dir / f"{escaped_version}{ext}"
+    if src.exists() and not dst.exists():
+    shutil.copy2(src, dst)
+    bb.note(f"Copied cache file {escaped_version}{ext}")
+    elif zip_path.exists():
+    # Normal extraction for non-alias modules
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+    zf.extractall(extract_dir)
+    bb.note(f"Extracted {module_path}@{version} to pkg/mod")
+    except Exception as e:
+    bb.debug(1, f"Module extraction skipped for {module_path}: {e}")
+    else:
+    bb.warn(f"VCS cache missing for {module_path}: {vcs_cache_path}")
 
     # Use ThreadPoolExecutor for parallel processing
     with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(process_module, module) for module in modules_data]
-        for future in as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                bb.warn(f"Module processing failed: {e}")
+    futures = [executor.submit(process_module, module) for module in modules_data]
+    for future in as_completed(futures):
+    try:
+    future.result()
+    except Exception as e:
+    bb.warn(f"Module processing failed: {e}")
+
+    # Post-process to find version mismatches from transitive dependencies
+    # Use go.sum data to find what versions are needed, create symlinks for missing versions
+    bb.note("Checking for version mismatches using go.sum data...")
+
+    import re
+    import os
+    def escape_module_path_post(path):
+    return re.sub(r'([A-Z])', lambda m: '!' + m.group(1).lower(), path)
+
+    def canonicalize_module_path(module_path):
+    """Normalize alternate module paths to canonical form (e.g., go.yaml.in -> gopkg.in)"""
+    match = re.match(r'^go\.([^\.]+)\.in/(.+)$', module_path)
+    if match:
+    name, rest = match.groups()
+    parts = rest.split('/')
+    if len(parts) >= 2:
+    module_name = parts[0] or name
+    version = parts[1]
+    remainder = '/'.join(parts[2:])
+    canonical = f"gopkg.in/{module_name}.{version}"
+    if remainder:
+    canonical = f"{canonical}/{remainder}"
+    return canonical
+    return f"gopkg.in/{name}.{rest}"
+    return module_path
+
+    # Track what versions we have extracted
+    # Map canonical path -> {actual_path: versions}
+    extracted_modules = {}  # canonical_path -> set of versions
+    actual_paths = {}  # canonical_path -> actual_extracted_path
+    pkg_mod_dir = Path(d.getVar('S')) / "pkg" / "mod"
+
+    # Scan extracted modules to see what we have
+    if pkg_mod_dir.exists():
+    for item in pkg_mod_dir.iterdir():
+    if item.is_dir() and '@' not in str(item.name):
+    # This is a module directory (e.g., "gopkg.in", "github.com", "go.yaml.in")
+    for subitem in item.rglob("*"):
+    if subitem.is_dir() and '@' in subitem.name:
+    # Found a versioned module (e.g., "yaml.v3@v3.0.4" or "go.yaml.in/yaml/v3@v3.0.4")
+    rel_path = subitem.relative_to(pkg_mod_dir)
+    parts = str(rel_path).rsplit('@', 1)
+    if len(parts) == 2:
+    actual_mod_path = parts[0]
+    version = parts[1]
+
+    # Track by canonical path so go.sum lookups work
+    canonical_path = canonicalize_module_path(actual_mod_path)
+    extracted_modules.setdefault(canonical_path, set()).add(version)
+
+    # Remember the actual extracted path for creating symlinks
+    if canonical_path not in actual_paths:
+    actual_paths[canonical_path] = actual_mod_path
+
+    # Find mismatches: versions in go.sum but not extracted
+    missing_versions = []
+    for mod_path, req_versions in go_sum_requirements.items():
+    extracted = extracted_modules.get(mod_path, set())
+    for req_ver in req_versions:
+    if req_ver not in extracted:
+    # Find a version we DO have for this module
+    if extracted:
+    base_ver = sorted(extracted)[-1]  # Use highest version
+    actual_path = actual_paths.get(mod_path, mod_path)
+    missing_versions.append((mod_path, actual_path, req_ver, base_ver))
+    else:
+    bb.debug(1, f"go.sum requires {mod_path}@{req_ver} but no version extracted")
+
+    # Create symlinks and cache files for missing versions
+    if missing_versions:
+    bb.note(f"Found {len(missing_versions)} version mismatches from transitive dependencies")
+    for canonical_path, actual_path, missing_ver, base_ver in missing_versions:
+    try:
+    # Create symlink using actual extracted path (e.g., go.yaml.in/yaml/v3)
+    # module@missing_ver -> module@base_ver
+    base_dir = pkg_mod_dir / f"{actual_path}@{base_ver}"
+    missing_dir = pkg_mod_dir / f"{actual_path}@{missing_ver}"
+    if base_dir.exists() and not missing_dir.exists():
+    os.symlink(f"{actual_path}@{base_ver}", missing_dir)
+    bb.note(f"Created symlink: {actual_path}@{missing_ver} -> @{base_ver}")
+
+    # Also create at canonical path if different (e.g., gopkg.in/yaml.v3)
+    if canonical_path != actual_path:
+    canonical_base = pkg_mod_dir / f"{canonical_path}@{base_ver}"
+    canonical_missing = pkg_mod_dir / f"{canonical_path}@{missing_ver}"
+    if base_dir.exists() and not canonical_missing.exists():
+    # Link to actual extracted location
+    canonical_missing.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(f"../{actual_path}@{base_ver}", canonical_missing)
+    bb.note(f"Created canonical symlink: {canonical_path}@{missing_ver} -> {actual_path}@{base_ver}")
+
+    # Create cache files with canonical module path by rewriting zips
+    escaped_actual = escape_module_path_post(actual_path)
+    escaped_canonical = escape_module_path_post(canonical_path)
+    escaped_missing = escape_module_path_post(missing_ver)
+    escaped_base = escape_module_path_post(base_ver)
+
+    # Source cache files are at actual_path location
+    src_cache_dir = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_actual / "@v"
+    # Destination cache files need to be at canonical_path location
+    dst_cache_dir = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_canonical / "@v"
+
+    if src_cache_dir.exists():
+    dst_cache_dir.mkdir(parents=True, exist_ok=True)
+    import shutil
+    import zipfile
+    import tempfile
+
+    # Copy .mod file with rewritten module path
+    src_mod = src_cache_dir / f"{escaped_base}.mod"
+    dst_mod = dst_cache_dir / f"{escaped_missing}.mod"
+    if src_mod.exists() and not dst_mod.exists():
+    mod_content = src_mod.read_text()
+    # Rewrite module directive to use canonical path using a replacement function
+    import re
+    def replace_module(match):
+    return match.group(1) + canonical_path + match.group(3)
+
+    mod_content = re.sub(
+    r'^(module\s+)(' + re.escape(actual_path) + r')(\s*)',
+    replace_module,
+    mod_content,
+    count=1,
+    flags=re.MULTILINE
+    )
+    dst_mod.write_text(mod_content)
+    bb.note(f"Created cache file: {canonical_path}@{missing_ver}.mod (rewritten)")
+
+    # Create .zip file with canonical module paths
+    src_zip = src_cache_dir / f"{escaped_base}.zip"
+    dst_zip = dst_cache_dir / f"{escaped_missing}.zip"
+    if src_zip.exists() and not dst_zip.exists():
+    with tempfile.TemporaryDirectory() as tmpdir:
+    tmppath = Path(tmpdir)
+    # Extract source zip
+    with zipfile.ZipFile(src_zip, 'r') as zf:
+    zf.extractall(tmppath)
+
+    # Find and rewrite go.mod
+    for gomod in tmppath.rglob("go.mod"):
+    content = gomod.read_text()
+    def replace_in_zip(match):
+    return match.group(1) + canonical_path + match.group(3)
+
+    content = re.sub(
+    r'^(module\s+)(' + re.escape(actual_path) + r')(\s*)',
+    replace_in_zip,
+    content,
+    count=1,
+    flags=re.MULTILINE
+    )
+    gomod.write_text(content)
+
+    # Rename directory to use canonical path
+    old_dir = tmppath / f"{actual_path}@{base_ver}"
+    new_dir = tmppath / f"{canonical_path}@{missing_ver}"
+    if old_dir.exists():
+    new_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(old_dir), str(new_dir))
+
+    # Create new zip with canonical path
+    with zipfile.ZipFile(dst_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
+    for file in new_dir.rglob("*"):
+    if file.is_file():
+    arcname = str(file.relative_to(tmppath))
+    zf.write(file, arcname)
+
+    bb.note(f"Created cache file: {canonical_path}@{missing_ver}.zip (rewritten)")
+    except Exception as e:
+    bb.debug(1, f"Could not create version alias for {canonical_path}@{missing_ver}: {e}")
 
     bb.note("Module cache creation complete")
-}
+    }
 
-# Add task after do_unpack (when git repositories are available)
-addtask create_module_cache after do_unpack before do_configure
+    # Add task after do_unpack (when git repositories are available)
+    addtask create_module_cache after do_unpack before do_configure
 
 
 # ============================================================
