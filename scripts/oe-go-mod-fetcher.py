@@ -29,7 +29,7 @@ DIRHASH_REPO_URL = "https://go.googlesource.com/mod"
 DIRHASH_REPO_COMMIT = "f8a9fe217cff893cb67f4acad96a0021c13ee6e7"
 DIRHASH_HELPER_SOURCE = """package main\n\nimport (\n    \"fmt\"\n    \"os\"\n\n    \"golang.org/x/mod/sumdb/dirhash\"\n)\n\nfunc main() {\n    if len(os.Args) != 2 {\n        fmt.Fprintf(os.Stderr, \"Usage: %s <zip-file>\\n\", os.Args[0])\n        os.Exit(1)\n    }\n\n    zipPath := os.Args[1]\n    hash, err := dirhash.HashZip(zipPath, dirhash.DefaultHash)\n    if err != nil {\n        fmt.Fprintf(os.Stderr, \"Error: %v\\n\", err)\n        os.Exit(1)\n    }\n\n    fmt.Println(hash)\n}\n"""
 
-MODULE_CACHE_TASK_HEADER = textwrap.dedent(r'''\
+MODULE_CACHE_TASK_HEADER = textwrap.dedent(r'''
 python do_create_module_cache() {
     """
     Build Go module cache from downloaded git repositories.
@@ -197,8 +197,7 @@ python do_create_module_cache() {
     modules_data = [
 ''')
 
-MODULE_CACHE_TASK_FOOTER = textwrap.dedent(r'''\
-    ]
+MODULE_CACHE_TASK_FOOTER = textwrap.dedent(r'''    ]
 
     s = d.getVar('S')
     workdir = d.getVar('WORKDIR')
@@ -570,10 +569,21 @@ class HybridModuleCacheBuilder:
         else:
             go_sum_block = "\n    # No go.sum data available\n    go_sum_requirements = {}\n"
 
-        # Build task: header + modules list + close list (footer) + go_sum dict + rest of task
-        # We need to split FOOTER to insert go_sum_block after the list closes
-        footer_lines = MODULE_CACHE_TASK_FOOTER.split('\n', 1)  # Split at first newline (the "]")
-        return MODULE_CACHE_TASK_HEADER + modules_block + footer_lines[0] + '\n' + go_sum_block + '\n' + footer_lines[1]
+        # Build task: header + modules list + close list + go_sum dict + rest of task
+        # The FOOTER has been dedented, so it starts with "\n]\n\n", then the task code with no indentation.
+        # We need to skip the "]" and re-add indentation to the task code.
+        # Find where "s = d.getVar" starts (after "\n]\n\n")
+        footer_start = MODULE_CACHE_TASK_FOOTER.find('s = d.getVar')
+        if footer_start == -1:
+            footer_start = 4  # Fallback: skip "\n]\n\n"
+
+        # Get the footer code - it should have no indentation after dedent, but add 4 spaces to be safe
+        footer_code = MODULE_CACHE_TASK_FOOTER[footer_start:]
+
+        # Strip any existing indentation from each line, then add 4 spaces
+        indented_footer = '\n'.join('    ' + line.lstrip() if line.strip() else '' for line in footer_code.split('\n'))
+
+        return MODULE_CACHE_TASK_HEADER + modules_block + '\n    ]\n' + go_sum_block + '\n' + indented_footer
 
 
 class GoModuleFetcher:
@@ -1171,7 +1181,7 @@ class GoModuleFetcher:
                 print(f"    📁 Using GOMODCACHE: {mod_cache_dir}")
 
                 output = subprocess.check_output(
-                    ("go", "list", "-json=Dir,Module", "-deps", go_list_target),
+                    ("go", "list", "-mod=mod", "-json=Dir,Module", "-deps", go_list_target),
                     cwd=source_dir, env=env, text=True, timeout=300
                 )
 
