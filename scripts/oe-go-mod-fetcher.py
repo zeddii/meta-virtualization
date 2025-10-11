@@ -84,6 +84,11 @@ python do_create_module_cache() {
 
         module_decl_pattern = re.compile(r'(?m)^(module\s+)(\S+)(\s*)')
 
+        def make_module_directive(module_name):
+            """Create a proper go.mod module directive with newline"""
+            cleaned_module = sanitize_module_name(module_name)
+            return f"module {cleaned_module}\n"
+
         def rewrite_module_directive(text, new_module):
             cleaned_module = sanitize_module_name(new_module)
             def replacer(match):
@@ -95,60 +100,76 @@ python do_create_module_cache() {
             new_text, count = module_decl_pattern.subn(replacer, text, count=1)
             return new_text if count else None
 
-        # Get file list from git repository
-        work_path = Path(vcs_path)
-        if subdir:
-            work_path = work_path / subdir
-
-        cmd = ["git", "ls-tree", "-r", "--name-only", "HEAD"]
-        if subdir:
-            cmd.append(subdir)
-
+        # Create module zip file using git archive (much faster and avoids arg limits)
         try:
-            files = subprocess.check_output(cmd, cwd=vcs_path, text=True).strip().split('\\n')
-            files = [f for f in files if f.strip()]
-        except subprocess.CalledProcessError:
-            bb.warn(f"Could not list files for {module_path}@{version}")
-            return
+            import tarfile
+            import tempfile
 
-        # Create module zip file
-        try:
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                module_prefix = f"{module_path}@{version}/"
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Use git archive to extract files efficiently
+                archive_cmd = ["git", "archive", "--format=tar", "HEAD"]
+                if subdir:
+                    archive_cmd.append(subdir)
+
+                tar_data = subprocess.check_output(archive_cmd, cwd=vcs_path)
+
+                # Extract tar to temp directory
+                tar_path = Path(tmpdir) / "archive.tar"
+                tar_path.write_bytes(tar_data)
+
+                with tarfile.open(tar_path, 'r') as tf:
+                    tf.extractall(tmpdir)
+
+                # Find go.mod files to determine excluded prefixes
                 expected_go_mod = f"{subdir}/go.mod" if subdir else "go.mod"
-
                 excluded_prefixes = []
-                for file_path in files:
-                    if file_path.endswith('go.mod') and file_path != expected_go_mod:
-                        dir_path = os.path.dirname(file_path)
-                        if dir_path:
+
+                extract_root = Path(tmpdir)
+                if subdir:
+                    extract_root = extract_root / subdir
+
+                for gomod_file in extract_root.rglob("go.mod"):
+                    rel_path = gomod_file.relative_to(Path(tmpdir))
+                    if str(rel_path) != expected_go_mod:
+                        dir_path = gomod_file.parent.relative_to(Path(tmpdir))
+                        if str(dir_path) != '.':
                             excluded_prefixes.append(f"{dir_path}/")
 
-                for file_path in files:
-                    if subdir and not file_path.startswith(subdir):
-                        continue
-                    if any(file_path.startswith(excluded_prefix) for excluded_prefix in excluded_prefixes):
-                        continue
-                    if file_path.endswith('go.mod') and file_path != expected_go_mod:
-                        continue
-                    try:
-                        content = subprocess.check_output(
-                            ["git", "cat-file", "blob", f"HEAD:{file_path}"],
-                            cwd=vcs_path
-                        )
-                        if rewrite_to_alias and file_path == expected_go_mod:
-                            try:
-                                content_text = content.decode()
-                                rewritten = rewrite_module_directive(content_text, alias_module)
-                                if rewritten is None:
-                                    rewritten = f"module {sanitize_module_name(alias_module)}\\n"
-                                content = rewritten.encode()
-                            except Exception:
-                                content = f"module {sanitize_module_name(alias_module)}\\n".encode()
-                        archive_path = module_prefix + (file_path[len(subdir)+1:] if subdir else file_path)
-                        zf.writestr(archive_path, content)
-                    except subprocess.CalledProcessError:
-                        continue
+                # Create zip file
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    module_prefix = f"{module_path}@{version}/"
+
+                    for file_path in extract_root.rglob("*"):
+                        if file_path.is_file():
+                            rel_path = file_path.relative_to(Path(tmpdir))
+                            rel_str = str(rel_path)
+
+                            # Skip excluded nested modules
+                            if any(rel_str.startswith(prefix) for prefix in excluded_prefixes):
+                                continue
+                            if rel_str.endswith('go.mod') and rel_str != expected_go_mod:
+                                continue
+
+                            # Read content
+                            content = file_path.read_bytes()
+
+                            # Rewrite go.mod if needed
+                            if rewrite_to_alias and rel_str == expected_go_mod:
+                                try:
+                                    content_text = content.decode()
+                                    rewritten = rewrite_module_directive(content_text, alias_module)
+                                    if rewritten is None:
+                                        rewritten = make_module_directive(alias_module)
+                                    content = rewritten.encode()
+                                except Exception:
+                                    content = make_module_directive(alias_module).encode()
+
+                            # Add to zip with correct path
+                            if subdir:
+                                archive_path = module_prefix + rel_str[len(subdir)+1:]
+                            else:
+                                archive_path = module_prefix + rel_str
+                            zf.writestr(archive_path, content)
 
             bb.note(f"Created {zip_path}")
         except Exception as e:
@@ -160,7 +181,7 @@ python do_create_module_cache() {
         try:
             if '+incompatible' in version:
                 # Synthetic minimal .mod for pre-module versions
-                mod_content = f"module {alias_module}\\n".encode()
+                mod_content = make_module_directive(alias_module).encode('utf-8')
                 bb.note(f"Creating synthetic .mod for +incompatible version: {module_path}")
             else:
                 # For proper module versions, use repository's go.mod
@@ -178,13 +199,13 @@ python do_create_module_cache() {
                             mod_text = mod_content.decode()
                             rewritten = rewrite_module_directive(mod_text, alias_module)
                             if rewritten is None:
-                                rewritten = f"module {sanitize_module_name(alias_module)}\\n"
+                                rewritten = make_module_directive(alias_module)
                             mod_content = rewritten.encode()
                         except Exception:
-                            mod_content = f"module {sanitize_module_name(alias_module)}\\n".encode()
+                            mod_content = make_module_directive(alias_module).encode()
                 except subprocess.CalledProcessError:
                     # Synthesize go.mod if not found
-                    mod_content = f"module {sanitize_module_name(alias_module)}\\n".encode()
+                    mod_content = make_module_directive(alias_module).encode()
 
             with open(mod_path, 'wb') as f:
                 f.write(mod_content)
@@ -197,7 +218,8 @@ python do_create_module_cache() {
     modules_data = [
 ''')
 
-MODULE_CACHE_TASK_FOOTER = textwrap.dedent(r'''    ]
+MODULE_CACHE_TASK_FOOTER = r'''
+
 
     s = d.getVar('S')
     workdir = d.getVar('WORKDIR')
@@ -243,7 +265,7 @@ MODULE_CACHE_TASK_FOOTER = textwrap.dedent(r'''    ]
                 alias_of = module_data.get('alias_of')
                 create_module_zip(module_path, version, str(vcs_cache_path), subdir, alias_of)
 
-                # Extract module to pkg/mod for offline Go builds
+                # CRITICAL FIX: Extract module to pkg/mod for offline Go builds
                 # The zip contains paths like "gopkg.in/yaml.v3@v3.0.4/..." so extract to pkg/mod directly
                 try:
                     import zipfile
@@ -301,7 +323,7 @@ MODULE_CACHE_TASK_FOOTER = textwrap.dedent(r'''    ]
             except Exception as e:
                 bb.warn(f"Module processing failed: {e}")
 
-    # Post-process to find version mismatches from transitive dependencies
+    # CRITICAL FIX: Post-process to find version mismatches from transitive dependencies
     # Use go.sum data to find what versions are needed, create symlinks for missing versions
     bb.note("Checking for version mismatches using go.sum data...")
 
@@ -477,7 +499,157 @@ MODULE_CACHE_TASK_FOOTER = textwrap.dedent(r'''    ]
 
 # Add task after do_unpack (when git repositories are available)
 addtask create_module_cache after do_unpack before do_configure
-''')
+
+
+# ============================================================
+# do_generate_go_sum: Generate go.sum from module cache
+# ============================================================
+
+python do_generate_go_sum() {
+    """
+    Generate go.sum from the module cache artifacts.
+    - Zip checksums: Calculated from our VCS-based builds using Go helper binary
+    - go.mod checksums: Calculated locally using the Hash1(dirhash) algorithm
+
+    This matches Go's expectations while keeping the build offline.
+    """
+    import subprocess
+    import re
+    import hashlib
+    import base64
+    from pathlib import Path
+
+    s = d.getVar('S')
+    cache_dir = Path(s) / "pkg" / "mod" / "cache" / "download"
+    go_sum_path = Path(s) / "src" / "import" / "go.sum"
+    workdir = Path(d.getVar('WORKDIR'))
+    fallback_marker = workdir / ".use-gomodgit-go-sum"
+    fallback_sum = workdir / "go.sum.gomodgit"
+
+    if fallback_marker.exists() or fallback_sum.exists():
+        bb.warn("go.sum.gomodgit fallback detected - skipping helper-based go.sum generation")
+        fallback_marker.touch()
+        return
+
+    # Go helper binary for checksums
+    go_helper = Path(d.getVar('STAGING_BINDIR_NATIVE')) / "dirhash"
+
+    if not cache_dir.exists():
+        bb.fatal("Module cache not found - do_create_module_cache must run first")
+        return
+
+    if not go_helper.exists():
+        bb.fatal(f"Go checksum helper not found at {go_helper}. Ensure go-dirhash-native is in DEPENDS.")
+        return
+
+    bb.note("Generating go.sum from module cache (Hash1 for go.mod files)...")
+
+    def calculate_mod_checksum(mod_path):
+        try:
+            mod_bytes = mod_path.read_bytes()
+        except FileNotFoundError:
+            return None
+
+        file_hash = hashlib.sha256(mod_bytes).hexdigest()
+        summary = f"{file_hash}  go.mod\n".encode('ascii')
+        digest = hashlib.sha256(summary).digest()
+        return "h1:" + base64.b64encode(digest).decode('ascii')
+
+    checksums = {}
+
+    # Scan all .zip files in the module cache and calculate checksums
+    for zip_file in sorted(cache_dir.rglob("*.zip")):
+        try:
+            # Calculate zip checksum using Go helper binary
+            result = subprocess.run(
+                [str(go_helper), str(zip_file)],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            if result.returncode != 0:
+                bb.warn(f"Failed to calculate zip checksum for {zip_file}: {result.stderr}")
+                continue
+
+            zip_checksum = result.stdout.strip()
+
+            # Extract and unescape module path and version
+            parts = zip_file.parts
+            v_index = parts.index('@v')
+            download_index = parts.index('download')
+
+            escaped_module_parts = parts[download_index + 1:v_index]
+            escaped_module = '/'.join(escaped_module_parts)
+            escaped_version = zip_file.stem
+
+            def unescape(s):
+                """Unescape !lowercase back to uppercase"""
+                return re.sub(r'!([a-z])', lambda m: m.group(1).upper(), s)
+
+            module_path = unescape(escaped_module)
+            version = unescape(escaped_version)
+            module_version = f"{module_path} {version}"
+
+            # Calculate go.mod checksum directly from cached .mod file.
+            mod_file = zip_file.with_suffix('.mod')
+            mod_checksum = calculate_mod_checksum(mod_file)
+
+            if module_version not in checksums:
+                checksums[module_version] = {'zip': zip_checksum, 'mod': mod_checksum}
+
+        except Exception as e:
+            bb.warn(f"Error processing {zip_file}: {e}")
+            continue
+
+    # Write go.sum with hybrid checksums
+    go_sum_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(go_sum_path, 'w') as f:
+        for module_version in sorted(checksums.keys()):
+            data = checksums[module_version]
+            f.write(f"{module_version} {data['zip']}\n")
+            if data['mod']:
+                f.write(f"{module_version}/go.mod {data['mod']}\n")
+
+    num_with_mod = sum(1 if data['mod'] else 0 for data in checksums.values())
+    bb.note(f"✅ Generated go.sum with {len(checksums)} modules")
+    bb.note(f"   🎯 Zip checksums: {len(checksums)} calculated from VCS builds")
+    bb.note(f"   📄 go.mod checksums calculated from cached .mod files ({num_with_mod} entries)")
+}
+
+# Generate go.sum from actual module cache BEFORE compile
+addtask generate_go_sum after do_create_module_cache before do_compile
+
+
+# ============================================================
+# do_compile integration helpers
+# ============================================================
+
+do_compile:prepend() {
+    # Ensure offline Go builds consume the generated module cache
+    export GOMODCACHE="${S}/pkg/mod"
+    export GOPROXY="direct"
+    export GOSUMDB="off"
+    export GONOSUMDB="*"
+    export GOPRIVATE="*"
+    export GOFLAGS="${GOFLAGS} -mod=mod -modcacherw"
+
+    fallback_sum="${WORKDIR}/go.sum.gomodgit"
+    fallback_marker="${WORKDIR}/.use-gomodgit-go-sum"
+
+    if [ -f "${fallback_sum}" ]; then
+        bbwarn "Fallback go.sum.gomodgit detected - using provided checksums"
+        install -d "${S}/src/import"
+        install -m 0644 "${fallback_sum}" "${S}/src/import/go.sum"
+        touch "${fallback_marker}"
+    else
+        rm -f "${fallback_marker}"
+    fi
+
+    bbnote "Using offline Go module cache at ${GOMODCACHE}"
+}
+'''
 
 
 class HybridModuleCacheBuilder:
@@ -569,21 +741,9 @@ class HybridModuleCacheBuilder:
         else:
             go_sum_block = "\n    # No go.sum data available\n    go_sum_requirements = {}\n"
 
-        # Build task: header + modules list + close list + go_sum dict + rest of task
-        # The FOOTER has been dedented, so it starts with "\n]\n\n", then the task code with no indentation.
-        # We need to skip the "]" and re-add indentation to the task code.
-        # Find where "s = d.getVar" starts (after "\n]\n\n")
-        footer_start = MODULE_CACHE_TASK_FOOTER.find('s = d.getVar')
-        if footer_start == -1:
-            footer_start = 4  # Fallback: skip "\n]\n\n"
-
-        # Get the footer code - it should have no indentation after dedent, but add 4 spaces to be safe
-        footer_code = MODULE_CACHE_TASK_FOOTER[footer_start:]
-
-        # Strip any existing indentation from each line, then add 4 spaces
-        indented_footer = '\n'.join('    ' + line.lstrip() if line.strip() else '' for line in footer_code.split('\n'))
-
-        return MODULE_CACHE_TASK_HEADER + modules_block + '\n    ]\n' + go_sum_block + '\n' + indented_footer
+        # Build task: header + modules list + close list + go_sum dict + footer
+        # Simple concatenation - FOOTER already has correct indentation
+        return MODULE_CACHE_TASK_HEADER + modules_block + '\n    ]\n' + go_sum_block + '\n' + MODULE_CACHE_TASK_FOOTER
 
 
 class GoModuleFetcher:
