@@ -70,6 +70,11 @@ python do_create_module_cache() {
 
         module_decl_pattern = re.compile(r'(?m)^(module\s+)(\S+)(\s*)')
 
+        def make_module_directive(module_name):
+            """Create a proper go.mod module directive with newline"""
+            cleaned_module = sanitize_module_name(module_name)
+            return f"module {cleaned_module}\n"
+
         def rewrite_module_directive(text, new_module):
             cleaned_module = sanitize_module_name(new_module)
             def replacer(match):
@@ -81,60 +86,76 @@ python do_create_module_cache() {
             new_text, count = module_decl_pattern.subn(replacer, text, count=1)
             return new_text if count else None
 
-        # Get file list from git repository
-        work_path = Path(vcs_path)
-        if subdir:
-            work_path = work_path / subdir
-
-        cmd = ["git", "ls-tree", "-r", "--name-only", "HEAD"]
-        if subdir:
-            cmd.append(subdir)
-
+        # Create module zip file using git archive (much faster and avoids arg limits)
         try:
-            files = subprocess.check_output(cmd, cwd=vcs_path, text=True).strip().split('\\n')
-            files = [f for f in files if f.strip()]
-        except subprocess.CalledProcessError:
-            bb.warn(f"Could not list files for {module_path}@{version}")
-            return
+            import tarfile
+            import tempfile
 
-        # Create module zip file
-        try:
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                module_prefix = f"{module_path}@{version}/"
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Use git archive to extract files efficiently
+                archive_cmd = ["git", "archive", "--format=tar", "HEAD"]
+                if subdir:
+                    archive_cmd.append(subdir)
+
+                tar_data = subprocess.check_output(archive_cmd, cwd=vcs_path)
+
+                # Extract tar to temp directory
+                tar_path = Path(tmpdir) / "archive.tar"
+                tar_path.write_bytes(tar_data)
+
+                with tarfile.open(tar_path, 'r') as tf:
+                    tf.extractall(tmpdir)
+
+                # Find go.mod files to determine excluded prefixes
                 expected_go_mod = f"{subdir}/go.mod" if subdir else "go.mod"
-
                 excluded_prefixes = []
-                for file_path in files:
-                    if file_path.endswith('go.mod') and file_path != expected_go_mod:
-                        dir_path = os.path.dirname(file_path)
-                        if dir_path:
+
+                extract_root = Path(tmpdir)
+                if subdir:
+                    extract_root = extract_root / subdir
+
+                for gomod_file in extract_root.rglob("go.mod"):
+                    rel_path = gomod_file.relative_to(Path(tmpdir))
+                    if str(rel_path) != expected_go_mod:
+                        dir_path = gomod_file.parent.relative_to(Path(tmpdir))
+                        if str(dir_path) != '.':
                             excluded_prefixes.append(f"{dir_path}/")
 
-                for file_path in files:
-                    if subdir and not file_path.startswith(subdir):
-                        continue
-                    if any(file_path.startswith(excluded_prefix) for excluded_prefix in excluded_prefixes):
-                        continue
-                    if file_path.endswith('go.mod') and file_path != expected_go_mod:
-                        continue
-                    try:
-                        content = subprocess.check_output(
-                            ["git", "cat-file", "blob", f"HEAD:{file_path}"],
-                            cwd=vcs_path
-                        )
-                        if rewrite_to_alias and file_path == expected_go_mod:
-                            try:
-                                content_text = content.decode()
-                                rewritten = rewrite_module_directive(content_text, alias_module)
-                                if rewritten is None:
-                                    rewritten = f"module {sanitize_module_name(alias_module)}\\n"
-                                content = rewritten.encode()
-                            except Exception:
-                                content = f"module {sanitize_module_name(alias_module)}\\n".encode()
-                        archive_path = module_prefix + (file_path[len(subdir)+1:] if subdir else file_path)
-                        zf.writestr(archive_path, content)
-                    except subprocess.CalledProcessError:
-                        continue
+                # Create zip file
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    module_prefix = f"{module_path}@{version}/"
+
+                    for file_path in extract_root.rglob("*"):
+                        if file_path.is_file():
+                            rel_path = file_path.relative_to(Path(tmpdir))
+                            rel_str = str(rel_path)
+
+                            # Skip excluded nested modules
+                            if any(rel_str.startswith(prefix) for prefix in excluded_prefixes):
+                                continue
+                            if rel_str.endswith('go.mod') and rel_str != expected_go_mod:
+                                continue
+
+                            # Read content
+                            content = file_path.read_bytes()
+
+                            # Rewrite go.mod if needed
+                            if rewrite_to_alias and rel_str == expected_go_mod:
+                                try:
+                                    content_text = content.decode()
+                                    rewritten = rewrite_module_directive(content_text, alias_module)
+                                    if rewritten is None:
+                                        rewritten = make_module_directive(alias_module)
+                                    content = rewritten.encode()
+                                except Exception:
+                                    content = make_module_directive(alias_module).encode()
+
+                            # Add to zip with correct path
+                            if subdir:
+                                archive_path = module_prefix + rel_str[len(subdir)+1:]
+                            else:
+                                archive_path = module_prefix + rel_str
+                            zf.writestr(archive_path, content)
 
             bb.note(f"Created {zip_path}")
         except Exception as e:
@@ -146,7 +167,7 @@ python do_create_module_cache() {
         try:
             if '+incompatible' in version:
                 # Synthetic minimal .mod for pre-module versions
-                mod_content = f"module {alias_module}\\n".encode()
+                mod_content = make_module_directive(alias_module).encode('utf-8')
                 bb.note(f"Creating synthetic .mod for +incompatible version: {module_path}")
             else:
                 # For proper module versions, use repository's go.mod
@@ -164,13 +185,13 @@ python do_create_module_cache() {
                             mod_text = mod_content.decode()
                             rewritten = rewrite_module_directive(mod_text, alias_module)
                             if rewritten is None:
-                                rewritten = f"module {sanitize_module_name(alias_module)}\\n"
+                                rewritten = make_module_directive(alias_module)
                             mod_content = rewritten.encode()
                         except Exception:
-                            mod_content = f"module {sanitize_module_name(alias_module)}\\n".encode()
+                            mod_content = make_module_directive(alias_module).encode()
                 except subprocess.CalledProcessError:
                     # Synthesize go.mod if not found
-                    mod_content = f"module {sanitize_module_name(alias_module)}\\n".encode()
+                    mod_content = make_module_directive(alias_module).encode()
 
             with open(mod_path, 'wb') as f:
                 f.write(mod_content)
@@ -181,19 +202,19 @@ python do_create_module_cache() {
 
     # Module list with repository information
     modules_data = [
-        ({"module": "github.com/docker/cli", "version": "v28.5.1+incompatible", "repo_url": "https://github.com/docker/cli", "commit": "e180ab8ab82d22b7895a3e6e110cf6dd5c45f1d7", "subdir": ""}),
+        ({"module": "github.com/docker/cli", "version": "v28.5.0+incompatible", "repo_url": "https://github.com/docker/cli", "commit": "887030fbe83f5368566ec3b35e15a4ba13267a62", "subdir": ""}),
         ({"module": "github.com/opencontainers/go-digest", "version": "v1.0.0", "repo_url": "https://github.com/opencontainers/go-digest.git", "commit": "ea51bea511f75cfa3ef6098cc253c5c3609b037a", "subdir": ""}),
         ({"module": "github.com/distribution/reference", "version": "v0.6.0", "repo_url": "https://github.com/distribution/reference", "commit": "ff14fafe2236e51c2894ac07d4bdfc778e96d682", "subdir": ""}),
         ({"module": "github.com/docker/docker-credential-helpers", "version": "v0.9.3", "repo_url": "https://github.com/docker/docker-credential-helpers", "commit": "f9d3010165b642df37215b1be945552f2c6f0e3b", "subdir": ""}),
         ({"module": "github.com/pkg/errors", "version": "v0.9.1", "repo_url": "https://github.com/pkg/errors.git", "commit": "614d223910a179a466c1767a985424175c39b465", "subdir": ""}),
-        ({"module": "golang.org/x/sys", "version": "v0.37.0", "repo_url": "https://go.googlesource.com/sys", "commit": "1edeebeea09c66c5a886ccfefb1be5dafac5c893", "subdir": ""}),
+        ({"module": "golang.org/x/sys", "version": "v0.36.0", "repo_url": "https://go.googlesource.com/sys", "commit": "b06ce0514ea5467cf3ac72ad85e4d1845c51fbad", "subdir": ""}),
         ({"module": "github.com/sirupsen/logrus", "version": "v1.9.3", "repo_url": "https://github.com/sirupsen/logrus", "commit": "d40e25cd45ed9c6b2b66e6b97573a0413e4c23bd", "subdir": ""}),
         ({"module": "github.com/containerd/errdefs", "version": "v1.0.0", "repo_url": "https://github.com/containerd/errdefs", "commit": "4817405e4a3caeb7aee9dac68ed55339c59cb635", "subdir": ""}),
         ({"module": "github.com/fvbommel/sortorder", "version": "v1.1.0", "repo_url": "https://github.com/fvbommel/sortorder", "commit": "a8d9302c17f9f46c6580b82b919672e58ef6e396", "subdir": ""}),
         ({"module": "github.com/moby/sys/sequential", "version": "v0.6.0", "repo_url": "https://github.com/moby/sys", "commit": "cafbe42351600ca9b363e220722f66d96f6e71f4", "subdir": "sequential"}),
         ({"module": "github.com/moby/sys/atomicwriter", "version": "v0.1.0", "repo_url": "https://github.com/moby/sys", "commit": "4a75548218baa36bdbaaed1371a3e8a9cdfcffa0", "subdir": "atomicwriter"}),
         ({"module": "github.com/containerd/errdefs/pkg", "version": "v0.3.0", "repo_url": "https://github.com/containerd/errdefs", "commit": "4817405e4a3caeb7aee9dac68ed55339c59cb635", "subdir": "pkg"}),
-        ({"module": "github.com/docker/docker", "version": "v28.5.1+incompatible", "repo_url": "https://github.com/docker/docker", "commit": "f8215cc266744ef195a50a70d427c345da2acdbb", "subdir": ""}),
+        ({"module": "github.com/docker/docker", "version": "v28.5.0+incompatible", "repo_url": "https://github.com/docker/docker", "commit": "cd048300a48700294339c9c91d2dcc691cb8f63b", "subdir": ""}),
         ({"module": "github.com/docker/go-connections", "version": "v0.6.0", "repo_url": "https://github.com/docker/go-connections", "commit": "42faf792bde28c414a060127d6351769408a675f", "subdir": ""}),
         ({"module": "github.com/docker/go-units", "version": "v0.5.0", "repo_url": "https://github.com/docker/go-units", "commit": "e682442797b36348f8e1f98defdbf32bac0b6c6f", "subdir": ""}),
         ({"module": "github.com/opencontainers/image-spec", "version": "v1.1.1", "repo_url": "https://github.com/opencontainers/image-spec", "commit": "147f9c13cedb47a0c4d9a11a222961073d585877", "subdir": ""}),
@@ -435,10 +456,10 @@ python do_create_module_cache() {
         "github.com/distribution/reference": {"v0.6.0", "v0.6.0/go.mod"},
         "github.com/dlclark/regexp2": {"v1.11.0", "v1.11.0/go.mod"},
         "github.com/docker/buildx": {"v0.28.0", "v0.28.0/go.mod"},
-        "github.com/docker/cli": {"v28.5.1+incompatible", "v28.5.1+incompatible/go.mod"},
+        "github.com/docker/cli": {"v28.5.0+incompatible", "v28.5.0+incompatible/go.mod"},
         "github.com/docker/cli-docs-tool": {"v0.10.0", "v0.10.0/go.mod"},
         "github.com/docker/distribution": {"v2.7.1+incompatible/go.mod", "v2.8.3+incompatible", "v2.8.3+incompatible/go.mod"},
-        "github.com/docker/docker": {"v28.5.1+incompatible", "v28.5.1+incompatible/go.mod"},
+        "github.com/docker/docker": {"v28.5.0+incompatible", "v28.5.0+incompatible/go.mod"},
         "github.com/docker/docker-credential-helpers": {"v0.9.3", "v0.9.3/go.mod"},
         "github.com/docker/go": {"v1.5.1-1.0.20160303222718-d30aec9fd63c", "v1.5.1-1.0.20160303222718-d30aec9fd63c/go.mod"},
         "github.com/docker/go-connections": {"v0.4.0/go.mod", "v0.6.0", "v0.6.0/go.mod"},
@@ -615,7 +636,7 @@ python do_create_module_cache() {
         "golang.org/x/net": {"v0.0.0-20180906233101-161cd47e91fd/go.mod", "v0.0.0-20181114220301-adae6a3d119a/go.mod", "v0.0.0-20190404232315-eb5bcb51f2a3/go.mod", "v0.0.0-20190613194153-d28f0bde5980/go.mod", "v0.0.0-20190620200207-3b0461eec859/go.mod", "v0.0.0-20200226121028-0de0cce0169b/go.mod", "v0.0.0-20201021035429-f5854403a974/go.mod", "v0.0.0-20210226172049-e18ecbb05110/go.mod", "v0.0.0-20220722155237-a158d28d115b/go.mod", "v0.40.0", "v0.40.0/go.mod"},
         "golang.org/x/oauth2": {"v0.30.0", "v0.30.0/go.mod"},
         "golang.org/x/sync": {"v0.0.0-20180314180146-1d60e4601c6f/go.mod", "v0.0.0-20181108010431-42b317875d0f/go.mod", "v0.0.0-20181221193216-37e7f081c4d4/go.mod", "v0.0.0-20190423024810-112230192c58/go.mod", "v0.0.0-20190911185100-cd5d95a43a6e/go.mod", "v0.0.0-20201020160332-67f06af15bc9/go.mod", "v0.0.0-20220722155255-886fb9371eb4/go.mod", "v0.17.0", "v0.17.0/go.mod"},
-        "golang.org/x/sys": {"v0.0.0-20180905080454-ebe1bf3edb33/go.mod", "v0.0.0-20180909124046-d0be0721c37e/go.mod", "v0.0.0-20181116152217-5ac8a444bdc5/go.mod", "v0.0.0-20190215142949-d0b11bdaac8a/go.mod", "v0.0.0-20190222072716-a9d3bda3a223/go.mod", "v0.0.0-20190412213103-97732733099d/go.mod", "v0.0.0-20190801041406-cbf593c0f2f3/go.mod", "v0.0.0-20191026070338-33540a1f6037/go.mod", "v0.0.0-20191120155948-bd437916bb0e/go.mod", "v0.0.0-20200930185726-fdedc70b468f/go.mod", "v0.0.0-20201119102817-f84b799fce68/go.mod", "v0.0.0-20210331175145-43e1dd70ce54/go.mod", "v0.0.0-20210615035016-665e8c7367d1/go.mod", "v0.0.0-20210616094352-59db8d763f22/go.mod", "v0.0.0-20220412211240-33da011f77ad/go.mod", "v0.0.0-20220520151302-bc2c85ada10a/go.mod", "v0.0.0-20220715151400-c0bba94af5f8/go.mod", "v0.0.0-20220722155257-8c9f86f7a55f/go.mod", "v0.0.0-20220811171246-fbc7d0a398ab/go.mod", "v0.1.0/go.mod", "v0.37.0", "v0.37.0/go.mod", "v0.6.0/go.mod"},
+        "golang.org/x/sys": {"v0.0.0-20180905080454-ebe1bf3edb33/go.mod", "v0.0.0-20180909124046-d0be0721c37e/go.mod", "v0.0.0-20181116152217-5ac8a444bdc5/go.mod", "v0.0.0-20190215142949-d0b11bdaac8a/go.mod", "v0.0.0-20190222072716-a9d3bda3a223/go.mod", "v0.0.0-20190412213103-97732733099d/go.mod", "v0.0.0-20190801041406-cbf593c0f2f3/go.mod", "v0.0.0-20191026070338-33540a1f6037/go.mod", "v0.0.0-20191120155948-bd437916bb0e/go.mod", "v0.0.0-20200930185726-fdedc70b468f/go.mod", "v0.0.0-20201119102817-f84b799fce68/go.mod", "v0.0.0-20210331175145-43e1dd70ce54/go.mod", "v0.0.0-20210615035016-665e8c7367d1/go.mod", "v0.0.0-20210616094352-59db8d763f22/go.mod", "v0.0.0-20220412211240-33da011f77ad/go.mod", "v0.0.0-20220520151302-bc2c85ada10a/go.mod", "v0.0.0-20220715151400-c0bba94af5f8/go.mod", "v0.0.0-20220722155257-8c9f86f7a55f/go.mod", "v0.0.0-20220811171246-fbc7d0a398ab/go.mod", "v0.1.0/go.mod", "v0.36.0", "v0.36.0/go.mod", "v0.6.0/go.mod"},
         "golang.org/x/term": {"v0.0.0-20201117132131-f5c789dd3221/go.mod", "v0.0.0-20201126162022-7de9c90e9dd1/go.mod", "v0.0.0-20210927222741-03fcf44c2211/go.mod", "v0.32.0", "v0.32.0/go.mod"},
         "golang.org/x/text": {"v0.25.0", "v0.25.0/go.mod", "v0.3.0/go.mod", "v0.3.3/go.mod", "v0.3.7/go.mod", "v0.4.0/go.mod"},
         "golang.org/x/time": {"v0.11.0", "v0.11.0/go.mod"},
@@ -651,6 +672,9 @@ python do_create_module_cache() {
         "tags.cncf.io/container-device-interface": {"v1.0.1", "v1.0.1/go.mod"}
     }
 
+
+
+
     s = d.getVar('S')
     workdir = d.getVar('WORKDIR')
 
@@ -658,126 +682,126 @@ python do_create_module_cache() {
     repo_locks_lock = threading.Lock()
 
     def acquire_repo_lock(path):
-    key = str(path)
-    with repo_locks_lock:
-    lock = repo_locks.get(key)
-    if not lock:
-    lock = threading.Lock()
-    repo_locks[key] = lock
-    return lock
+        key = str(path)
+        with repo_locks_lock:
+            lock = repo_locks.get(key)
+            if not lock:
+                lock = threading.Lock()
+                repo_locks[key] = lock
+            return lock
 
     # Process modules in parallel
     def process_module(module_data):
-    module_path = module_data['module']
-    version = module_data['version']
-    repo_url = module_data['repo_url']
-    commit = module_data['commit']
-    subdir = module_data.get('subdir')
+        module_path = module_data['module']
+        version = module_data['version']
+        repo_url = module_data['repo_url']
+        commit = module_data['commit']
+        subdir = module_data.get('subdir')
 
-    # Calculate VCS cache path
-    vcs_key = f"git3:{repo_url}"
-    vcs_hash = hashlib.sha256(vcs_key.encode()).hexdigest()
-    # VCS cache is downloaded to ${WORKDIR}/sources/vcs_cache/ by git:// fetcher
-    workdir = d.getVar('WORKDIR')
-    vcs_cache_path = Path(workdir) / "sources" / "vcs_cache" / vcs_hash
+        # Calculate VCS cache path
+        vcs_key = f"git3:{repo_url}"
+        vcs_hash = hashlib.sha256(vcs_key.encode()).hexdigest()
+        # VCS cache is downloaded to ${WORKDIR}/sources/vcs_cache/ by git:// fetcher
+        workdir = d.getVar('WORKDIR')
+        vcs_cache_path = Path(workdir) / "sources" / "vcs_cache" / vcs_hash
 
-    # VCS cache should already exist from git:// download
-    if vcs_cache_path.exists():
-    lock = acquire_repo_lock(vcs_cache_path)
-    with lock:
-    bb.note(f"Processing {module_path}@{version}")
-    create_vcs_info_file(str(vcs_cache_path), repo_url)
-    try:
-    subprocess.run(["git", "checkout", commit], cwd=vcs_cache_path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except subprocess.CalledProcessError:
-    subprocess.run(["git", "fetch", "--all"], cwd=vcs_cache_path, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    subprocess.run(["git", "checkout", commit], cwd=vcs_cache_path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    alias_of = module_data.get('alias_of')
-    create_module_zip(module_path, version, str(vcs_cache_path), subdir, alias_of)
+        # VCS cache should already exist from git:// download
+        if vcs_cache_path.exists():
+            lock = acquire_repo_lock(vcs_cache_path)
+            with lock:
+                bb.note(f"Processing {module_path}@{version}")
+                create_vcs_info_file(str(vcs_cache_path), repo_url)
+                try:
+                    subprocess.run(["git", "checkout", commit], cwd=vcs_cache_path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                except subprocess.CalledProcessError:
+                    subprocess.run(["git", "fetch", "--all"], cwd=vcs_cache_path, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    subprocess.run(["git", "checkout", commit], cwd=vcs_cache_path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                alias_of = module_data.get('alias_of')
+                create_module_zip(module_path, version, str(vcs_cache_path), subdir, alias_of)
 
-    # Extract module to pkg/mod for offline Go builds
-    # The zip contains paths like "gopkg.in/yaml.v3@v3.0.4/..." so extract to pkg/mod directly
-    try:
-    import zipfile
-    import os
-    def escape_module_path_local(path):
-    import re
-    return re.sub(r'([A-Z])', lambda m: '!' + m.group(1).lower(), path)
+                # CRITICAL FIX: Extract module to pkg/mod for offline Go builds
+                # The zip contains paths like "gopkg.in/yaml.v3@v3.0.4/..." so extract to pkg/mod directly
+                try:
+                    import zipfile
+                    import os
+                    def escape_module_path_local(path):
+                        import re
+                        return re.sub(r'([A-Z])', lambda m: '!' + m.group(1).lower(), path)
 
-    escaped_module = escape_module_path_local(module_path)
-    escaped_version = escape_module_path_local(version)
+                    escaped_module = escape_module_path_local(module_path)
+                    escaped_version = escape_module_path_local(version)
 
-    zip_path = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_module / "@v" / f"{escaped_version}.zip"
-    extract_dir = Path(d.getVar('S')) / "pkg" / "mod"
+                    zip_path = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_module / "@v" / f"{escaped_version}.zip"
+                    extract_dir = Path(d.getVar('S')) / "pkg" / "mod"
 
-    # Handle version aliases (e.g., v3.0.1 pointing to v3.0.4)
-    is_version_alias = module_data.get('is_version_alias', False)
-    if is_version_alias:
-    # This is a version alias - create symlink and copy cache files
-    orig_ver = module_data.get('original_version')
-    if orig_ver:
-    # Create symlink in pkg/mod: yaml.v3@v3.0.1 -> yaml.v3@v3.0.4
-    orig_dir = extract_dir / f"{module_path}@{orig_ver}"
-    alias_dir = extract_dir / f"{module_path}@{version}"
-    if orig_dir.exists() and not alias_dir.exists():
-    os.symlink(f"{module_path}@{orig_ver}", alias_dir)
-    bb.note(f"Created symlink {module_path}@{version} -> @{orig_ver}")
+                    # Handle version aliases (e.g., v3.0.1 pointing to v3.0.4)
+                    is_version_alias = module_data.get('is_version_alias', False)
+                    if is_version_alias:
+                        # This is a version alias - create symlink and copy cache files
+                        orig_ver = module_data.get('original_version')
+                        if orig_ver:
+                            # Create symlink in pkg/mod: yaml.v3@v3.0.1 -> yaml.v3@v3.0.4
+                            orig_dir = extract_dir / f"{module_path}@{orig_ver}"
+                            alias_dir = extract_dir / f"{module_path}@{version}"
+                            if orig_dir.exists() and not alias_dir.exists():
+                                os.symlink(f"{module_path}@{orig_ver}", alias_dir)
+                                bb.note(f"Created symlink {module_path}@{version} -> @{orig_ver}")
 
-    # Copy cache files (.mod, .zip) for the alias version
-    import shutil
-    download_dir = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_module / "@v"
-    orig_escaped_ver = escape_module_path_local(orig_ver)
-    for ext in ['.mod', '.zip']:
-    src = download_dir / f"{orig_escaped_ver}{ext}"
-    dst = download_dir / f"{escaped_version}{ext}"
-    if src.exists() and not dst.exists():
-    shutil.copy2(src, dst)
-    bb.note(f"Copied cache file {escaped_version}{ext}")
-    elif zip_path.exists():
-    # Normal extraction for non-alias modules
-    extract_dir.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path, 'r') as zf:
-    zf.extractall(extract_dir)
-    bb.note(f"Extracted {module_path}@{version} to pkg/mod")
-    except Exception as e:
-    bb.debug(1, f"Module extraction skipped for {module_path}: {e}")
-    else:
-    bb.warn(f"VCS cache missing for {module_path}: {vcs_cache_path}")
+                            # Copy cache files (.mod, .zip) for the alias version
+                            import shutil
+                            download_dir = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_module / "@v"
+                            orig_escaped_ver = escape_module_path_local(orig_ver)
+                            for ext in ['.mod', '.zip']:
+                                src = download_dir / f"{orig_escaped_ver}{ext}"
+                                dst = download_dir / f"{escaped_version}{ext}"
+                                if src.exists() and not dst.exists():
+                                    shutil.copy2(src, dst)
+                                    bb.note(f"Copied cache file {escaped_version}{ext}")
+                    elif zip_path.exists():
+                        # Normal extraction for non-alias modules
+                        extract_dir.mkdir(parents=True, exist_ok=True)
+                        with zipfile.ZipFile(zip_path, 'r') as zf:
+                            zf.extractall(extract_dir)
+                        bb.note(f"Extracted {module_path}@{version} to pkg/mod")
+                except Exception as e:
+                    bb.debug(1, f"Module extraction skipped for {module_path}: {e}")
+        else:
+            bb.warn(f"VCS cache missing for {module_path}: {vcs_cache_path}")
 
     # Use ThreadPoolExecutor for parallel processing
     with ThreadPoolExecutor(max_workers=8) as executor:
-    futures = [executor.submit(process_module, module) for module in modules_data]
-    for future in as_completed(futures):
-    try:
-    future.result()
-    except Exception as e:
-    bb.warn(f"Module processing failed: {e}")
+        futures = [executor.submit(process_module, module) for module in modules_data]
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:
+                bb.warn(f"Module processing failed: {e}")
 
-    # Post-process to find version mismatches from transitive dependencies
+    # CRITICAL FIX: Post-process to find version mismatches from transitive dependencies
     # Use go.sum data to find what versions are needed, create symlinks for missing versions
     bb.note("Checking for version mismatches using go.sum data...")
 
     import re
     import os
     def escape_module_path_post(path):
-    return re.sub(r'([A-Z])', lambda m: '!' + m.group(1).lower(), path)
+        return re.sub(r'([A-Z])', lambda m: '!' + m.group(1).lower(), path)
 
     def canonicalize_module_path(module_path):
-    """Normalize alternate module paths to canonical form (e.g., go.yaml.in -> gopkg.in)"""
-    match = re.match(r'^go\.([^\.]+)\.in/(.+)$', module_path)
-    if match:
-    name, rest = match.groups()
-    parts = rest.split('/')
-    if len(parts) >= 2:
-    module_name = parts[0] or name
-    version = parts[1]
-    remainder = '/'.join(parts[2:])
-    canonical = f"gopkg.in/{module_name}.{version}"
-    if remainder:
-    canonical = f"{canonical}/{remainder}"
-    return canonical
-    return f"gopkg.in/{name}.{rest}"
-    return module_path
+        """Normalize alternate module paths to canonical form (e.g., go.yaml.in -> gopkg.in)"""
+        match = re.match(r'^go\.([^\.]+)\.in/(.+)$', module_path)
+        if match:
+            name, rest = match.groups()
+            parts = rest.split('/')
+            if len(parts) >= 2:
+                module_name = parts[0] or name
+                version = parts[1]
+                remainder = '/'.join(parts[2:])
+                canonical = f"gopkg.in/{module_name}.{version}"
+                if remainder:
+                    canonical = f"{canonical}/{remainder}"
+                return canonical
+            return f"gopkg.in/{name}.{rest}"
+        return module_path
 
     # Track what versions we have extracted
     # Map canonical path -> {actual_path: versions}
@@ -787,148 +811,298 @@ python do_create_module_cache() {
 
     # Scan extracted modules to see what we have
     if pkg_mod_dir.exists():
-    for item in pkg_mod_dir.iterdir():
-    if item.is_dir() and '@' not in str(item.name):
-    # This is a module directory (e.g., "gopkg.in", "github.com", "go.yaml.in")
-    for subitem in item.rglob("*"):
-    if subitem.is_dir() and '@' in subitem.name:
-    # Found a versioned module (e.g., "yaml.v3@v3.0.4" or "go.yaml.in/yaml/v3@v3.0.4")
-    rel_path = subitem.relative_to(pkg_mod_dir)
-    parts = str(rel_path).rsplit('@', 1)
-    if len(parts) == 2:
-    actual_mod_path = parts[0]
-    version = parts[1]
+        for item in pkg_mod_dir.iterdir():
+            if item.is_dir() and '@' not in str(item.name):
+                # This is a module directory (e.g., "gopkg.in", "github.com", "go.yaml.in")
+                for subitem in item.rglob("*"):
+                    if subitem.is_dir() and '@' in subitem.name:
+                        # Found a versioned module (e.g., "yaml.v3@v3.0.4" or "go.yaml.in/yaml/v3@v3.0.4")
+                        rel_path = subitem.relative_to(pkg_mod_dir)
+                        parts = str(rel_path).rsplit('@', 1)
+                        if len(parts) == 2:
+                            actual_mod_path = parts[0]
+                            version = parts[1]
 
-    # Track by canonical path so go.sum lookups work
-    canonical_path = canonicalize_module_path(actual_mod_path)
-    extracted_modules.setdefault(canonical_path, set()).add(version)
+                            # Track by canonical path so go.sum lookups work
+                            canonical_path = canonicalize_module_path(actual_mod_path)
+                            extracted_modules.setdefault(canonical_path, set()).add(version)
 
-    # Remember the actual extracted path for creating symlinks
-    if canonical_path not in actual_paths:
-    actual_paths[canonical_path] = actual_mod_path
+                            # Remember the actual extracted path for creating symlinks
+                            if canonical_path not in actual_paths:
+                                actual_paths[canonical_path] = actual_mod_path
 
     # Find mismatches: versions in go.sum but not extracted
     missing_versions = []
     for mod_path, req_versions in go_sum_requirements.items():
-    extracted = extracted_modules.get(mod_path, set())
-    for req_ver in req_versions:
-    if req_ver not in extracted:
-    # Find a version we DO have for this module
-    if extracted:
-    base_ver = sorted(extracted)[-1]  # Use highest version
-    actual_path = actual_paths.get(mod_path, mod_path)
-    missing_versions.append((mod_path, actual_path, req_ver, base_ver))
-    else:
-    bb.debug(1, f"go.sum requires {mod_path}@{req_ver} but no version extracted")
+        extracted = extracted_modules.get(mod_path, set())
+        for req_ver in req_versions:
+            if req_ver not in extracted:
+                # Find a version we DO have for this module
+                if extracted:
+                    base_ver = sorted(extracted)[-1]  # Use highest version
+                    actual_path = actual_paths.get(mod_path, mod_path)
+                    missing_versions.append((mod_path, actual_path, req_ver, base_ver))
+                else:
+                    bb.debug(1, f"go.sum requires {mod_path}@{req_ver} but no version extracted")
 
     # Create symlinks and cache files for missing versions
     if missing_versions:
-    bb.note(f"Found {len(missing_versions)} version mismatches from transitive dependencies")
-    for canonical_path, actual_path, missing_ver, base_ver in missing_versions:
-    try:
-    # Create symlink using actual extracted path (e.g., go.yaml.in/yaml/v3)
-    # module@missing_ver -> module@base_ver
-    base_dir = pkg_mod_dir / f"{actual_path}@{base_ver}"
-    missing_dir = pkg_mod_dir / f"{actual_path}@{missing_ver}"
-    if base_dir.exists() and not missing_dir.exists():
-    os.symlink(f"{actual_path}@{base_ver}", missing_dir)
-    bb.note(f"Created symlink: {actual_path}@{missing_ver} -> @{base_ver}")
+        bb.note(f"Found {len(missing_versions)} version mismatches from transitive dependencies")
+        for canonical_path, actual_path, missing_ver, base_ver in missing_versions:
+            try:
+                # Create symlink using actual extracted path (e.g., go.yaml.in/yaml/v3)
+                # module@missing_ver -> module@base_ver
+                base_dir = pkg_mod_dir / f"{actual_path}@{base_ver}"
+                missing_dir = pkg_mod_dir / f"{actual_path}@{missing_ver}"
+                if base_dir.exists() and not missing_dir.exists():
+                    os.symlink(f"{actual_path}@{base_ver}", missing_dir)
+                    bb.note(f"Created symlink: {actual_path}@{missing_ver} -> @{base_ver}")
 
-    # Also create at canonical path if different (e.g., gopkg.in/yaml.v3)
-    if canonical_path != actual_path:
-    canonical_base = pkg_mod_dir / f"{canonical_path}@{base_ver}"
-    canonical_missing = pkg_mod_dir / f"{canonical_path}@{missing_ver}"
-    if base_dir.exists() and not canonical_missing.exists():
-    # Link to actual extracted location
-    canonical_missing.parent.mkdir(parents=True, exist_ok=True)
-    os.symlink(f"../{actual_path}@{base_ver}", canonical_missing)
-    bb.note(f"Created canonical symlink: {canonical_path}@{missing_ver} -> {actual_path}@{base_ver}")
+                # Also create at canonical path if different (e.g., gopkg.in/yaml.v3)
+                if canonical_path != actual_path:
+                    canonical_base = pkg_mod_dir / f"{canonical_path}@{base_ver}"
+                    canonical_missing = pkg_mod_dir / f"{canonical_path}@{missing_ver}"
+                    if base_dir.exists() and not canonical_missing.exists():
+                        # Link to actual extracted location
+                        canonical_missing.parent.mkdir(parents=True, exist_ok=True)
+                        os.symlink(f"../{actual_path}@{base_ver}", canonical_missing)
+                        bb.note(f"Created canonical symlink: {canonical_path}@{missing_ver} -> {actual_path}@{base_ver}")
 
-    # Create cache files with canonical module path by rewriting zips
-    escaped_actual = escape_module_path_post(actual_path)
-    escaped_canonical = escape_module_path_post(canonical_path)
-    escaped_missing = escape_module_path_post(missing_ver)
-    escaped_base = escape_module_path_post(base_ver)
+                # Create cache files with canonical module path by rewriting zips
+                escaped_actual = escape_module_path_post(actual_path)
+                escaped_canonical = escape_module_path_post(canonical_path)
+                escaped_missing = escape_module_path_post(missing_ver)
+                escaped_base = escape_module_path_post(base_ver)
 
-    # Source cache files are at actual_path location
-    src_cache_dir = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_actual / "@v"
-    # Destination cache files need to be at canonical_path location
-    dst_cache_dir = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_canonical / "@v"
+                # Source cache files are at actual_path location
+                src_cache_dir = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_actual / "@v"
+                # Destination cache files need to be at canonical_path location
+                dst_cache_dir = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_canonical / "@v"
 
-    if src_cache_dir.exists():
-    dst_cache_dir.mkdir(parents=True, exist_ok=True)
-    import shutil
-    import zipfile
-    import tempfile
+                if src_cache_dir.exists():
+                    dst_cache_dir.mkdir(parents=True, exist_ok=True)
+                    import shutil
+                    import zipfile
+                    import tempfile
 
-    # Copy .mod file with rewritten module path
-    src_mod = src_cache_dir / f"{escaped_base}.mod"
-    dst_mod = dst_cache_dir / f"{escaped_missing}.mod"
-    if src_mod.exists() and not dst_mod.exists():
-    mod_content = src_mod.read_text()
-    # Rewrite module directive to use canonical path using a replacement function
-    import re
-    def replace_module(match):
-    return match.group(1) + canonical_path + match.group(3)
+                    # Copy .mod file with rewritten module path
+                    src_mod = src_cache_dir / f"{escaped_base}.mod"
+                    dst_mod = dst_cache_dir / f"{escaped_missing}.mod"
+                    if src_mod.exists() and not dst_mod.exists():
+                        mod_content = src_mod.read_text()
+                        # Rewrite module directive to use canonical path using a replacement function
+                        import re
+                        def replace_module(match):
+                            return match.group(1) + canonical_path + match.group(3)
 
-    mod_content = re.sub(
-    r'^(module\s+)(' + re.escape(actual_path) + r')(\s*)',
-    replace_module,
-    mod_content,
-    count=1,
-    flags=re.MULTILINE
-    )
-    dst_mod.write_text(mod_content)
-    bb.note(f"Created cache file: {canonical_path}@{missing_ver}.mod (rewritten)")
+                        mod_content = re.sub(
+                            r'^(module\s+)(' + re.escape(actual_path) + r')(\s*)',
+                            replace_module,
+                            mod_content,
+                            count=1,
+                            flags=re.MULTILINE
+                        )
+                        dst_mod.write_text(mod_content)
+                        bb.note(f"Created cache file: {canonical_path}@{missing_ver}.mod (rewritten)")
 
-    # Create .zip file with canonical module paths
-    src_zip = src_cache_dir / f"{escaped_base}.zip"
-    dst_zip = dst_cache_dir / f"{escaped_missing}.zip"
-    if src_zip.exists() and not dst_zip.exists():
-    with tempfile.TemporaryDirectory() as tmpdir:
-    tmppath = Path(tmpdir)
-    # Extract source zip
-    with zipfile.ZipFile(src_zip, 'r') as zf:
-    zf.extractall(tmppath)
+                    # Create .zip file with canonical module paths
+                    src_zip = src_cache_dir / f"{escaped_base}.zip"
+                    dst_zip = dst_cache_dir / f"{escaped_missing}.zip"
+                    if src_zip.exists() and not dst_zip.exists():
+                        with tempfile.TemporaryDirectory() as tmpdir:
+                            tmppath = Path(tmpdir)
+                            # Extract source zip
+                            with zipfile.ZipFile(src_zip, 'r') as zf:
+                                zf.extractall(tmppath)
 
-    # Find and rewrite go.mod
-    for gomod in tmppath.rglob("go.mod"):
-    content = gomod.read_text()
-    def replace_in_zip(match):
-    return match.group(1) + canonical_path + match.group(3)
+                            # Find and rewrite go.mod
+                            for gomod in tmppath.rglob("go.mod"):
+                                content = gomod.read_text()
+                                def replace_in_zip(match):
+                                    return match.group(1) + canonical_path + match.group(3)
 
-    content = re.sub(
-    r'^(module\s+)(' + re.escape(actual_path) + r')(\s*)',
-    replace_in_zip,
-    content,
-    count=1,
-    flags=re.MULTILINE
-    )
-    gomod.write_text(content)
+                                content = re.sub(
+                                    r'^(module\s+)(' + re.escape(actual_path) + r')(\s*)',
+                                    replace_in_zip,
+                                    content,
+                                    count=1,
+                                    flags=re.MULTILINE
+                                )
+                                gomod.write_text(content)
 
-    # Rename directory to use canonical path
-    old_dir = tmppath / f"{actual_path}@{base_ver}"
-    new_dir = tmppath / f"{canonical_path}@{missing_ver}"
-    if old_dir.exists():
-    new_dir.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(old_dir), str(new_dir))
+                            # Rename directory to use canonical path
+                            old_dir = tmppath / f"{actual_path}@{base_ver}"
+                            new_dir = tmppath / f"{canonical_path}@{missing_ver}"
+                            if old_dir.exists():
+                                new_dir.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.move(str(old_dir), str(new_dir))
 
-    # Create new zip with canonical path
-    with zipfile.ZipFile(dst_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
-    for file in new_dir.rglob("*"):
-    if file.is_file():
-    arcname = str(file.relative_to(tmppath))
-    zf.write(file, arcname)
+                            # Create new zip with canonical path
+                            with zipfile.ZipFile(dst_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
+                                for file in new_dir.rglob("*"):
+                                    if file.is_file():
+                                        arcname = str(file.relative_to(tmppath))
+                                        zf.write(file, arcname)
 
-    bb.note(f"Created cache file: {canonical_path}@{missing_ver}.zip (rewritten)")
-    except Exception as e:
-    bb.debug(1, f"Could not create version alias for {canonical_path}@{missing_ver}: {e}")
+                        bb.note(f"Created cache file: {canonical_path}@{missing_ver}.zip (rewritten)")
+            except Exception as e:
+                bb.debug(1, f"Could not create version alias for {canonical_path}@{missing_ver}: {e}")
 
     bb.note("Module cache creation complete")
-    }
+}
 
-    # Add task after do_unpack (when git repositories are available)
-    addtask create_module_cache after do_unpack before do_configure
+# Add task after do_unpack (when git repositories are available)
+addtask create_module_cache after do_unpack before do_configure
+
+
+# ============================================================
+# do_generate_go_sum: Generate go.sum from module cache
+# ============================================================
+
+python do_generate_go_sum() {
+    """
+    Generate go.sum from the module cache artifacts.
+    - Zip checksums: Calculated from our VCS-based builds using Go helper binary
+    - go.mod checksums: Calculated locally using the Hash1(dirhash) algorithm
+
+    This matches Go's expectations while keeping the build offline.
+    """
+    import subprocess
+    import re
+    import hashlib
+    import base64
+    from pathlib import Path
+
+    s = d.getVar('S')
+    cache_dir = Path(s) / "pkg" / "mod" / "cache" / "download"
+    go_sum_path = Path(s) / "src" / "import" / "go.sum"
+    workdir = Path(d.getVar('WORKDIR'))
+    fallback_marker = workdir / ".use-gomodgit-go-sum"
+    fallback_sum = workdir / "go.sum.gomodgit"
+
+    if fallback_marker.exists() or fallback_sum.exists():
+        bb.warn("go.sum.gomodgit fallback detected - skipping helper-based go.sum generation")
+        fallback_marker.touch()
+        return
+
+    # Go helper binary for checksums
+    go_helper = Path(d.getVar('STAGING_BINDIR_NATIVE')) / "dirhash"
+
+    if not cache_dir.exists():
+        bb.fatal("Module cache not found - do_create_module_cache must run first")
+        return
+
+    if not go_helper.exists():
+        bb.fatal(f"Go checksum helper not found at {go_helper}. Ensure go-dirhash-native is in DEPENDS.")
+        return
+
+    bb.note("Generating go.sum from module cache (Hash1 for go.mod files)...")
+
+    def calculate_mod_checksum(mod_path):
+        try:
+            mod_bytes = mod_path.read_bytes()
+        except FileNotFoundError:
+            return None
+
+        file_hash = hashlib.sha256(mod_bytes).hexdigest()
+        summary = f"{file_hash}  go.mod\n".encode('ascii')
+        digest = hashlib.sha256(summary).digest()
+        return "h1:" + base64.b64encode(digest).decode('ascii')
+
+    checksums = {}
+
+    # Scan all .zip files in the module cache and calculate checksums
+    for zip_file in sorted(cache_dir.rglob("*.zip")):
+        try:
+            # Calculate zip checksum using Go helper binary
+            result = subprocess.run(
+                [str(go_helper), str(zip_file)],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            if result.returncode != 0:
+                bb.warn(f"Failed to calculate zip checksum for {zip_file}: {result.stderr}")
+                continue
+
+            zip_checksum = result.stdout.strip()
+
+            # Extract and unescape module path and version
+            parts = zip_file.parts
+            v_index = parts.index('@v')
+            download_index = parts.index('download')
+
+            escaped_module_parts = parts[download_index + 1:v_index]
+            escaped_module = '/'.join(escaped_module_parts)
+            escaped_version = zip_file.stem
+
+            def unescape(s):
+                """Unescape !lowercase back to uppercase"""
+                return re.sub(r'!([a-z])', lambda m: m.group(1).upper(), s)
+
+            module_path = unescape(escaped_module)
+            version = unescape(escaped_version)
+            module_version = f"{module_path} {version}"
+
+            # Calculate go.mod checksum directly from cached .mod file.
+            mod_file = zip_file.with_suffix('.mod')
+            mod_checksum = calculate_mod_checksum(mod_file)
+
+            if module_version not in checksums:
+                checksums[module_version] = {'zip': zip_checksum, 'mod': mod_checksum}
+
+        except Exception as e:
+            bb.warn(f"Error processing {zip_file}: {e}")
+            continue
+
+    # Write go.sum with hybrid checksums
+    go_sum_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(go_sum_path, 'w') as f:
+        for module_version in sorted(checksums.keys()):
+            data = checksums[module_version]
+            f.write(f"{module_version} {data['zip']}\n")
+            if data['mod']:
+                f.write(f"{module_version}/go.mod {data['mod']}\n")
+
+    num_with_mod = sum(1 if data['mod'] else 0 for data in checksums.values())
+    bb.note(f"✅ Generated go.sum with {len(checksums)} modules")
+    bb.note(f"   🎯 Zip checksums: {len(checksums)} calculated from VCS builds")
+    bb.note(f"   📄 go.mod checksums calculated from cached .mod files ({num_with_mod} entries)")
+}
+
+# Generate go.sum from actual module cache BEFORE compile
+addtask generate_go_sum after do_create_module_cache before do_compile
+
+
+# ============================================================
+# do_compile integration helpers
+# ============================================================
+
+do_compile:prepend() {
+    # Ensure offline Go builds consume the generated module cache
+    export GOMODCACHE="${S}/pkg/mod"
+    export GOPROXY="direct"
+    export GOSUMDB="off"
+    export GONOSUMDB="*"
+    export GOPRIVATE="*"
+    export GOFLAGS="${GOFLAGS} -mod=mod -modcacherw"
+
+    fallback_sum="${WORKDIR}/go.sum.gomodgit"
+    fallback_marker="${WORKDIR}/.use-gomodgit-go-sum"
+
+    if [ -f "${fallback_sum}" ]; then
+        bbwarn "Fallback go.sum.gomodgit detected - using provided checksums"
+        install -d "${S}/src/import"
+        install -m 0644 "${fallback_sum}" "${S}/src/import/go.sum"
+        touch "${fallback_marker}"
+    else
+        rm -f "${fallback_marker}"
+    fi
+
+    bbnote "Using offline Go module cache at ${GOMODCACHE}"
+}
 
 
 # ============================================================

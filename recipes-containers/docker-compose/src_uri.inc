@@ -3,18 +3,18 @@
 # Include module_cache_task.inc in your BitBake recipe for custom cache generation
 
 SRC_URI += "\
-    git://github.com/docker/cli;protocol=https;nobranch=1;rev=e180ab8ab82d22b7895a3e6e110cf6dd5c45f1d7;name=git_cad1045a9710;destsuffix=vcs_cache/cad1045a971054d09cd294955aa5eca1b56ac97f11687af53e0be244f1ee61f7 \
+    git://github.com/docker/cli;protocol=https;nobranch=1;rev=887030fbe83f5368566ec3b35e15a4ba13267a62;name=git_cad1045a9710;destsuffix=vcs_cache/cad1045a971054d09cd294955aa5eca1b56ac97f11687af53e0be244f1ee61f7 \
     git://github.com/opencontainers/go-digest.git;protocol=https;nobranch=1;rev=ea51bea511f75cfa3ef6098cc253c5c3609b037a;name=git_a209ab0e5e36;destsuffix=vcs_cache/a209ab0e5e3698ad17a060978b199a8cd790a373c7391624a67a97163f2ea6bb \
     git://github.com/distribution/reference;protocol=https;nobranch=1;rev=ff14fafe2236e51c2894ac07d4bdfc778e96d682;name=git_b4d8130d4c04;destsuffix=vcs_cache/b4d8130d4c04b5441d272d1e4a14056fc7374d5de56dd82a30c12fc65eb49b35 \
     git://github.com/docker/docker-credential-helpers;protocol=https;nobranch=1;rev=f9d3010165b642df37215b1be945552f2c6f0e3b;name=git_46e680977ce1;destsuffix=vcs_cache/46e680977ce17af64976bcc14fea9bb4345542e04842e8d0db0a451d5a14095d \
     git://github.com/pkg/errors.git;protocol=https;nobranch=1;rev=614d223910a179a466c1767a985424175c39b465;name=git_3761d4baf749;destsuffix=vcs_cache/3761d4baf74996b70c1469fcd5838db1576134c619499faa4afe8956043e307a \
-    git://go.googlesource.com/sys;protocol=https;nobranch=1;rev=1edeebeea09c66c5a886ccfefb1be5dafac5c893;name=git_da0444fc0003;destsuffix=vcs_cache/da0444fc0003f84a590bd6521553c0531086778bca13ec63ace9e0dd258f4b51 \
+    git://go.googlesource.com/sys;protocol=https;nobranch=1;rev=b06ce0514ea5467cf3ac72ad85e4d1845c51fbad;name=git_da0444fc0003;destsuffix=vcs_cache/da0444fc0003f84a590bd6521553c0531086778bca13ec63ace9e0dd258f4b51 \
     git://github.com/sirupsen/logrus;protocol=https;nobranch=1;rev=d40e25cd45ed9c6b2b66e6b97573a0413e4c23bd;name=git_020616345f7c;destsuffix=vcs_cache/020616345f7c7f88438c217f9d0e26744bce721c80e4a28f93399a8a4cd2acf1 \
     git://github.com/containerd/errdefs;protocol=https;nobranch=1;rev=4817405e4a3caeb7aee9dac68ed55339c59cb635;shallow=1;name=git_070120f783f1;destsuffix=vcs_cache/070120f783f179d9fd78a8b3191f8baf31e25d04d29e5baf30489375a5fded26 \
     git://github.com/fvbommel/sortorder;protocol=https;nobranch=1;rev=a8d9302c17f9f46c6580b82b919672e58ef6e396;name=git_9bd736309022;destsuffix=vcs_cache/9bd736309022b18ba28090c4a1df9c12651aa113beca47f1d90d63fb089308d3 \
     git://github.com/moby/sys;protocol=https;nobranch=1;rev=cafbe42351600ca9b363e220722f66d96f6e71f4;name=git_66165bb73acd;destsuffix=vcs_cache/66165bb73acd3a5f9b7c253c16a1ab6e044a4dba9a6becc8ca3fd494895f95bc \
     git://github.com/moby/sys;protocol=https;nobranch=1;rev=4a75548218baa36bdbaaed1371a3e8a9cdfcffa0;name=git_66165bb73acd;destsuffix=vcs_cache/66165bb73acd3a5f9b7c253c16a1ab6e044a4dba9a6becc8ca3fd494895f95bc \
-    git://github.com/docker/docker;protocol=https;nobranch=1;rev=f8215cc266744ef195a50a70d427c345da2acdbb;shallow=1;name=git_248eb0d137df;destsuffix=vcs_cache/248eb0d137df81736f6c84eff5e00bf5cccc915e2a34175acacd42218fa12c7f \
+    git://github.com/docker/docker;protocol=https;nobranch=1;rev=cd048300a48700294339c9c91d2dcc691cb8f63b;shallow=1;name=git_248eb0d137df;destsuffix=vcs_cache/248eb0d137df81736f6c84eff5e00bf5cccc915e2a34175acacd42218fa12c7f \
     git://github.com/docker/go-connections;protocol=https;nobranch=1;rev=42faf792bde28c414a060127d6351769408a675f;name=git_d4d85c75c05a;destsuffix=vcs_cache/d4d85c75c05a73a49903227d5abc01a97e2af98bb40d3e0568d93c9e52de9e77 \
     git://github.com/docker/go-units;protocol=https;nobranch=1;rev=e682442797b36348f8e1f98defdbf32bac0b6c6f;name=git_35e0b052ee50;destsuffix=vcs_cache/35e0b052ee50befe765248041206ea7cc293dd40a0ccd992a5732fbaa9ffd341 \
     git://github.com/opencontainers/image-spec;protocol=https;nobranch=1;rev=147f9c13cedb47a0c4d9a11a222961073d585877;name=git_a9e099eff8be;destsuffix=vcs_cache/a9e099eff8be32adc00fd86b57c3b2b055d813dcaa5b53df2d456150425a3ca5 \
