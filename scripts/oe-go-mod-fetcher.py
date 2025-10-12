@@ -6379,6 +6379,109 @@ def prompt_yes_no(question: str, default: bool = True) -> bool:
         print("Please respond with 'y' or 'n'.")
 
 
+def validate_srcrev(recipedir: Path, git_ref: Optional[str], source_dir: Optional[Path]) -> bool:
+    """
+    Validate that the source directory is checked out to the commit expected by the recipe.
+
+    Args:
+        recipedir: Directory containing the BitBake recipe (.bb file)
+        git_ref: The git ref passed via --git-ref (or None if not specified)
+        source_dir: The source directory to validate (or None if using --git-repo)
+
+    Returns:
+        True if validation passes or is not applicable, False if mismatch detected
+    """
+    if not recipedir:
+        # No recipe directory specified, skip validation
+        return True
+
+    if not source_dir or not source_dir.exists():
+        # No source directory to validate (e.g., using --git-repo which will clone fresh)
+        return True
+
+    # Find .bb file in recipe directory
+    recipe_files = list(recipedir.glob("*.bb"))
+    if not recipe_files:
+        print(f"⚠️  Warning: No .bb recipe file found in {recipedir}")
+        return True
+
+    if len(recipe_files) > 1:
+        print(f"⚠️  Warning: Multiple .bb files found in {recipedir}, skipping validation")
+        return True
+
+    recipe_file = recipe_files[0]
+
+    # Extract SRCREV from recipe file
+    srcrev_pattern = re.compile(r'^\s*SRCREV(?:_\w+)?\s*=\s*"([a-f0-9]{40})"\s*$', re.MULTILINE)
+
+    try:
+        recipe_content = recipe_file.read_text()
+        srcrev_matches = srcrev_pattern.findall(recipe_content)
+
+        if not srcrev_matches:
+            # No SRCREV found in recipe, skip validation
+            return True
+
+        # Use the first SRCREV found (typically SRCREV_<mainrepo>)
+        expected_srcrev = srcrev_matches[0]
+
+    except Exception as e:
+        print(f"⚠️  Warning: Could not read recipe file {recipe_file}: {e}")
+        return True
+
+    # Get actual commit from source directory or git_ref
+    if git_ref:
+        # If --git-ref was specified, validate it matches the recipe's SRCREV
+        # Normalize git_ref to full commit hash if possible
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", git_ref],
+                cwd=source_dir,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            actual_commit = result.stdout.strip()
+        except subprocess.CalledProcessError:
+            print(f"⚠️  Warning: Could not resolve git ref '{git_ref}' in {source_dir}")
+            return True
+
+        if actual_commit != expected_srcrev:
+            print(f"\n❌ ERROR: Git ref mismatch detected!")
+            print(f"   Recipe expects: {expected_srcrev[:12]} (SRCREV in {recipe_file.name})")
+            print(f"   --git-ref provided: {git_ref} → {actual_commit[:12]}")
+            print(f"\n   The --git-ref argument should match the recipe's SRCREV.")
+            print(f"   Please use: --git-ref {expected_srcrev}")
+            return False
+    else:
+        # No --git-ref specified, check current HEAD in source directory
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=source_dir,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            actual_commit = result.stdout.strip()
+        except subprocess.CalledProcessError as e:
+            print(f"⚠️  Warning: Could not get git HEAD from {source_dir}: {e}")
+            return True
+
+        if actual_commit != expected_srcrev:
+            print(f"\n❌ ERROR: Source directory commit mismatch detected!")
+            print(f"   Recipe expects: {expected_srcrev[:12]} (SRCREV in {recipe_file.name})")
+            print(f"   Source directory ({source_dir}) is at: {actual_commit[:12]}")
+            print(f"\n   The source directory is checked out to the wrong commit.")
+            print(f"   Please checkout the correct commit:")
+            print(f"     cd {source_dir} && git checkout {expected_srcrev}")
+            return False
+
+    # Validation passed
+    print(f"✅ SRCREV validation passed: {expected_srcrev[:12]}")
+    return True
+
+
 def main():
     print(f"Go Module Git Fetcher v{VERSION}")
     print("=" * 40)
@@ -6557,6 +6660,15 @@ Examples:
                     print(f"❌ go.mod file not found: {args.go_mod_file}")
                     sys.exit(1)
 
+            # Validate SRCREV if recipedir is specified
+            if args.recipedir:
+                recipedir = Path(args.recipedir)
+                # For --git-repo case, we don't validate since fetch_main_repo already checked out the ref
+                # For local directory case, validate the current checkout
+                validation_source = None if args.git_repo else source_dir
+                if not validate_srcrev(recipedir, args.git_ref, validation_source):
+                    sys.exit(1)
+
             # Use the new gomodgit infrastructure
             output_dir = Path(args.recipedir) if args.recipedir else Path(".")
             fetcher.bootstrap_gomodgit_infrastructure(source_dir, output_dir=output_dir)
@@ -6575,6 +6687,15 @@ Examples:
                 source_dir = Path(".").absolute()
                 if not (source_dir / args.go_mod_file).exists():
                     print(f"❌ go.mod file not found: {args.go_mod_file}")
+                    sys.exit(1)
+
+            # Validate SRCREV if recipedir is specified
+            if args.recipedir:
+                recipedir = Path(args.recipedir)
+                # For --git-repo case, we don't validate since fetch_main_repo already checked out the ref
+                # For local directory case, validate the current checkout
+                validation_source = None if args.git_repo else source_dir
+                if not validate_srcrev(recipedir, args.git_ref, validation_source):
                     sys.exit(1)
 
             # Use the new hybrid infrastructure
