@@ -12,6 +12,58 @@ GOMODCACHE = "${S}/pkg/mod"
 GO_MOD_CACHE_DIR = "${@os.path.relpath(d.getVar('GOMODCACHE'), d.getVar('UNPACKDIR'))}"
 do_unpack[cleandirs] += "${GOMODCACHE}"
 
+# Uncomment this line to force rebuilding the module cache from scratch always
+#do_create_module_cache[cleandirs] += "${GOMODCACHE}/cache/download"
+
+# ============================================================
+# do_copy_fallback_modules: Copy file:// fallback modules
+# ============================================================
+
+python do_copy_fallback_modules() {
+    import os
+    import shutil
+    from pathlib import Path
+
+    unpackdir = d.getVar('UNPACKDIR')
+    gomodcache = d.getVar('GOMODCACHE')
+    fallback_src = Path(unpackdir) / 'gomod-fallback'
+    cache_dst = Path(gomodcache) / 'cache' / 'download'
+
+    if not fallback_src.exists():
+        bb.debug(1, 'No gomod-fallback directory found')
+        return
+
+    fallback_modules = [
+        {'module': "github.com/hashicorp/golang-lru/arc/v2", 'version': "v2.0.7", 'reason': "commit_mismatch"},
+        {'module': "golang.zx2c4.com/wireguard", 'version': "v0.0.0-20231211153847-12269c276173", 'reason': "commit_mismatch"},
+        {'module': "github.com/hashicorp/golang-lru/arc/v2", 'version': "v2.0.7", 'reason': "commit_mismatch"},
+    ]
+
+    bb.plain('📦 Copying %d fallback modules to build cache...' % len(fallback_modules))
+    for fb in fallback_modules:
+        module_path = fb['module']
+        version = fb['version']
+        src_base = fallback_src / module_path / '@v'
+        dst_base = cache_dst / module_path / '@v'
+        dst_base.mkdir(parents=True, exist_ok=True)
+
+        copied = []
+        for ext in ['.info', '.mod', '.zip', '.ziphash']:
+            src_file = src_base / f'{version}{ext}'
+            dst_file = dst_base / f'{version}{ext}'
+            if src_file.exists():
+                shutil.copy2(src_file, dst_file)
+                copied.append(ext)
+
+        if copied:
+            bb.debug(1, f'Copied {module_path}@{version}: {copied}')
+        else:
+            bb.warn(f'No files found for fallback module {module_path}@{version}')
+
+    bb.plain('✅ Fallback modules copied to build cache')
+}
+addtask copy_fallback_modules after do_unpack before do_create_module_cache
+
 
 python do_create_module_cache() {
     """
@@ -23,6 +75,7 @@ python do_create_module_cache() {
     import subprocess
     import zipfile
     import threading
+    import re
     from pathlib import Path
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -32,7 +85,7 @@ python do_create_module_cache() {
         with open(f"{vcs_path}.info", 'wb') as f:
             f.write(vcs_key.encode())
 
-    def create_module_zip(module_path, version, vcs_path, subdir=None):
+    def create_module_zip(module_path, version, vcs_path, subdir=None, alias_of=None):
         """Create module zip file from git repository"""
         # Calculate paths
         # Use correct escaping function that matches BitBake's gomod.py
@@ -41,8 +94,22 @@ python do_create_module_cache() {
             import re
             return re.sub(r'([A-Z])', lambda m: '!' + m.group(1).lower(), path)
 
+        def sanitize_module_name(name):
+            if not name:
+                return name
+            stripped = name.strip()
+            if len(stripped) >= 2 and stripped[0] == '"' and stripped[-1] == '"':
+                return stripped[1:-1]
+            return stripped
+
+        module_path = sanitize_module_name(module_path)
+        alias_of = sanitize_module_name(alias_of) if alias_of else None
+
         escaped_module = escape_module_path(module_path)
         escaped_version = escape_module_path(version)
+
+        alias_module = module_path
+        rewrite_to_alias = bool(alias_of)
 
         download_dir = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_module / "@v"
         download_dir.mkdir(parents=True, exist_ok=True)
@@ -50,51 +117,94 @@ python do_create_module_cache() {
         zip_path = download_dir / f"{escaped_version}.zip"
         mod_path = download_dir / f"{escaped_version}.mod"
 
-        # Get file list from git repository
-        work_path = Path(vcs_path)
-        if subdir:
-            work_path = work_path / subdir
+        module_decl_pattern = re.compile(r'(?m)^(module\s+)(\S+)(\s*)')
 
-        cmd = ["git", "ls-tree", "-r", "--name-only", "HEAD"]
-        if subdir:
-            cmd.append(subdir)
+        def make_module_directive(module_name):
+            """Create a proper go.mod module directive with newline"""
+            cleaned_module = sanitize_module_name(module_name)
+            return f"module {cleaned_module}\n"
 
+        def rewrite_module_directive(text, new_module):
+            cleaned_module = sanitize_module_name(new_module)
+            def replacer(match):
+                existing = match.group(2)
+                if existing.startswith('"') and existing.endswith('"'):
+                    return f"{match.group(1)}{cleaned_module}{match.group(3)}"
+                return f"{match.group(1)}{cleaned_module}{match.group(3)}"
+
+            new_text, count = module_decl_pattern.subn(replacer, text, count=1)
+            return new_text if count else None
+
+        # Create module zip file using git archive (much faster and avoids arg limits)
         try:
-            files = subprocess.check_output(cmd, cwd=vcs_path, text=True).strip().split('\n')
-            files = [f for f in files if f.strip()]
-        except subprocess.CalledProcessError:
-            bb.warn(f"Could not list files for {module_path}@{version}")
-            return
+            import tarfile
+            import tempfile
 
-        # Create module zip file
-        try:
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                module_prefix = f"{module_path}@{version}/"
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Use git archive to extract files efficiently
+                archive_cmd = ["git", "archive", "--format=tar", "HEAD"]
+                if subdir:
+                    archive_cmd.append(subdir)
+
+                tar_data = subprocess.check_output(archive_cmd, cwd=vcs_path)
+
+                # Extract tar to temp directory
+                tar_path = Path(tmpdir) / "archive.tar"
+                tar_path.write_bytes(tar_data)
+
+                with tarfile.open(tar_path, 'r') as tf:
+                    tf.extractall(tmpdir)
+
+                # Find go.mod files to determine excluded prefixes
                 expected_go_mod = f"{subdir}/go.mod" if subdir else "go.mod"
-
                 excluded_prefixes = []
-                for file_path in files:
-                    if file_path.endswith('go.mod') and file_path != expected_go_mod:
-                        dir_path = os.path.dirname(file_path)
-                        if dir_path:
+
+                extract_root = Path(tmpdir)
+                if subdir:
+                    extract_root = extract_root / subdir
+
+                for gomod_file in extract_root.rglob("go.mod"):
+                    rel_path = gomod_file.relative_to(Path(tmpdir))
+                    if str(rel_path) != expected_go_mod:
+                        dir_path = gomod_file.parent.relative_to(Path(tmpdir))
+                        if str(dir_path) != '.':
                             excluded_prefixes.append(f"{dir_path}/")
 
-                for file_path in files:
-                    if subdir and not file_path.startswith(subdir):
-                        continue
-                    if any(file_path.startswith(excluded_prefix) for excluded_prefix in excluded_prefixes):
-                        continue
-                    if file_path.endswith('go.mod') and file_path != expected_go_mod:
-                        continue
-                    try:
-                        content = subprocess.check_output(
-                            ["git", "cat-file", "blob", f"HEAD:{file_path}"],
-                            cwd=vcs_path
-                        )
-                        archive_path = module_prefix + (file_path[len(subdir)+1:] if subdir else file_path)
-                        zf.writestr(archive_path, content)
-                    except subprocess.CalledProcessError:
-                        continue
+                # Create zip file
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    module_prefix = f"{module_path}@{version}/"
+
+                    for file_path in extract_root.rglob("*"):
+                        if file_path.is_file():
+                            rel_path = file_path.relative_to(Path(tmpdir))
+                            rel_str = str(rel_path)
+
+                            # Skip excluded nested modules
+                            if any(rel_str.startswith(prefix) for prefix in excluded_prefixes):
+                                continue
+                            if rel_str.endswith('go.mod') and rel_str != expected_go_mod:
+                                continue
+
+                            # Read content
+                            content = file_path.read_bytes()
+
+                            # Rewrite go.mod if needed
+                            if rewrite_to_alias and rel_str == expected_go_mod:
+                                try:
+                                    content_text = content.decode()
+                                    rewritten = rewrite_module_directive(content_text, alias_module)
+                                    if rewritten is None:
+                                        rewritten = make_module_directive(alias_module)
+                                    content = rewritten.encode()
+                                except Exception:
+                                    content = make_module_directive(alias_module).encode()
+
+                            # Add to zip with correct path
+                            if subdir:
+                                archive_path = module_prefix + rel_str[len(subdir)+1:]
+                            else:
+                                archive_path = module_prefix + rel_str
+                            zf.writestr(archive_path, content)
 
             bb.note(f"Created {zip_path}")
         except Exception as e:
@@ -106,7 +216,7 @@ python do_create_module_cache() {
         try:
             if '+incompatible' in version:
                 # Synthetic minimal .mod for pre-module versions
-                mod_content = f"module {module_path}\n".encode()
+                mod_content = make_module_directive(alias_module).encode('utf-8')
                 bb.note(f"Creating synthetic .mod for +incompatible version: {module_path}")
             else:
                 # For proper module versions, use repository's go.mod
@@ -119,9 +229,18 @@ python do_create_module_cache() {
                         ["git", "cat-file", "blob", f"HEAD:{mod_file}"],
                         cwd=vcs_path
                     )
+                    if rewrite_to_alias:
+                        try:
+                            mod_text = mod_content.decode()
+                            rewritten = rewrite_module_directive(mod_text, alias_module)
+                            if rewritten is None:
+                                rewritten = make_module_directive(alias_module)
+                            mod_content = rewritten.encode()
+                        except Exception:
+                            mod_content = make_module_directive(alias_module).encode()
                 except subprocess.CalledProcessError:
                     # Synthesize go.mod if not found
-                    mod_content = f"module {module_path}\n".encode()
+                    mod_content = make_module_directive(alias_module).encode()
 
             with open(mod_path, 'wb') as f:
                 f.write(mod_content)
@@ -131,23 +250,19 @@ python do_create_module_cache() {
             bb.warn(f"Failed to create mod file for {module_path}@{version}: {e}")
 
     # Module list with repository information
-    modules_data = [({"module": "github.com/gorilla/mux", "version": "v1.8.1", "repo_url": "https://github.com/gorilla/mux", "commit": "b4617d0b9670ad14039b2739167fd35a60f557c5", "subdir": ""}),
+    modules_data = [
+        ({"module": "github.com/gorilla/mux", "version": "v1.8.1", "repo_url": "https://github.com/gorilla/mux", "commit": "b4617d0b9670ad14039b2739167fd35a60f557c5", "subdir": ""}),
         ({"module": "github.com/coreos/go-systemd/v22", "version": "v22.6.0", "repo_url": "https://github.com/coreos/go-systemd", "commit": "8214e15a7a799dc18f0ef8dd788b830f815d7530", "subdir": ""}),
-        ({"module": "golang.org/x/sys", "version": "v0.35.0", "repo_url": "https://go.googlesource.com/sys", "commit": "5b936e1f126baa13682eff91c2e4d5d9e3a0b71d", "subdir": ""}),
         ({"module": "github.com/sirupsen/logrus", "version": "v1.9.3", "repo_url": "https://github.com/sirupsen/logrus", "commit": "d40e25cd45ed9c6b2b66e6b97573a0413e4c23bd", "subdir": ""}),
         ({"module": "github.com/containerd/log", "version": "v0.1.0", "repo_url": "https://github.com/containerd/log", "commit": "0fc1e28871fdf2786e2cc51bbe4133db6547a199", "subdir": ""}),
         ({"module": "google.golang.org/protobuf", "version": "v1.36.8", "repo_url": "https://go.googlesource.com/protobuf", "commit": "0833cf304e6344e895e819f769afa28107fe8892", "subdir": ""}),
         ({"module": "google.golang.org/genproto/googleapis/rpc", "version": "v0.0.0-20250826171959-ef028d996bc1", "repo_url": "https://github.com/googleapis/go-genproto", "commit": "ef028d996bc1e7e0d82a6f72fba4a35dea082183", "subdir": "googleapis/rpc"}),
-        ({"module": "google.golang.org/grpc", "version": "v1.75.0", "repo_url": "https://github.com/grpc/grpc-go", "commit": "b9788ef265596eda98a4391079c70c3992ed47cb", "subdir": ""}),
         ({"module": "github.com/containerd/ttrpc", "version": "v1.2.7", "repo_url": "https://github.com/containerd/ttrpc", "commit": "3b8c8b75577584e412043afb7b561193a4a47d2e", "subdir": ""}),
-        ({"module": "golang.org/x/net", "version": "v0.43.0", "repo_url": "https://go.googlesource.com/net", "commit": "e74bc31d69f225b635e065a602db3fbfa9850f93", "subdir": ""}),
         ({"module": "golang.org/x/text", "version": "v0.28.0", "repo_url": "https://go.googlesource.com/text", "commit": "425d715b4a85c7698cedf621412bb53794cbda53", "subdir": ""}),
-        ({"module": "github.com/containerd/containerd/api", "version": "v1.9.0", "repo_url": "https://github.com/containerd/containerd", "commit": "9033738f0870139e925d1afe05774a0387ebbabd", "subdir": "api"}),
         ({"module": "github.com/opencontainers/go-digest", "version": "v1.0.0", "repo_url": "https://github.com/opencontainers/go-digest.git", "commit": "ea51bea511f75cfa3ef6098cc253c5c3609b037a", "subdir": ""}),
         ({"module": "github.com/opencontainers/image-spec", "version": "v1.1.1", "repo_url": "https://github.com/opencontainers/image-spec", "commit": "147f9c13cedb47a0c4d9a11a222961073d585877", "subdir": ""}),
         ({"module": "github.com/gogo/protobuf", "version": "v1.3.2", "repo_url": "https://github.com/gogo/protobuf.git", "commit": "b03c65ea87cdc3521ede29f62fe3ce239267c1bc", "subdir": ""}),
         ({"module": "github.com/containerd/typeurl/v2", "version": "v2.2.3", "repo_url": "https://github.com/containerd/typeurl", "commit": "5b047adad57d172afa9654c019fe65bf0540cc4d", "subdir": ""}),
-        ({"module": "github.com/containerd/containerd/v2", "version": "v2.1.4", "repo_url": "https://github.com/containerd/containerd", "commit": "75cb2b7193e4e490e9fbdc236c0e811ccaba3376", "subdir": ""}),
         ({"module": "github.com/containerd/errdefs", "version": "v1.0.0", "repo_url": "https://github.com/containerd/errdefs", "commit": "4817405e4a3caeb7aee9dac68ed55339c59cb635", "subdir": ""}),
         ({"module": "github.com/google/go-cmp", "version": "v0.7.0", "repo_url": "https://github.com/google/go-cmp", "commit": "9b12f366a942ebc7254abc7f32ca05068b455fb7", "subdir": ""}),
         ({"module": "github.com/containerd/errdefs/pkg", "version": "v0.3.0", "repo_url": "https://github.com/containerd/errdefs", "commit": "4817405e4a3caeb7aee9dac68ed55339c59cb635", "subdir": "pkg"}),
@@ -172,18 +287,14 @@ python do_create_module_cache() {
         ({"module": "github.com/containerd/fifo", "version": "v1.1.0", "repo_url": "https://github.com/containerd/fifo", "commit": "151b205263c29d471e0d55c787d2ce9f5343fd46", "subdir": ""}),
         ({"module": "github.com/containerd/plugin", "version": "v1.0.0", "repo_url": "https://github.com/containerd/plugin", "commit": "19cedbf730bb9ae1c106c4d4df8492bb3d3fb8fd", "subdir": ""}),
         ({"module": "github.com/moby/sys/signal", "version": "v0.7.1", "repo_url": "https://github.com/moby/sys", "commit": "cafbe42351600ca9b363e220722f66d96f6e71f4", "subdir": "signal"}),
-        ({"module": "github.com/opencontainers/selinux", "version": "v1.12.0", "repo_url": "https://github.com/opencontainers/selinux", "commit": "996c4cffd3c5fb210e4ff01b4998ac73ff0031fa", "subdir": ""}),
         ({"module": "go.etcd.io/bbolt", "version": "v1.4.2", "repo_url": "https://github.com/etcd-io/bbolt", "commit": "dca4b1df8e6a770203c4c44117635c0c84140e24", "subdir": ""}),
         ({"module": "github.com/containerd/fuse-overlayfs-snapshotter/v2", "version": "v2.1.6", "repo_url": "https://github.com/containerd/fuse-overlayfs-snapshotter", "commit": "8b4beab359e7d031f06783f60a34f2a9b7297ef5", "subdir": ""}),
         ({"module": "github.com/containerd/stargz-snapshotter/estargz", "version": "v0.17.0", "repo_url": "https://github.com/containerd/stargz-snapshotter", "commit": "6f6aacb044960a0820a2d2954f5cbcc40b17fbdb", "subdir": "estargz"}),
         ({"module": "github.com/vbatts/tar-split", "version": "v0.12.1", "repo_url": "https://github.com/vbatts/tar-split", "commit": "ced2b07a57dc67e1f3d620ec6a0daad5109aba63", "subdir": ""}),
-        ({"module": "github.com/containerd/stargz-snapshotter", "version": "v0.17.0", "repo_url": "https://github.com/containerd/stargz-snapshotter", "commit": "6f6aacb044960a0820a2d2954f5cbcc40b17fbdb", "subdir": ""}),
         ({"module": "github.com/golang/groupcache", "version": "v0.0.0-20241129210726-2c02b8208cf8", "repo_url": "https://github.com/golang/groupcache", "commit": "2c02b8208cf8c02a3e358cb1d9b60950647543fc", "subdir": ""}),
         ({"module": "github.com/beorn7/perks", "version": "v1.0.1", "repo_url": "https://github.com/beorn7/perks.git", "commit": "37c8de3658fcb183f997c4e13e8337516ab753e6", "subdir": ""}),
         ({"module": "github.com/cespare/xxhash/v2", "version": "v2.3.0", "repo_url": "https://github.com/cespare/xxhash", "commit": "998dce232f17418a7a5721ecf87ca714025a3243", "subdir": ""}),
         ({"module": "github.com/prometheus/client_model", "version": "v0.6.2", "repo_url": "https://github.com/prometheus/client_model", "commit": "eb136e513d419e0c31ad750922f0a6f7675c2dee", "subdir": ""}),
-        ({"module": "github.com/prometheus/common", "version": "v0.65.0", "repo_url": "https://github.com/prometheus/common", "commit": "75c3814dc66c571cc82cee2d3a6bf5f37ee73f1a", "subdir": ""}),
-        ({"module": "github.com/prometheus/client_golang", "version": "v1.23.0", "repo_url": "https://github.com/prometheus/client_golang", "commit": "e4b2208dd8cb6d1425f00250db842ec3c1e8749e", "subdir": ""}),
         ({"module": "github.com/munnerz/goautoneg", "version": "v0.0.0-20191010083416-a7dc8b61c822", "repo_url": "https://github.com/munnerz/goautoneg.git", "commit": "a7dc8b61c822528f973a5e4e7b272055c6fdb43e", "subdir": ""}),
         ({"module": "github.com/prometheus/procfs", "version": "v0.17.0", "repo_url": "https://github.com/prometheus/procfs", "commit": "61fe41207276bc95c4c391762e9ef137385e8a5d", "subdir": ""}),
         ({"module": "github.com/hashicorp/go-cleanhttp", "version": "v0.5.2", "repo_url": "https://github.com/hashicorp/go-cleanhttp.git", "commit": "6d9e2ac5d828e5f8594b97f88c4bde14a67bb6d2", "subdir": ""}),
@@ -191,17 +302,15 @@ python do_create_module_cache() {
         ({"module": "github.com/hanwen/go-fuse/v2", "version": "v2.8.0", "repo_url": "https://github.com/hanwen/go-fuse", "commit": "ee34567408d6ab557a0169089879ec111bd74408", "subdir": ""}),
         ({"module": "github.com/docker/go-metrics", "version": "v0.0.1", "repo_url": "https://github.com/docker/go-metrics.git", "commit": "b619b3592b65de4f087d9f16863a7e6ff905973c", "subdir": ""}),
         ({"module": "github.com/pelletier/go-toml/v2", "version": "v2.2.4", "repo_url": "https://github.com/pelletier/go-toml", "commit": "ee07c9203b72060f12e31c04ace80e8a187d5a67", "subdir": ""}),
-        ({"module": "k8s.io/cri-api", "version": "v0.34.1", "repo_url": "https://github.com/kubernetes/cri-api", "commit": "9b3ce5ec47987aa9451184a42273d4d36e789f83", "subdir": ""}),
-        ({"module": "github.com/docker/docker", "version": "v28.3.3+incompatible", "repo_url": "https://github.com/docker/docker", "commit": "bea959c7b793b32a893820b97c4eadc7c87fabb0", "subdir": ""}),
         ({"module": "github.com/fsnotify/fsnotify", "version": "v1.9.0", "repo_url": "https://github.com/fsnotify/fsnotify", "commit": "ae0e7923765f64fb8061396db7edebb558cf6093", "subdir": ""}),
         ({"module": "github.com/google/go-containerregistry", "version": "v0.20.2", "repo_url": "https://github.com/google/go-containerregistry", "commit": "c195f151efe3369874c72662cd69ad43ee485128", "subdir": ""}),
         ({"module": "k8s.io/cri-client", "version": "v0.34.1", "repo_url": "https://github.com/kubernetes/cri-client", "commit": "6063f15166ef1384cca5a06281c5da320e25c843", "subdir": ""}),
+        ({"module": "github.com/k3s-io/k3s", "version": "v0.0.0", "repo_url": "https://github.com/k3s-io/k3s.git", "commit": "0e5bc29d34d04e7857d1cc86e4f945236cd048cb", "subdir": ""}),
         ({"module": "github.com/k3s-io/api", "version": "v0.1.3", "repo_url": "https://github.com/k3s-io/api", "commit": "8adb951ef8746be48fb3a38fab98e65cc728374a", "subdir": ""}),
+        ({"module": "gopkg.in/inf.v0", "version": "v0.9.1", "repo_url": "https://github.com/go-inf/inf", "commit": "d2d2541c53f18d2a059457998ce2876cc8e67cbf", "subdir": ""}),
         ({"module": "github.com/x448/float16", "version": "v0.8.4", "repo_url": "https://github.com/x448/float16.git", "commit": "cb9afec31f2649663ebb64da5c6c32c3d365c3ca", "subdir": ""}),
         ({"module": "github.com/fxamacker/cbor/v2", "version": "v2.9.0", "repo_url": "https://github.com/fxamacker/cbor", "commit": "d29ad7351b55b1844387cf9306c4101658cc5256", "subdir": ""}),
         ({"module": "sigs.k8s.io/json", "version": "v0.0.0-20250730193827-2d320260d730", "repo_url": "https://github.com/kubernetes-sigs/json", "commit": "2d320260d730f3842fef7b08d9a807bdbc617824", "subdir": ""}),
-        ({"module": "k8s.io/apimachinery", "version": "v0.34.1", "repo_url": "https://github.com/kubernetes/apimachinery", "commit": "b72d93d174332f952a8d431419fece5e6f044bcb", "subdir": ""}),
-        ({"module": "k8s.io/klog/v2", "version": "v2.130.1", "repo_url": "https://github.com/kubernetes/klog", "commit": "75663bb798999a49e3e4c0f2375ed5cca8164194", "subdir": ""}),
         ({"module": "k8s.io/utils", "version": "v0.0.0-20250820121507-0af2bda4dd1d", "repo_url": "https://github.com/kubernetes/utils", "commit": "0af2bda4dd1d4b5b10c2a000f68c34d1e0b83acf", "subdir": ""}),
         ({"module": "github.com/modern-go/concurrent", "version": "v0.0.0-20180306012644-bacd9c7ef1dd", "repo_url": "https://github.com/modern-go/concurrent.git", "commit": "bacd9c7ef1dd9b15be4a9909b8ac7a4e313eec94", "subdir": ""}),
         ({"module": "github.com/modern-go/reflect2", "version": "v1.0.3-0.20250322232337-35a7c28c31ee", "repo_url": "https://github.com/modern-go/reflect2", "commit": "35a7c28c31ee079903db043180532306a621943a", "subdir": ""}),
@@ -212,9 +321,7 @@ python do_create_module_cache() {
         ({"module": "github.com/rancher/lasso", "version": "v0.2.3", "repo_url": "https://github.com/rancher/lasso", "commit": "d9be1e6a051ddf344ab23f18d8ec92f8b1ece3ea", "subdir": ""}),
         ({"module": "github.com/google/gnostic-models", "version": "v0.7.0", "repo_url": "https://github.com/google/gnostic-models", "commit": "82b4ba06c153dcd30e1dbcf93601b3bee5cb3792", "subdir": ""}),
         ({"module": "go.yaml.in/yaml/v3", "version": "v3.0.4", "repo_url": "https://github.com/yaml/go-yaml", "commit": "c3552c15f996075a7634df5159d9161c67bf3d76", "subdir": ""}),
-        ({"module": "k8s.io/api", "version": "v0.34.1", "repo_url": "https://github.com/kubernetes/api", "commit": "77c9e29b068e14d4bcca2d6a4c85b2cc9da5a923", "subdir": ""}),
         ({"module": "sigs.k8s.io/yaml", "version": "v1.6.0", "repo_url": "https://github.com/kubernetes-sigs/yaml", "commit": "048d724aca2d37ddb5b03c90b5b4550a3a48766d", "subdir": ""}),
-        ({"module": "k8s.io/kube-openapi", "version": "v0.0.0-20250814151709-d7b6acb124c3", "repo_url": "https://github.com/kubernetes/kube-openapi", "commit": "d7b6acb124c36bbdd139d97fa1f3409f1c0eb45e", "subdir": ""}),
         ({"module": "github.com/go-openapi/swag/jsonname", "version": "v0.24.0", "repo_url": "https://github.com/go-openapi/swag", "commit": "04b65d3aff180750a2ad252c8b3da549a1c02dfa", "subdir": "jsonname"}),
         ({"module": "github.com/go-openapi/jsonpointer", "version": "v0.22.0", "repo_url": "https://github.com/go-openapi/jsonpointer", "commit": "ea421064bbd1a1dc07bf3cecd02a049066f02146", "subdir": ""}),
         ({"module": "github.com/go-openapi/jsonreference", "version": "v0.21.1", "repo_url": "https://github.com/go-openapi/jsonreference", "commit": "6973d2f8636af9d72c2d4b37d6779cf3699afe8d", "subdir": ""}),
@@ -236,30 +343,24 @@ python do_create_module_cache() {
         ({"module": "golang.org/x/oauth2", "version": "v0.30.0", "repo_url": "https://go.googlesource.com/oauth2", "commit": "cf1431934151b3a93e0b3286eb6798ca08ea3770", "subdir": ""}),
         ({"module": "golang.org/x/time", "version": "v0.12.0", "repo_url": "https://go.googlesource.com/time", "commit": "1616a7fa5fe23b54fee0cc3dd6d0bd48abc19914", "subdir": ""}),
         ({"module": "github.com/google/uuid", "version": "v1.6.0", "repo_url": "https://github.com/google/uuid", "commit": "0f11ee6918f41a04c201eceeadf612a377bc7fbc", "subdir": ""}),
-        ({"module": "github.com/emicklei/go-restful/v3", "version": "v3.13.0", "repo_url": "https://github.com/emicklei/go-restful", "commit": "3fae6e4c6809ebc26315d163196ea7ab8e0685cb", "subdir": ""}),
         ({"module": "github.com/pmezard/go-difflib", "version": "v1.0.1-0.20181226105442-5d4384ee4fb2", "repo_url": "https://github.com/pmezard/go-difflib.git", "commit": "5d4384ee4fb2527b0a1256a821ebfc92f91efefc", "subdir": ""}),
         ({"module": "github.com/evanphx/json-patch", "version": "v5.9.11+incompatible", "repo_url": "https://github.com/evanphx/json-patch", "commit": "84a4bb100ade42a86fce2647c95a7dbcbf569cb2", "subdir": ""}),
         ({"module": "github.com/pkg/errors", "version": "v0.9.1", "repo_url": "https://github.com/pkg/errors.git", "commit": "614d223910a179a466c1767a985424175c39b465", "subdir": ""}),
         ({"module": "github.com/rancher/wrangler/v3", "version": "v3.2.3", "repo_url": "https://github.com/rancher/wrangler", "commit": "cc0fd777bcfd3be1f98587c2663fbb7f308922d7", "subdir": ""}),
         ({"module": "gopkg.in/evanphx/json-patch.v4", "version": "v4.13.0", "repo_url": "https://gopkg.in/evanphx/json-patch.v4", "commit": "84a4bb100ade42a86fce2647c95a7dbcbf569cb2", "subdir": ""}),
         ({"module": "github.com/Rican7/retry", "version": "v0.3.1", "repo_url": "https://github.com/Rican7/retry.git", "commit": "e6cc9ad35993d0a7edf857b494c854e0804440cd", "subdir": ""}),
-        ({"module": "go.etcd.io/etcd/client/pkg/v3", "version": "v3.6.4", "repo_url": "https://github.com/etcd-io/etcd", "commit": "5400cdc39b829ee5dadacb77002256cf86357da1", "subdir": "client/pkg"}),
         ({"module": "go.uber.org/multierr", "version": "v1.11.0", "repo_url": "https://github.com/uber-go/multierr", "commit": "de75ae527b39a27afcb50a84427ec7b84021d5f4", "subdir": ""}),
         ({"module": "go.uber.org/zap", "version": "v1.27.0", "repo_url": "https://github.com/uber-go/zap", "commit": "fcf8ee58669e358bbd6460bef5c2ee7a53c0803a", "subdir": ""}),
         ({"module": "github.com/k3s-io/kine", "version": "v0.14.0", "repo_url": "https://github.com/k3s-io/kine", "commit": "adbb708512a6be82e7f1beaabc618b95f490d820", "subdir": ""}),
-        ({"module": "github.com/golang/protobuf", "version": "v1.5.4", "repo_url": "https://github.com/golang/protobuf", "commit": "75de7c059e36b64f01d0dd234ff2fff404ec3374", "subdir": ""}),
         ({"module": "github.com/grpc-ecosystem/grpc-gateway/v2", "version": "v2.27.2", "repo_url": "https://github.com/grpc-ecosystem/grpc-gateway", "commit": "91958df0371da5c71794adc92e21cf8fed58df97", "subdir": ""}),
-        ({"module": "go.etcd.io/etcd/api/v3", "version": "v3.6.4", "repo_url": "https://github.com/etcd-io/etcd", "commit": "5400cdc39b829ee5dadacb77002256cf86357da1", "subdir": "api"}),
         ({"module": "google.golang.org/genproto/googleapis/api", "version": "v0.0.0-20250826171959-ef028d996bc1", "repo_url": "https://github.com/googleapis/go-genproto", "commit": "ef028d996bc1e7e0d82a6f72fba4a35dea082183", "subdir": "googleapis/api"}),
         ({"module": "github.com/coreos/go-semver", "version": "v0.3.1", "repo_url": "https://github.com/coreos/go-semver", "commit": "c16f28124668daf02b2a32a431dec2f183977ffc", "subdir": ""}),
-        ({"module": "go.etcd.io/etcd/client/v3", "version": "v3.6.4", "repo_url": "https://github.com/etcd-io/etcd", "commit": "5400cdc39b829ee5dadacb77002256cf86357da1", "subdir": "client/v3"}),
         ({"module": "filippo.io/edwards25519", "version": "v1.1.0", "repo_url": "https://github.com/FiloSottile/edwards25519", "commit": "325f520de716c1d2d2b4e8dc2f82c7ccc5fac764", "subdir": ""}),
         ({"module": "github.com/go-sql-driver/mysql", "version": "v1.9.3", "repo_url": "https://github.com/go-sql-driver/mysql", "commit": "62984ada4402df6571557bc3fed2bcbde48ec908", "subdir": ""}),
         ({"module": "github.com/dustin/go-humanize", "version": "v1.0.1", "repo_url": "https://github.com/dustin/go-humanize", "commit": "9ec74ab2f7a7161664182fd4e5e292fccffbc75f", "subdir": ""}),
         ({"module": "github.com/expr-lang/expr", "version": "v1.17.5", "repo_url": "https://github.com/expr-lang/expr", "commit": "eeb1b8b6259d9a34ad5fb06bdd8cde80841396ac", "subdir": ""}),
         ({"module": "github.com/nats-io/jsm.go", "version": "v0.2.4", "repo_url": "https://github.com/nats-io/jsm.go", "commit": "805384d41dc2abb325fab8f4412ca3bbcf8c80fd", "subdir": ""}),
         ({"module": "github.com/nats-io/nats.go", "version": "v1.44.0", "repo_url": "https://github.com/nats-io/nats.go", "commit": "7a260b8b93562630ec8c6f8f31ae3704c4f61ad1", "subdir": ""}),
-        ({"module": "golang.org/x/crypto", "version": "v0.40.0", "repo_url": "https://go.googlesource.com/crypto", "commit": "459a9db11b9c43bb1d61722bfd371751d6de05c9", "subdir": ""}),
         ({"module": "github.com/nats-io/nkeys", "version": "v0.4.11", "repo_url": "https://github.com/nats-io/nkeys", "commit": "cf5e93d3187a266d33f60aa95de13bb216db0469", "subdir": ""}),
         ({"module": "github.com/nats-io/nuid", "version": "v1.0.1", "repo_url": "https://github.com/nats-io/nuid.git", "commit": "4b96681fa6d28dd0ab5fe79bac63b3a493d9ee94", "subdir": ""}),
         ({"module": "github.com/minio/highwayhash", "version": "v1.0.3", "repo_url": "https://github.com/minio/highwayhash", "commit": "030a8b332625f1501d534324055b1de810fe9233", "subdir": ""}),
@@ -276,10 +377,8 @@ python do_create_module_cache() {
         ({"module": "github.com/soheilhy/cmux", "version": "v0.1.5", "repo_url": "https://github.com/soheilhy/cmux.git", "commit": "5ec6847320e53b5fee0ab9a4757b56625a946c85", "subdir": ""}),
         ({"module": "github.com/gorilla/websocket", "version": "v1.5.4-0.20250319132907-e064f32e3674", "repo_url": "https://github.com/gorilla/websocket", "commit": "e064f32e3674d9d79a8fd417b5bc06fa5c6cad8f", "subdir": ""}),
         ({"module": "github.com/tmc/grpc-websocket-proxy", "version": "v0.0.0-20220101234140-673ab2c3ae75", "repo_url": "https://github.com/tmc/grpc-websocket-proxy.git", "commit": "673ab2c3ae75cc01952b84b88590e30e75dcf395", "subdir": ""}),
-        ({"module": "go.etcd.io/etcd/pkg/v3", "version": "v3.6.4", "repo_url": "https://github.com/etcd-io/etcd", "commit": "5400cdc39b829ee5dadacb77002256cf86357da1", "subdir": "pkg"}),
         ({"module": "github.com/spf13/pflag", "version": "v1.0.7", "repo_url": "https://github.com/spf13/pflag", "commit": "f9cbdd9ca94287ab4ef0848e67ecd77cf1361d48", "subdir": ""}),
         ({"module": "github.com/jonboulle/clockwork", "version": "v0.5.0", "repo_url": "https://github.com/jonboulle/clockwork", "commit": "6d8d032a18422c2e3ef651170a8a55012d1f704c", "subdir": ""}),
-        ({"module": "go.etcd.io/etcd/server/v3", "version": "v3.6.4", "repo_url": "https://github.com/etcd-io/etcd", "commit": "5400cdc39b829ee5dadacb77002256cf86357da1", "subdir": "server"}),
         ({"module": "go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc", "version": "v0.60.0", "repo_url": "https://github.com/open-telemetry/opentelemetry-go-contrib", "commit": "bc53d2b4eb4de79471bc54f64a5c3dcefa8720d7", "subdir": "instrumentation/google.golang.org/grpc/otelgrpc"}),
         ({"module": "github.com/golang-jwt/jwt/v5", "version": "v5.2.2", "repo_url": "https://github.com/golang-jwt/jwt", "commit": "0951d184286dece21f73c85673fd308786ffe9c3", "subdir": ""}),
         ({"module": "go.etcd.io/raft/v3", "version": "v3.6.0", "repo_url": "https://github.com/etcd-io/raft", "commit": "f35a02212416d045c574e30aa59d4b07c4b8d732", "subdir": ""}),
@@ -296,13 +395,10 @@ python do_create_module_cache() {
         ({"module": "github.com/docker/cli", "version": "v28.3.2+incompatible", "repo_url": "https://github.com/docker/cli", "commit": "578ccf607d24abc5270e9a4cbd5ba9b5355b042f", "subdir": ""}),
         ({"module": "github.com/docker/docker-credential-helpers", "version": "v0.7.0", "repo_url": "https://github.com/docker/docker-credential-helpers", "commit": "ac5992b5f4756fc0398a7d0c93c609e624368bde", "subdir": ""}),
         ({"module": "github.com/mitchellh/go-homedir", "version": "v1.1.0", "repo_url": "https://github.com/mitchellh/go-homedir.git", "commit": "af06845cf3004701891bf4fdb884bfe4920b3727", "subdir": ""}),
-        ({"module": "github.com/docker/distribution", "version": "v2.8.3+incompatible", "repo_url": "https://github.com/docker/distribution", "commit": "4772604ae973031ab32dd9805a4bccf61d94909f", "subdir": ""}),
         ({"module": "github.com/rancher/wharfie", "version": "v0.7.0", "repo_url": "https://github.com/rancher/wharfie", "commit": "532348fc570e63bb96d25d33f48f18d2b48ec8bd", "subdir": ""}),
-        ({"module": "k8s.io/apiserver", "version": "v0.34.1", "repo_url": "https://github.com/kubernetes/apiserver", "commit": "20f57a0bb01cd42f50c93489604e05c6f80693d4", "subdir": ""}),
         ({"module": "github.com/containerd/cgroups/v3", "version": "v3.0.5", "repo_url": "https://github.com/containerd/cgroups", "commit": "bce3c7e5fbf05852294998684293918fcb3f59dd", "subdir": ""}),
         ({"module": "github.com/godbus/dbus/v5", "version": "v5.1.0", "repo_url": "https://github.com/godbus/dbus.git", "commit": "e523abc905595cf17fb0001a7d77eaaddfaa216d", "subdir": ""}),
         ({"module": "github.com/docker/go-units", "version": "v0.5.0", "repo_url": "https://github.com/docker/go-units", "commit": "e682442797b36348f8e1f98defdbf32bac0b6c6f", "subdir": ""}),
-        ({"module": "github.com/cilium/ebpf", "version": "v0.17.3", "repo_url": "https://github.com/cilium/ebpf", "commit": "159dff1788cbfd31fcf301c9abaca55336596174", "subdir": ""}),
         ({"module": "golang.org/x/exp", "version": "v0.0.0-20250717185816-542afb5b7346", "repo_url": "https://go.googlesource.com/exp", "commit": "542afb5b7346d69c3c878cfdd23a583e8524294d", "subdir": ""}),
         ({"module": "github.com/ipfs/go-datastore", "version": "v0.8.2", "repo_url": "https://github.com/ipfs/go-datastore", "commit": "d16c26966647697a53ec76d918ec9bb41e32a754", "subdir": ""}),
         ({"module": "github.com/syndtr/goleveldb", "version": "v1.0.0", "repo_url": "https://github.com/syndtr/goleveldb.git", "commit": "9d007e481048296f09f59bd19bb7ae584563cd95", "subdir": ""}),
@@ -319,7 +415,6 @@ python do_create_module_cache() {
         ({"module": "github.com/urfave/cli/v2", "version": "v2.27.7", "repo_url": "https://github.com/urfave/cli", "commit": "19b951ab78929023a9a670722b26ffb1d67c733a", "subdir": ""}),
         ({"module": "github.com/rancher/dynamiclistener", "version": "v0.7.0", "repo_url": "https://github.com/rancher/dynamiclistener", "commit": "242c2af2db15d1c29283f31efcfff4ae9d5fa0da", "subdir": ""}),
         ({"module": "github.com/blang/semver/v4", "version": "v4.0.0", "repo_url": "https://github.com/blang/semver.git", "commit": "af3461a9cbcf1f3f5889d21b83f5ef63880c33a8", "subdir": "v4"}),
-        ({"module": "k8s.io/component-base", "version": "v0.34.1", "repo_url": "https://github.com/kubernetes/component-base", "commit": "d09ed2f305dc16ba9e6058d0f3baa7d6df60984f", "subdir": ""}),
         ({"module": "sigs.k8s.io/apiserver-network-proxy/konnectivity-client", "version": "v0.33.0", "repo_url": "https://github.com/kubernetes-sigs/apiserver-network-proxy", "commit": "37140650c57cbe11fad4f01ce6ee095dc74788ef", "subdir": "konnectivity-client"}),
         ({"module": "cel.dev/expr", "version": "v0.24.0", "repo_url": "https://github.com/google/cel-spec", "commit": "9f069b3ee58b02d6f6736c5ebd6587075c1a1b22", "subdir": ""}),
         ({"module": "github.com/google/cel-go", "version": "v0.26.1", "repo_url": "https://github.com/google/cel-go", "commit": "8e7beb65e9a70f501fd743c3b70b2a0a2fadac52", "subdir": ""}),
@@ -396,8 +491,6 @@ python do_create_module_cache() {
         ({"module": "github.com/marten-seemann/tcp", "version": "v0.0.0-20210406111302-dfbc87cc63fd", "repo_url": "https://github.com/marten-seemann/tcp.git", "commit": "dfbc87cc63fd003b9a070c76d605769fa3e2e3b2", "subdir": ""}),
         ({"module": "github.com/mikioh/tcpinfo", "version": "v0.0.0-20190314235526-30a79bb1804b", "repo_url": "https://github.com/mikioh/tcpinfo.git", "commit": "30a79bb1804bc47fa7fe29928c9109f368792a9e", "subdir": ""}),
         ({"module": "github.com/hashicorp/golang-lru/v2", "version": "v2.0.7", "repo_url": "https://github.com/hashicorp/golang-lru", "commit": "d8515860cebc7b25ff2d29fada3f10a43611c28b", "subdir": ""}),
-        ({"module": "github.com/hashicorp/golang-lru/arc/v2", "version": "v2.0.7", "repo_url": "https://github.com/hashicorp/golang-lru", "commit": "d8515860cebc7b25ff2d29fada3f10a43611c28b", "subdir": "arc"}),
-        ({"module": "github.com/spegel-org/spegel", "version": "v1.0.18", "repo_url": "https://github.com/spegel-org/spegel.git", "commit": "81fd24777ed670c08fcc989c487dcd3d02ddb1ee", "subdir": ""}),
         ({"module": "github.com/spf13/afero", "version": "v1.14.0", "repo_url": "https://github.com/spf13/afero", "commit": "ea38482beffb2485aed022e0c1ed3b4b561f67b6", "subdir": ""}),
         ({"module": "github.com/ipfs/go-log", "version": "v1.0.5", "repo_url": "https://github.com/ipfs/go-log.git", "commit": "c39ee80c0915c5cca41dc1311e848c2fd7fa4101", "subdir": ""}),
         ({"module": "github.com/opentracing/opentracing-go", "version": "v1.2.0", "repo_url": "https://github.com/opentracing/opentracing-go.git", "commit": "d34af3eaa63c4d08ab54863a4bdd0daa45212e12", "subdir": ""}),
@@ -413,15 +506,9 @@ python do_create_module_cache() {
         ({"module": "github.com/whyrusleeping/go-keyspace", "version": "v0.0.0-20160322163242-5b898ac5add1", "repo_url": "https://github.com/whyrusleeping/go-keyspace.git", "commit": "5b898ac5add1da7178a4a98e69cb7b9205c085ee", "subdir": ""}),
         ({"module": "github.com/libp2p/go-libp2p-routing-helpers", "version": "v0.7.5", "repo_url": "https://github.com/libp2p/go-libp2p-routing-helpers", "commit": "ad93cfa49d5eceda7ee273c220ac61baa70eb925", "subdir": ""}),
         ({"module": "gonum.org/v1/gonum", "version": "v0.15.1", "repo_url": "https://github.com/gonum/gonum", "commit": "bdcda9a453049449163d160b98285b64ec8093a1", "subdir": ""}),
-        ({"module": "k8s.io/apiextensions-apiserver", "version": "v0.34.1", "repo_url": "https://github.com/kubernetes/apiextensions-apiserver", "commit": "bb911410281a5f899b7acb2f6ea20fd874888ee3", "subdir": ""}),
-        ({"module": "k8s.io/controller-manager", "version": "v0.34.1", "repo_url": "https://github.com/kubernetes/controller-manager", "commit": "56c0602ab4a83ddb3e08d1bbba63646d33140cae", "subdir": ""}),
-        ({"module": "k8s.io/kubernetes", "version": "v1.34.1", "repo_url": "https://github.com/kubernetes/kubernetes", "commit": "93248f9ae092f571eb870b7664c534bfc7d00f03", "subdir": ""}),
-        ({"module": "k8s.io/component-helpers", "version": "v0.34.1", "repo_url": "https://github.com/kubernetes/component-helpers", "commit": "2cc7cf5d44212a0fcb24b80b0abc529239e70354", "subdir": ""}),
-        ({"module": "k8s.io/kubelet", "version": "v0.34.1", "repo_url": "https://github.com/kubernetes/kubelet", "commit": "891f310f1aeaa29881251402a8a7b81c49957a1f", "subdir": ""}),
         ({"module": "github.com/pierrec/lz4", "version": "v2.6.0+incompatible", "repo_url": "https://github.com/pierrec/lz4.git", "commit": "0e583d326e0ec6b9c1ad223188dc709af385408e", "subdir": ""}),
         ({"module": "github.com/inetaf/tcpproxy", "version": "v0.0.0-20240214030015-3ce58045626c", "repo_url": "https://github.com/inetaf/tcpproxy", "commit": "3ce58045626c8bc343a593c90354975e61b1817a", "subdir": ""}),
         ({"module": "github.com/mwitkow/go-http-dialer", "version": "v0.0.0-20161116154839-378f744fb2b8", "repo_url": "https://github.com/mwitkow/go-http-dialer.git", "commit": "378f744fb2b81a6b96e3f40cde4f3bcab5a9cff0", "subdir": ""}),
-        ({"module": "k8s.io/cloud-provider", "version": "v0.34.1", "repo_url": "https://github.com/kubernetes/cloud-provider", "commit": "483df2b4dc3bbb607194c719e91e383f305c02c6", "subdir": ""}),
         ({"module": "github.com/vishvananda/netns", "version": "v0.0.5", "repo_url": "https://github.com/vishvananda/netns", "commit": "4c46424d73b556b3ea4bc5a7cec9e7376dcb2a73", "subdir": ""}),
         ({"module": "github.com/vishvananda/netlink", "version": "v1.3.1", "repo_url": "https://github.com/vishvananda/netlink", "commit": "17daef607c6442d47b0565343cf8a69f985a4cb7", "subdir": ""}),
         ({"module": "github.com/flannel-io/flannel", "version": "v0.27.0", "repo_url": "https://github.com/flannel-io/flannel", "commit": "cf342d377f5920c74c2cc880d0d9ea05e0a93886", "subdir": ""}),
@@ -435,11 +522,9 @@ python do_create_module_cache() {
         ({"module": "github.com/mdlayher/genetlink", "version": "v1.3.2", "repo_url": "https://github.com/mdlayher/genetlink", "commit": "7531bffe0f5e10d1ce558d35e6feb5d1d1600851", "subdir": ""}),
         ({"module": "github.com/coreos/go-iptables", "version": "v0.8.0", "repo_url": "https://github.com/coreos/go-iptables", "commit": "26e42518b22e6878bd6e479a574122c319fa923e", "subdir": ""}),
         ({"module": "github.com/joho/godotenv", "version": "v1.5.1", "repo_url": "https://github.com/joho/godotenv", "commit": "3fc4292b58a67b78e1dbb6e47b4879a6cc602ec4", "subdir": ""}),
-        ({"module": "github.com/cloudnativelabs/kube-router/v2", "version": "v2.0.0-00010101000000-000000000000", "repo_url": "https://github.com/cloudnativelabs/kube-router.git", "commit": "6c44013bc5447484059547bb3698d168bd6c0892", "subdir": ""}),
         ({"module": "github.com/hashicorp/go-version", "version": "v1.7.0", "repo_url": "https://github.com/hashicorp/go-version", "commit": "fcaa53267960208632e9308c93aa89535526a018", "subdir": ""}),
         ({"module": "github.com/stretchr/objx", "version": "v0.5.2", "repo_url": "https://github.com/stretchr/objx", "commit": "307d0db21292676ac9d469826525c3630f47f63a", "subdir": ""}),
         ({"module": "github.com/stretchr/testify", "version": "v1.11.1", "repo_url": "https://github.com/stretchr/testify", "commit": "2a57335dc9cd6833daa820bc94d9b40c26a7917d", "subdir": ""}),
-        ({"module": "github.com/Mirantis/cri-dockerd", "version": "v0.0.0-00010101000000-000000000000", "repo_url": "https://github.com/Mirantis/cri-dockerd.git", "commit": "2885e1ed842ca4bfd93896abfa5b460a11048935", "subdir": ""}),
         ({"module": "github.com/docker/go-connections", "version": "v0.6.0", "repo_url": "https://github.com/docker/go-connections", "commit": "42faf792bde28c414a060127d6351769408a675f", "subdir": ""}),
         ({"module": "github.com/moby/term", "version": "v0.5.2", "repo_url": "https://github.com/moby/term", "commit": "6c1b69fecbac2753dcaf18718a7e9f9093c3760d", "subdir": ""}),
         ({"module": "github.com/morikuni/aec", "version": "v1.0.0", "repo_url": "https://github.com/morikuni/aec.git", "commit": "39771216ff4c63d11f5e604076f9c45e8be1067b", "subdir": ""}),
@@ -451,25 +536,20 @@ python do_create_module_cache() {
         ({"module": "github.com/mxk/go-flowrate", "version": "v0.0.0-20140419014527-cca7078d478f", "repo_url": "https://github.com/mxk/go-flowrate.git", "commit": "cca7078d478f8520f85629ad7c68962d31ed7682", "subdir": ""}),
         ({"module": "github.com/armon/circbuf", "version": "v0.0.0-20190214190532-5111143e8da2", "repo_url": "https://github.com/armon/circbuf.git", "commit": "5111143e8da2e98b4ea6a8f32b9065ea1821c191", "subdir": ""}),
         ({"module": "github.com/blang/semver", "version": "v3.5.1+incompatible", "repo_url": "https://github.com/blang/semver.git", "commit": "2ee87856327ba09384cabd113bc6b5d174e9ec0f", "subdir": ""}),
-        ({"module": "k8s.io/kube-aggregator", "version": "v0.34.1", "repo_url": "https://github.com/kubernetes/kube-aggregator", "commit": "5ef74b424a3bee59abeae07e1bdb85d1087cc0d2", "subdir": ""}),
         ({"module": "github.com/pquerna/cachecontrol", "version": "v0.1.0", "repo_url": "https://github.com/pquerna/cachecontrol.git", "commit": "fb00f8a766ae43bf209f50299ce7d69669416dfb", "subdir": ""}),
         ({"module": "gopkg.in/go-jose/go-jose.v2", "version": "v2.6.3", "repo_url": "https://gopkg.in/go-jose/go-jose.v2", "commit": "0dd4dd541c665fb292d664f77604ba694726f298", "subdir": ""}),
         ({"module": "github.com/coreos/go-oidc", "version": "v2.3.0+incompatible", "repo_url": "https://github.com/coreos/go-oidc", "commit": "b7e896c40598f5307b3b5a163b6ad02ae97ec1a5", "subdir": ""}),
         ({"module": "golang.org/x/tools", "version": "v0.36.0", "repo_url": "https://go.googlesource.com/tools", "commit": "44d18e11572cd133e1eec6811ba57d78ff20addf", "subdir": ""}),
-        ({"module": "k8s.io/mount-utils", "version": "v0.32.4", "repo_url": "https://github.com/kubernetes/mount-utils", "commit": "3ea5b6a0474bbe29b4ffc094248f3a63b8d392e3", "subdir": ""}),
         ({"module": "github.com/robfig/cron/v3", "version": "v3.0.1", "repo_url": "https://github.com/robfig/cron.git", "commit": "ccba498c397bb90a9c84945bbb0f7af2d72b6309", "subdir": ""}),
-        ({"module": "github.com/google/cadvisor", "version": "v0.53.0", "repo_url": "https://github.com/google/cadvisor", "commit": "85d18c6139a3f1fd48120c49ae44eac5aa352d86", "subdir": ""}),
         ({"module": "github.com/mistifyio/go-zfs", "version": "v2.1.2-0.20190413222219-f784269be439+incompatible", "repo_url": "https://github.com/mistifyio/go-zfs.git", "commit": "2a28eb653910a6c48842cf517b098451a8b94ee7", "subdir": ""}),
         ({"module": "github.com/karrick/godirwalk", "version": "v1.17.0", "repo_url": "https://github.com/karrick/godirwalk.git", "commit": "9a7752c108e7ea76255201b9f47bd4d4d2df868e", "subdir": ""}),
         ({"module": "github.com/euank/go-kmsg-parser", "version": "v2.0.0+incompatible", "repo_url": "https://github.com/euank/go-kmsg-parser.git", "commit": "5ba4d492e455a77d25dcf0d2c4acc9f2afebef4e", "subdir": ""}),
-        ({"module": "k8s.io/kubectl", "version": "v0.34.1", "repo_url": "https://github.com/kubernetes/kubectl", "commit": "b2cb112e103aff2bb7d5e300d56105cd63fddb21", "subdir": ""}),
         ({"module": "github.com/container-storage-interface/spec", "version": "v1.9.0", "repo_url": "https://github.com/container-storage-interface/spec", "commit": "80d53107c70981b9da8aaf9cd1c90249562b22f0", "subdir": ""}),
         ({"module": "github.com/mohae/deepcopy", "version": "v0.0.0-20170929034955-c48cc78d4826", "repo_url": "https://github.com/mohae/deepcopy.git", "commit": "c48cc78d482608239f6c4c92a4abd87eb8761c90", "subdir": ""}),
         ({"module": "github.com/libopenstorage/openstorage", "version": "v1.0.0", "repo_url": "https://github.com/libopenstorage/openstorage.git", "commit": "093a0c3888753c2056e7373183693d670c6bba01", "subdir": ""}),
         ({"module": "github.com/lithammer/dedent", "version": "v1.1.0", "repo_url": "https://github.com/lithammer/dedent.git", "commit": "8478954c3bc893cf36c5ee7c822266b993a3b3ee", "subdir": ""}),
         ({"module": "github.com/moby/ipvs", "version": "v1.1.0", "repo_url": "https://github.com/moby/ipvs", "commit": "fe22ac585b3e22a969cbde61addd99ecd93ab22c", "subdir": ""}),
         ({"module": "sigs.k8s.io/knftables", "version": "v0.0.18", "repo_url": "https://github.com/kubernetes-sigs/knftables", "commit": "007fc6b3ddf2de86708d11af4d4bdaac1c68ea5f", "subdir": ""}),
-        ({"module": "go.opentelemetry.io/contrib/instrumentation/github.com/emicklei/go-restful/otelrestful", "version": "v0.44.0", "repo_url": "https://github.com/open-telemetry/opentelemetry-go-contrib", "commit": "fdfa6e3abf03caa6a1d3267913e01526d97eab8a", "subdir": "instrumentation/github.com/emicklei/go-restful/otelrestful"}),
         ({"module": "github.com/goccy/go-json", "version": "v0.10.5", "repo_url": "https://github.com/goccy/go-json", "commit": "9872089c316cfe2d0f29b331b75d45bf6d522d96", "subdir": ""}),
         ({"module": "github.com/minio/crc64nvme", "version": "v1.0.1", "repo_url": "https://github.com/minio/crc64nvme", "commit": "0a53153041b96db22da97cd5a39090ec49ff8deb", "subdir": ""}),
         ({"module": "github.com/minio/md5-simd", "version": "v1.1.2", "repo_url": "https://github.com/minio/md5-simd.git", "commit": "776275e0c9a74ceebbd50fe5c1d61b0c80c608df", "subdir": ""}),
@@ -477,7 +557,6 @@ python do_create_module_cache() {
         ({"module": "github.com/go-ini/ini", "version": "v1.67.0", "repo_url": "https://github.com/go-ini/ini", "commit": "b2f570e5b5b844226bbefe6fb521d891f529a951", "subdir": ""}),
         ({"module": "github.com/rs/xid", "version": "v1.6.0", "repo_url": "https://github.com/rs/xid", "commit": "7aed5a87c88ebb644e4e6d077f58147ac42f03b9", "subdir": ""}),
         ({"module": "github.com/otiai10/copy", "version": "v1.7.0", "repo_url": "https://github.com/otiai10/copy.git", "commit": "323db161ae97db91e6e13dbcda403fdb29c3fff8", "subdir": ""}),
-        ({"module": "go.etcd.io/etcd/etcdutl/v3", "version": "v3.6.4", "repo_url": "https://github.com/etcd-io/etcd", "commit": "5400cdc39b829ee5dadacb77002256cf86357da1", "subdir": "etcdutl"}),
         ({"module": "github.com/rancher/remotedialer", "version": "v0.5.1-0.20250827012652-e6b68fd83a6b", "repo_url": "https://github.com/rancher/remotedialer", "commit": "e6b68fd83a6b94cd706c1a7ea94487f66565641e", "subdir": ""}),
         ({"module": "github.com/yl2chen/cidranger", "version": "v1.0.2", "repo_url": "https://github.com/yl2chen/cidranger.git", "commit": "7ff5a0e84593dad6fbd50551343618d7956b3c71", "subdir": ""}),
         ({"module": "github.com/gofrs/flock", "version": "v0.8.1", "repo_url": "https://github.com/gofrs/flock.git", "commit": "6f010d1acea74a32f2f2066bfe324c08bbee30e3", "subdir": ""}),
@@ -490,7 +569,6 @@ python do_create_module_cache() {
         ({"module": "github.com/invopop/jsonschema", "version": "v0.13.0", "repo_url": "https://github.com/invopop/jsonschema", "commit": "328cc73c3399c73df18b708fa00d29669cb0e4cc", "subdir": ""}),
         ({"module": "github.com/mitchellh/go-wordwrap", "version": "v1.0.1", "repo_url": "https://github.com/mitchellh/go-wordwrap.git", "commit": "ecf0936a077a4bd73a1cc2ac5c370f2b55618d62", "subdir": ""}),
         ({"module": "github.com/liggitt/tabwriter", "version": "v0.0.0-20181228230101-89fcab3d43de", "repo_url": "https://github.com/liggitt/tabwriter.git", "commit": "89fcab3d43de07060e4fd4c1547430ed57e87f24", "subdir": ""}),
-        ({"module": "k8s.io/cli-runtime", "version": "v0.34.1", "repo_url": "https://github.com/kubernetes/cli-runtime", "commit": "d9c0bddb60ea3a08e50f594c138d521b9780ab28", "subdir": ""}),
         ({"module": "github.com/onsi/ginkgo/v2", "version": "v2.25.0", "repo_url": "https://github.com/onsi/ginkgo", "commit": "fcc0e74deeb1be682ffa7b56e6567183643798dd", "subdir": ""}),
         ({"module": "github.com/Masterminds/semver/v3", "version": "v3.3.1", "repo_url": "https://github.com/Masterminds/semver", "commit": "1558ca3488226e3490894a145e831ad58a5ff958", "subdir": ""}),
         ({"module": "github.com/onsi/gomega", "version": "v1.38.0", "repo_url": "https://github.com/onsi/gomega", "commit": "c1237df9d4dbb138d19c835940657cc5c7fbd506", "subdir": ""}),
@@ -507,7 +585,6 @@ python do_create_module_cache() {
         ({"module": "github.com/fatih/camelcase", "version": "v1.0.0", "repo_url": "https://github.com/fatih/camelcase.git", "commit": "44e46d280b43ec1531bb25252440e34f1b800b65", "subdir": ""}),
         ({"module": "sigs.k8s.io/kustomize/kustomize/v5", "version": "v5.7.1", "repo_url": "https://github.com/kubernetes-sigs/kustomize", "commit": "168971a50110fc90dfbd1327245e7aabe5c07e8f", "subdir": "kustomize"}),
         ({"module": "github.com/containerd/console", "version": "v1.0.5", "repo_url": "https://github.com/containerd/console", "commit": "c8d962180f543ac07c008ecc79a413406ea10c0b", "subdir": ""}),
-        ({"module": "github.com/Microsoft/hcsshim", "version": "v0.13.0", "repo_url": "https://github.com/Microsoft/hcsshim", "commit": "7084bd2fa445d83629a67a91ff4e072517a11f04", "subdir": ""}),
         ({"module": "github.com/containerd/go-cni", "version": "v1.1.12", "repo_url": "https://github.com/containerd/go-cni", "commit": "f4736bb1d1b10293d9c484cbf79254a5efa1e020", "subdir": ""}),
         ({"module": "github.com/opencontainers/runtime-tools", "version": "v0.9.1-0.20221107090550-2e043c6bd626", "repo_url": "https://github.com/opencontainers/runtime-tools", "commit": "2e043c6bd62639199bdd0d5f0c5082797de4de2a", "subdir": ""}),
         ({"module": "github.com/syndtr/gocapability", "version": "v0.0.0-20200815063812-42c35b437635", "repo_url": "https://github.com/syndtr/gocapability.git", "commit": "42c35b4376354fd554efc7ad35e0b7f94e3a0ffb", "subdir": ""}),
@@ -517,8 +594,1350 @@ python do_create_module_cache() {
         ({"module": "github.com/intel/goresctrl", "version": "v0.8.0", "repo_url": "https://github.com/intel/goresctrl", "commit": "f7cfa04536314eacecaa523f3b87d3978fbe28e3", "subdir": ""}),
         ({"module": "github.com/containerd/go-runc", "version": "v1.1.0", "repo_url": "https://github.com/containerd/go-runc", "commit": "df3c22d088ca919d1943efa8ae0cfc0514da0542", "subdir": ""}),
         ({"module": "github.com/mdlayher/vsock", "version": "v1.2.1", "repo_url": "https://github.com/mdlayher/vsock", "commit": "8569e301791e164b669ff36b51035bb1d7c9b3a3", "subdir": ""}),
-        ({"module": "go.uber.org/mock", "version": "v0.5.2", "repo_url": "https://github.com/uber/mock", "commit": "0b8095f698fe3b6414a8d1321e990100ba8ce5bc", "subdir": ""})
+        ({"module": "go.uber.org/mock", "version": "v0.5.2", "repo_url": "https://github.com/uber/mock", "commit": "0b8095f698fe3b6414a8d1321e990100ba8ce5bc", "subdir": ""}),
+        ({"module": "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc", "version": "v1.37.0", "repo_url": "https://github.com/open-telemetry/opentelemetry-go", "commit": "69e81088ad40f45a0764597326722dea8f3f00a8", "subdir": "exporters/otlp/otlptrace/otlptracegrpc"}),
+        ({"module": "github.com/warpfork/go-wish", "version": "v0.0.0-20220906213052-39a1cc7a02d0", "repo_url": "https://github.com/warpfork/go-wish", "commit": "39a1cc7a02d01d037bc6bc075e6550279026e645", "subdir": ""}),
+        ({"module": "github.com/tchap/go-patricia/v2", "version": "v2.3.2", "repo_url": "https://github.com/tchap/go-patricia", "commit": "583dbe1884ffba565db4259568911f9277c2f12c", "subdir": ""}),
+        ({"module": "github.com/jbenet/go-temp-err-catcher", "version": "v0.1.0", "repo_url": "https://github.com/jbenet/go-temp-err-catcher.git", "commit": "fa11adda5e7cccb838a208007c9ea79dda63c0c0", "subdir": ""}),
+        ({"module": "github.com/mdlayher/netlink", "version": "v1.7.2", "repo_url": "https://github.com/mdlayher/netlink", "commit": "657f7da1d9bd78d246ae610e0b5efc63a6a5f9e4", "subdir": ""}),
+        ({"module": "github.com/k3s-io/etcd/server/v3", "version": "v3.6.4-k3s3", "repo_url": "https://github.com/k3s-io/etcd", "commit": "182208f36cfc0932344aa6e1aca96cfd9a317841", "subdir": ""}),
+        ({"module": "sigs.k8s.io/kustomize/api", "version": "v0.20.1", "repo_url": "https://github.com/kubernetes-sigs/kustomize", "commit": "8b42cd9918f226dca98703088ba8af0b320df8a3", "subdir": "api"}),
+        ({"module": "github.com/google/btree", "version": "v1.1.3", "repo_url": "https://github.com/google/btree", "commit": "aeba20f7a1e1315badec4eca4fdc9f754f5f880a", "subdir": ""}),
+        ({"module": "github.com/mikioh/tcpopt", "version": "v0.0.0-20190314235656-172688c1accc", "repo_url": "https://github.com/mikioh/tcpopt.git", "commit": "172688c1accceb1c8699343c22838f55e4b662ca", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/metrics", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/metrics"}),
+        ({"module": "github.com/containerd/zfs/v2", "version": "v2.0.0-rc.0", "repo_url": "https://github.com/containerd/zfs", "commit": "ac25940eac8d55a66eb07b5444da0bd98ab03f2b", "subdir": ""}),
+        ({"module": "github.com/vbatts/tar-split", "version": "v0.12.1", "repo_url": "https://github.com/vbatts/tar-split", "commit": "ced2b07a57dc67e1f3d620ec6a0daad5109aba63", "subdir": ""}),
+        ({"module": "github.com/moby/ipvs", "version": "v1.1.0", "repo_url": "https://github.com/moby/ipvs", "commit": "fe22ac585b3e22a969cbde61addd99ecd93ab22c", "subdir": ""}),
+        ({"module": "github.com/huin/goupnp", "version": "v1.3.0", "repo_url": "https://github.com/huin/goupnp", "commit": "00783e79ec6092ce7c16ab10ef62e92e75e89939", "subdir": ""}),
+        ({"module": "github.com/josharian/intern", "version": "v1.0.0", "repo_url": "https://github.com/josharian/intern.git", "commit": "8e6ff32b3e7c0b018c43953085fe2ac330fe9acd", "subdir": ""}),
+        ({"module": "github.com/opencontainers/cgroups", "version": "v0.0.4", "repo_url": "https://github.com/opencontainers/cgroups", "commit": "a3e2ecd1f756a19cee15f85b96337a59c3b5337b", "subdir": ""}),
+        ({"module": "github.com/ghodss/yaml", "version": "v1.0.0", "repo_url": "https://github.com/ghodss/yaml.git", "commit": "0ca9ea5df5451ffdf184b4428c902747c2c11cd7", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/apiserver", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/apiserver"}),
+        ({"module": "sigs.k8s.io/kustomize/kustomize/v5", "version": "v5.7.1", "repo_url": "https://github.com/kubernetes-sigs/kustomize", "commit": "168971a50110fc90dfbd1327245e7aabe5c07e8f", "subdir": "kustomize"}),
+        ({"module": "github.com/containerd/cgroups/v3", "version": "v3.0.5", "repo_url": "https://github.com/containerd/cgroups", "commit": "bce3c7e5fbf05852294998684293918fcb3f59dd", "subdir": ""}),
+        ({"module": "github.com/docker/docker", "version": "v25.0.8+incompatible", "repo_url": "https://github.com/docker/docker", "commit": "71907ca48ef98bc6640795e50dcf257d683af53b", "subdir": ""}),
+        ({"module": "github.com/flannel-io/flannel", "version": "v0.27.0", "repo_url": "https://github.com/flannel-io/flannel", "commit": "cf342d377f5920c74c2cc880d0d9ea05e0a93886", "subdir": ""}),
+        ({"module": "github.com/multiformats/go-multicodec", "version": "v0.9.0", "repo_url": "https://github.com/multiformats/go-multicodec", "commit": "b8b4bf5270f9f220f00bcdeddf1641b13e67cc0b", "subdir": ""}),
+        ({"module": "github.com/blang/semver/v4", "version": "v4.0.0", "repo_url": "https://github.com/blang/semver.git", "commit": "af3461a9cbcf1f3f5889d21b83f5ef63880c33a8", "subdir": "v4"}),
+        ({"module": "github.com/google/cel-go", "version": "v0.26.1", "repo_url": "https://github.com/google/cel-go", "commit": "8e7beb65e9a70f501fd743c3b70b2a0a2fadac52", "subdir": ""}),
+        ({"module": "github.com/pion/transport/v2", "version": "v2.2.10", "repo_url": "https://github.com/pion/transport", "commit": "3f96630bb3c0d950695c97b4ba91cf5f8bfee87f", "subdir": ""}),
+        ({"module": "github.com/onsi/ginkgo/v2", "version": "v2.25.0", "repo_url": "https://github.com/onsi/ginkgo", "commit": "fcc0e74deeb1be682ffa7b56e6567183643798dd", "subdir": ""}),
+        ({"module": "github.com/containerd/cgroups", "version": "v1.1.0", "repo_url": "https://github.com/containerd/cgroups", "commit": "fe7323f622bc222e72473679f12a9089aeeda177", "subdir": ""}),
+        ({"module": "github.com/prometheus/client_golang", "version": "v1.22.0", "repo_url": "https://github.com/prometheus/client_golang", "commit": "d50be25511d790f4c166d68ce7d046c2977d148b", "subdir": ""}),
+        ({"module": "github.com/pkg/errors", "version": "v0.9.1", "repo_url": "https://github.com/pkg/errors.git", "commit": "614d223910a179a466c1767a985424175c39b465", "subdir": ""}),
+        ({"module": "github.com/xeipuuv/gojsonschema", "version": "v1.2.0", "repo_url": "https://github.com/xeipuuv/gojsonschema.git", "commit": "82fcdeb203eb6ab2a67d0a623d9c19e5e5a64927", "subdir": ""}),
+        ({"module": "github.com/containerd/fifo", "version": "v1.1.0", "repo_url": "https://github.com/containerd/fifo", "commit": "151b205263c29d471e0d55c787d2ce9f5343fd46", "subdir": ""}),
+        ({"module": "github.com/go-ini/ini", "version": "v1.67.0", "repo_url": "https://github.com/go-ini/ini", "commit": "b2f570e5b5b844226bbefe6fb521d891f529a951", "subdir": ""}),
+        ({"module": "go.opentelemetry.io/proto/otlp", "version": "v1.7.0", "repo_url": "https://github.com/open-telemetry/opentelemetry-proto-go", "commit": "8e4e66c4c1fa47ca51f444db26dd23f5eafd3d45", "subdir": "otlp"}),
+        ({"module": "github.com/go-openapi/swag/fileutils", "version": "v0.24.0", "repo_url": "https://github.com/go-openapi/swag", "commit": "04b65d3aff180750a2ad252c8b3da549a1c02dfa", "subdir": "fileutils"}),
+        ({"module": "go.etcd.io/bbolt", "version": "v1.4.2", "repo_url": "https://github.com/etcd-io/bbolt", "commit": "dca4b1df8e6a770203c4c44117635c0c84140e24", "subdir": ""}),
+        ({"module": "github.com/Microsoft/go-winio", "version": "v0.6.2", "repo_url": "https://github.com/Microsoft/go-winio", "commit": "3c9576c9346a1892dee136329e7e15309e82fb4f", "subdir": ""}),
+        ({"module": "go.opentelemetry.io/otel/sdk/metric", "version": "v1.35.0", "repo_url": "https://github.com/open-telemetry/opentelemetry-go", "commit": "5ba5e7a449f36c1c02710bbaa517263797046db0", "subdir": "sdk/metric"}),
+        ({"module": "github.com/monochromegane/go-gitignore", "version": "v0.0.0-20200626010858-205db1a8cc00", "repo_url": "https://github.com/monochromegane/go-gitignore.git", "commit": "205db1a8cc001de79230472da52edde4974df734", "subdir": ""}),
+        ({"module": "github.com/xeipuuv/gojsonpointer", "version": "v0.0.0-20190905194746-02993c407bfb", "repo_url": "https://github.com/xeipuuv/gojsonpointer.git", "commit": "02993c407bfbf5f6dae44c4f4b1cf6a39b5fc5bb", "subdir": ""}),
+        ({"module": "github.com/containernetworking/plugins", "version": "v1.7.1", "repo_url": "https://github.com/containernetworking/plugins", "commit": "a5d507e2b884d8bd6a001c9e5a9118113ffef444", "subdir": ""}),
+        ({"module": "github.com/libp2p/go-libp2p-routing-helpers", "version": "v0.7.5", "repo_url": "https://github.com/libp2p/go-libp2p-routing-helpers", "commit": "ad93cfa49d5eceda7ee273c220ac61baa70eb925", "subdir": ""}),
+        ({"module": "github.com/go-openapi/swag/jsonname", "version": "v0.24.0", "repo_url": "https://github.com/go-openapi/swag", "commit": "04b65d3aff180750a2ad252c8b3da549a1c02dfa", "subdir": "jsonname"}),
+        ({"module": "github.com/containerd/log", "version": "v0.1.0", "repo_url": "https://github.com/containerd/log", "commit": "0fc1e28871fdf2786e2cc51bbe4133db6547a199", "subdir": ""}),
+        ({"module": "github.com/google/go-cmp", "version": "v0.7.0", "repo_url": "https://github.com/google/go-cmp", "commit": "9b12f366a942ebc7254abc7f32ca05068b455fb7", "subdir": ""}),
+        ({"module": "github.com/docker/go-events", "version": "v0.0.0-20190806004212-e31b211e4f1c", "repo_url": "https://github.com/docker/go-events.git", "commit": "e31b211e4f1cd09aa76fe4ac244571fab96ae47f", "subdir": ""}),
+        ({"module": "github.com/armon/go-socks5", "version": "v0.0.0-20160902184237-e75332964ef5", "repo_url": "https://github.com/armon/go-socks5.git", "commit": "e75332964ef517daa070d7c38a9466a0d687e0a5", "subdir": ""}),
+        ({"module": "github.com/pion/stun", "version": "v0.6.1", "repo_url": "https://github.com/pion/stun", "commit": "e56f1f82cd67337fd13713c396d4e942d10c5c36", "subdir": ""}),
+        ({"module": "golang.org/x/text", "version": "v0.28.0", "repo_url": "https://go.googlesource.com/text", "commit": "425d715b4a85c7698cedf621412bb53794cbda53", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/csi-translation-lib", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/csi-translation-lib"}),
+        ({"module": "go.opentelemetry.io/otel/trace", "version": "v1.37.0", "repo_url": "https://github.com/open-telemetry/opentelemetry-go", "commit": "69e81088ad40f45a0764597326722dea8f3f00a8", "subdir": "trace"}),
+        ({"module": "github.com/mattn/go-sqlite3", "version": "v1.14.32", "repo_url": "https://github.com/mattn/go-sqlite3", "commit": "8bf7a8a844faf952aa0245b4c0ad0a47e84f4efd", "subdir": ""}),
+        ({"module": "github.com/BurntSushi/toml", "version": "v1.5.0", "repo_url": "https://github.com/BurntSushi/toml", "commit": "d97def528e83313822a9f98946334ffccd542bdf", "subdir": ""}),
+        ({"module": "github.com/containerd/containerd/api", "version": "v1.9.0", "repo_url": "https://github.com/containerd/containerd", "commit": "9033738f0870139e925d1afe05774a0387ebbabd", "subdir": "api"}),
+        ({"module": "github.com/wk8/go-ordered-map/v2", "version": "v2.1.8", "repo_url": "https://github.com/wk8/go-ordered-map", "commit": "85ca4a2b29d3241fa4513f82be3d38fe2392a791", "subdir": ""}),
+        ({"module": "github.com/containernetworking/cni", "version": "v1.3.0", "repo_url": "https://github.com/containernetworking/cni", "commit": "a28faab92684aed3af64d5085733c34550ce9877", "subdir": ""}),
+        ({"module": "github.com/grpc-ecosystem/grpc-gateway/v2", "version": "v2.27.2", "repo_url": "https://github.com/grpc-ecosystem/grpc-gateway", "commit": "91958df0371da5c71794adc92e21cf8fed58df97", "subdir": ""}),
+        ({"module": "github.com/rancher/remotedialer", "version": "v0.5.1-0.20250827012652-e6b68fd83a6b", "repo_url": "https://github.com/rancher/remotedialer", "commit": "e6b68fd83a6b94cd706c1a7ea94487f66565641e", "subdir": ""}),
+        ({"module": "github.com/mistifyio/go-zfs", "version": "v2.1.2-0.20190413222219-f784269be439+incompatible", "repo_url": "https://github.com/mistifyio/go-zfs.git", "commit": "2a28eb653910a6c48842cf517b098451a8b94ee7", "subdir": ""}),
+        ({"module": "go.uber.org/fx", "version": "v1.23.0", "repo_url": "https://github.com/uber-go/fx", "commit": "699948c47a7363a93381319c66b17159642febb9", "subdir": ""}),
+        ({"module": "github.com/multiformats/go-multihash", "version": "v0.2.3", "repo_url": "https://github.com/multiformats/go-multihash", "commit": "ff9da31500dddfc675e996601a05cdfc3ce7c764", "subdir": ""}),
+        ({"module": "github.com/yl2chen/cidranger", "version": "v1.0.2", "repo_url": "https://github.com/yl2chen/cidranger.git", "commit": "7ff5a0e84593dad6fbd50551343618d7956b3c71", "subdir": ""}),
+        ({"module": "github.com/ipfs/go-datastore", "version": "v0.8.2", "repo_url": "https://github.com/ipfs/go-datastore", "commit": "d16c26966647697a53ec76d918ec9bb41e32a754", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/pod-security-admission", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/pod-security-admission"}),
+        ({"module": "github.com/quic-go/webtransport-go", "version": "v0.8.1-0.20241018022711-4ac2c9250e66", "repo_url": "https://github.com/quic-go/webtransport-go", "commit": "4ac2c9250e66042470c55c7e9f431269c7dbd3ed", "subdir": ""}),
+        ({"module": "github.com/nats-io/jwt/v2", "version": "v2.7.4", "repo_url": "https://github.com/nats-io/jwt", "commit": "28e31bd445aeebe6a0bb93902baf91e43036c22c", "subdir": "v2"}),
+        ({"module": "sigs.k8s.io/yaml", "version": "v1.6.0", "repo_url": "https://github.com/kubernetes-sigs/yaml", "commit": "048d724aca2d37ddb5b03c90b5b4550a3a48766d", "subdir": ""}),
+        ({"module": "github.com/mikioh/tcpinfo", "version": "v0.0.0-20190314235526-30a79bb1804b", "repo_url": "https://github.com/mikioh/tcpinfo.git", "commit": "30a79bb1804bc47fa7fe29928c9109f368792a9e", "subdir": ""}),
+        ({"module": "github.com/libopenstorage/openstorage", "version": "v1.0.0", "repo_url": "https://github.com/libopenstorage/openstorage.git", "commit": "093a0c3888753c2056e7373183693d670c6bba01", "subdir": ""}),
+        ({"module": "sigs.k8s.io/apiserver-network-proxy/konnectivity-client", "version": "v0.33.0", "repo_url": "https://github.com/kubernetes-sigs/apiserver-network-proxy", "commit": "37140650c57cbe11fad4f01ce6ee095dc74788ef", "subdir": "konnectivity-client"}),
+        ({"module": "github.com/jbenet/goprocess", "version": "v0.1.4", "repo_url": "https://github.com/jbenet/goprocess.git", "commit": "23d20c20149e1f362afda26f4500cb9d6393f0ad", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/cli-runtime", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/cli-runtime"}),
+        ({"module": "github.com/libp2p/go-reuseport", "version": "v0.4.0", "repo_url": "https://github.com/libp2p/go-reuseport", "commit": "ac34b4fb35437abcc176b5bb97cc431d62d983e0", "subdir": ""}),
+        ({"module": "dario.cat/mergo", "version": "v1.0.1", "repo_url": "https://github.com/imdario/mergo", "commit": "59ea6a9cd9f9c60cb6b1c58476f76cd3172ccebf", "subdir": ""}),
+        ({"module": "github.com/felixge/httpsnoop", "version": "v1.0.4", "repo_url": "https://github.com/felixge/httpsnoop", "commit": "c5817c27ec125409c069052fdd171023c353501c", "subdir": ""}),
+        ({"module": "github.com/go-jose/go-jose/v4", "version": "v4.0.5", "repo_url": "https://github.com/go-jose/go-jose", "commit": "99b346cec4e86d102284642c5dcbe9bb0cacfc22", "subdir": ""}),
+        ({"module": "github.com/josharian/native", "version": "v1.1.0", "repo_url": "https://github.com/josharian/native", "commit": "c1e37c09b531b14ae12a501eb6fd529b31cecdaa", "subdir": ""}),
+        ({"module": "github.com/fatih/color", "version": "v1.16.0", "repo_url": "https://github.com/fatih/color", "commit": "0f9779ed479afd460f0c2cc5a3d3eb69b9ba188b", "subdir": ""}),
+        ({"module": "github.com/mdlayher/vsock", "version": "v1.2.1", "repo_url": "https://github.com/mdlayher/vsock", "commit": "8569e301791e164b669ff36b51035bb1d7c9b3a3", "subdir": ""}),
+        ({"module": "sigs.k8s.io/kustomize/kyaml", "version": "v0.20.1", "repo_url": "https://github.com/kubernetes-sigs/kustomize", "commit": "87f462af25615bb5b83f9010aa6d4b46946bf0d6", "subdir": "kyaml"}),
+        ({"module": "github.com/hanwen/go-fuse/v2", "version": "v2.8.0", "repo_url": "https://github.com/hanwen/go-fuse", "commit": "ee34567408d6ab557a0169089879ec111bd74408", "subdir": ""}),
+        ({"module": "github.com/xeipuuv/gojsonreference", "version": "v0.0.0-20180127040603-bd5ef7bd5415", "repo_url": "https://github.com/xeipuuv/gojsonreference.git", "commit": "bd5ef7bd5415a7ac448318e64f11a24cd21e594b", "subdir": ""}),
+        ({"module": "github.com/MakeNowJust/heredoc", "version": "v1.0.0", "repo_url": "https://github.com/MakeNowJust/heredoc.git", "commit": "bbd9af33722b79a933ef99c7c94833065e2d6c20", "subdir": ""}),
+        ({"module": "github.com/russross/blackfriday/v2", "version": "v2.1.0", "repo_url": "https://github.com/russross/blackfriday.git", "commit": "4c9bf9512682b995722660a4196c0013228e2049", "subdir": ""}),
+        ({"module": "github.com/checkpoint-restore/checkpointctl", "version": "v1.3.0", "repo_url": "https://github.com/checkpoint-restore/checkpointctl", "commit": "9a448d52c31a1d571b774d3cf812a5e93f2f747b", "subdir": ""}),
+        ({"module": "gopkg.in/natefinch/lumberjack.v2", "version": "v2.2.1", "repo_url": "https://gopkg.in/natefinch/lumberjack.v2", "commit": "4cb27fcfbb0f35cb48c542c5ea80b7c1d18933d0", "subdir": ""}),
+        ({"module": "github.com/mdlayher/socket", "version": "v0.5.1", "repo_url": "https://github.com/mdlayher/socket", "commit": "9c51a391be6c6bc5b7ce52f328497931c5e97733", "subdir": ""}),
+        ({"module": "github.com/exponent-io/jsonpath", "version": "v0.0.0-20210407135951-1de76d718b3f", "repo_url": "https://github.com/exponent-io/jsonpath.git", "commit": "1de76d718b3f2694498041a6e578675bf52cee06", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/externaljwt", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/externaljwt"}),
+        ({"module": "github.com/ipfs/go-log/v2", "version": "v2.5.1", "repo_url": "https://github.com/ipfs/go-log.git", "commit": "8625e3ec81bdeb96627de192e6fe21eab5896603", "subdir": ""}),
+        ({"module": "github.com/ipfs/boxo", "version": "v0.29.1", "repo_url": "https://github.com/ipfs/boxo", "commit": "d11922eef338d1d71f5c9793e33fe99a95b0a5c5", "subdir": ""}),
+        ({"module": "sigs.k8s.io/structured-merge-diff/v6", "version": "v6.3.0", "repo_url": "https://github.com/kubernetes-sigs/structured-merge-diff", "commit": "d3e4dc6f630e155d2fbfdac465eb0da8a737245f", "subdir": ""}),
+        ({"module": "github.com/fatih/camelcase", "version": "v1.0.0", "repo_url": "https://github.com/fatih/camelcase.git", "commit": "44e46d280b43ec1531bb25252440e34f1b800b65", "subdir": ""}),
+        ({"module": "github.com/go-test/deep", "version": "v1.0.7", "repo_url": "https://github.com/go-test/deep.git", "commit": "c733f5ed5136b7437e29ac91bb97c653af3694b5", "subdir": ""}),
+        ({"module": "github.com/nats-io/nkeys", "version": "v0.4.11", "repo_url": "https://github.com/nats-io/nkeys", "commit": "cf5e93d3187a266d33f60aa95de13bb216db0469", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kube-router/v2", "version": "v2.5.0", "repo_url": "https://github.com/k3s-io/kube-router", "commit": "70545914453cec949ba7e0ab1f84d07f2e080073", "subdir": ""}),
+        ({"module": "github.com/pierrec/lz4", "version": "v2.6.0+incompatible", "repo_url": "https://github.com/pierrec/lz4.git", "commit": "0e583d326e0ec6b9c1ad223188dc709af385408e", "subdir": ""}),
+        ({"module": "github.com/minio/md5-simd", "version": "v1.1.2", "repo_url": "https://github.com/minio/md5-simd.git", "commit": "776275e0c9a74ceebbd50fe5c1d61b0c80c608df", "subdir": ""}),
+        ({"module": "github.com/pion/stun/v3", "version": "v3.0.0", "repo_url": "https://github.com/pion/stun", "commit": "fd9b93c8104f1bdaae3d8e45de6962aaf45c3f5e", "subdir": ""}),
+        ({"module": "github.com/davecgh/go-spew", "version": "v1.1.2-0.20180830191138-d8f796af33cc", "repo_url": "https://github.com/davecgh/go-spew.git", "commit": "d8f796af33cc11cb798c1aaeb27a4ebc5099927d", "subdir": ""}),
+        ({"module": "github.com/hashicorp/go-retryablehttp", "version": "v0.7.8", "repo_url": "https://github.com/hashicorp/go-retryablehttp", "commit": "e1f5485fe84728709b857cb89e17088894c301d6", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/kube-scheduler", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/kube-scheduler"}),
+        ({"module": "github.com/containerd/go-cni", "version": "v1.1.12", "repo_url": "https://github.com/containerd/go-cni", "commit": "f4736bb1d1b10293d9c484cbf79254a5efa1e020", "subdir": ""}),
+        ({"module": "github.com/hashicorp/golang-lru", "version": "v1.0.2", "repo_url": "https://github.com/hashicorp/golang-lru", "commit": "a032ef5a154020ffc7a74ba73702f9c5d3ea11f2", "subdir": ""}),
+        ({"module": "github.com/mwitkow/go-http-dialer", "version": "v0.0.0-20161116154839-378f744fb2b8", "repo_url": "https://github.com/mwitkow/go-http-dialer.git", "commit": "378f744fb2b81a6b96e3f40cde4f3bcab5a9cff0", "subdir": ""}),
+        ({"module": "github.com/pion/randutil", "version": "v0.1.0", "repo_url": "https://github.com/pion/randutil.git", "commit": "3e7aefb6fd280d89fca72f1596348f1939525187", "subdir": ""}),
+        ({"module": "github.com/k3s-io/api", "version": "v0.1.3", "repo_url": "https://github.com/k3s-io/api", "commit": "8adb951ef8746be48fb3a38fab98e65cc728374a", "subdir": ""}),
+        ({"module": "github.com/spf13/cobra", "version": "v1.9.1", "repo_url": "https://github.com/spf13/cobra", "commit": "40b5bc1437a564fc795d388b23835e84f54cd1d1", "subdir": ""}),
+        ({"module": "github.com/modern-go/reflect2", "version": "v1.0.3-0.20250322232337-35a7c28c31ee", "repo_url": "https://github.com/modern-go/reflect2", "commit": "35a7c28c31ee079903db043180532306a621943a", "subdir": ""}),
+        ({"module": "gopkg.in/evanphx/json-patch.v4", "version": "v4.13.0", "repo_url": "https://gopkg.in/evanphx/json-patch.v4", "commit": "84a4bb100ade42a86fce2647c95a7dbcbf569cb2", "subdir": ""}),
+        ({"module": "github.com/nats-io/jsm.go", "version": "v0.2.4", "repo_url": "https://github.com/nats-io/jsm.go", "commit": "805384d41dc2abb325fab8f4412ca3bbcf8c80fd", "subdir": ""}),
+        ({"module": "github.com/soheilhy/cmux", "version": "v0.1.5", "repo_url": "https://github.com/soheilhy/cmux.git", "commit": "5ec6847320e53b5fee0ab9a4757b56625a946c85", "subdir": ""}),
+        ({"module": "go.opentelemetry.io/otel", "version": "v1.37.0", "repo_url": "https://github.com/open-telemetry/opentelemetry-go", "commit": "69e81088ad40f45a0764597326722dea8f3f00a8", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/endpointslice", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/endpointslice"}),
+        ({"module": "google.golang.org/grpc", "version": "v1.72.1", "repo_url": "https://github.com/grpc/grpc-go", "commit": "4cf3cf7f386a1defff130a0b2a45d246c2fb19a6", "subdir": ""}),
+        ({"module": "github.com/k3s-io/cri-tools", "version": "v1.34.0-k3s2", "repo_url": "https://github.com/k3s-io/cri-tools", "commit": "524e6a42ddbb56bd3cba6997202fca8a9b16f541", "subdir": ""}),
+        ({"module": "github.com/armon/circbuf", "version": "v0.0.0-20190214190532-5111143e8da2", "repo_url": "https://github.com/armon/circbuf.git", "commit": "5111143e8da2e98b4ea6a8f32b9065ea1821c191", "subdir": ""}),
+        ({"module": "github.com/dgraph-io/ristretto", "version": "v0.0.2", "repo_url": "https://github.com/dgraph-io/ristretto.git", "commit": "dbc185e050f48c5190a78b4a07829d9c10afca21", "subdir": ""}),
+        ({"module": "github.com/quic-go/quic-go", "version": "v0.50.1", "repo_url": "https://github.com/quic-go/quic-go", "commit": "b90058aba5f65f48e0e150c89bbaa21a72dda4de", "subdir": ""}),
+        ({"module": "github.com/opencontainers/runtime-tools", "version": "v0.9.1-0.20221107090550-2e043c6bd626", "repo_url": "https://github.com/opencontainers/runtime-tools", "commit": "2e043c6bd62639199bdd0d5f0c5082797de4de2a", "subdir": ""}),
+        ({"module": "github.com/google/go-containerregistry", "version": "v0.20.2", "repo_url": "https://github.com/google/go-containerregistry", "commit": "c195f151efe3369874c72662cd69ad43ee485128", "subdir": ""}),
+        ({"module": "github.com/google/gnostic-models", "version": "v0.7.0", "repo_url": "https://github.com/google/gnostic-models", "commit": "82b4ba06c153dcd30e1dbcf93601b3bee5cb3792", "subdir": ""}),
+        ({"module": "github.com/hashicorp/golang-lru/v2", "version": "v2.0.7", "repo_url": "https://github.com/hashicorp/golang-lru", "commit": "d8515860cebc7b25ff2d29fada3f10a43611c28b", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/controller-manager", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/controller-manager"}),
+        ({"module": "go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc", "version": "v0.60.0", "repo_url": "https://github.com/open-telemetry/opentelemetry-go-contrib", "commit": "bc53d2b4eb4de79471bc54f64a5c3dcefa8720d7", "subdir": "instrumentation/google.golang.org/grpc/otelgrpc"}),
+        ({"module": "github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus", "version": "v1.0.1", "repo_url": "https://github.com/grpc-ecosystem/go-grpc-middleware", "commit": "7da22cf3f3d3ae190467d9c7a3ea749b3d0e63b5", "subdir": "providers/prometheus"}),
+        ({"module": "github.com/munnerz/goautoneg", "version": "v0.0.0-20191010083416-a7dc8b61c822", "repo_url": "https://github.com/munnerz/goautoneg.git", "commit": "a7dc8b61c822528f973a5e4e7b272055c6fdb43e", "subdir": ""}),
+        ({"module": "go.etcd.io/raft/v3", "version": "v3.6.0", "repo_url": "https://github.com/etcd-io/raft", "commit": "f35a02212416d045c574e30aa59d4b07c4b8d732", "subdir": ""}),
+        ({"module": "github.com/libp2p/go-libp2p", "version": "v0.41.1", "repo_url": "https://github.com/libp2p/go-libp2p", "commit": "8ce45df1bd142373cdf0a6f8355a757273258f49", "subdir": ""}),
+        ({"module": "github.com/nats-io/nats.go", "version": "v1.44.0", "repo_url": "https://github.com/nats-io/nats.go", "commit": "7a260b8b93562630ec8c6f8f31ae3704c4f61ad1", "subdir": ""}),
+        ({"module": "github.com/go-openapi/swag/cmdutils", "version": "v0.24.0", "repo_url": "https://github.com/go-openapi/swag", "commit": "04b65d3aff180750a2ad252c8b3da549a1c02dfa", "subdir": "cmdutils"}),
+        ({"module": "github.com/smartystreets/goconvey", "version": "v1.7.2", "repo_url": "https://github.com/smartystreets/goconvey.git", "commit": "611926313bc5c80aeccd38083b08653beb007cac", "subdir": ""}),
+        ({"module": "github.com/moby/term", "version": "v0.5.2", "repo_url": "https://github.com/moby/term", "commit": "6c1b69fecbac2753dcaf18718a7e9f9093c3760d", "subdir": ""}),
+        ({"module": "github.com/opentracing/opentracing-go", "version": "v1.2.0", "repo_url": "https://github.com/opentracing/opentracing-go.git", "commit": "d34af3eaa63c4d08ab54863a4bdd0daa45212e12", "subdir": ""}),
+        ({"module": "github.com/xlab/treeprint", "version": "v1.2.0", "repo_url": "https://github.com/xlab/treeprint", "commit": "044005a3b405f660f109e066d9f589755835c2ea", "subdir": ""}),
+        ({"module": "github.com/prometheus/common", "version": "v0.62.0", "repo_url": "https://github.com/prometheus/common", "commit": "280b0e7d5bdf09ddfd2d93c226671cb2ebdb7d5f", "subdir": ""}),
+        ({"module": "github.com/moby/sys/symlink", "version": "v0.3.0", "repo_url": "https://github.com/moby/sys", "commit": "cafbe42351600ca9b363e220722f66d96f6e71f4", "subdir": "symlink"}),
+        ({"module": "github.com/tmc/grpc-websocket-proxy", "version": "v0.0.0-20220101234140-673ab2c3ae75", "repo_url": "https://github.com/tmc/grpc-websocket-proxy.git", "commit": "673ab2c3ae75cc01952b84b88590e30e75dcf395", "subdir": ""}),
+        ({"module": "github.com/go-openapi/swag", "version": "v0.24.1", "repo_url": "https://github.com/go-openapi/swag", "commit": "3b4039d0b89a2722b0a6b96e5cce47505e0dd184", "subdir": ""}),
+        ({"module": "github.com/mr-tron/base58", "version": "v1.2.0", "repo_url": "https://github.com/mr-tron/base58.git", "commit": "cd0e5141f51dfcadb8311fd8e495eb11126a8010", "subdir": ""}),
+        ({"module": "github.com/gorilla/mux", "version": "v1.8.1", "repo_url": "https://github.com/gorilla/mux", "commit": "b4617d0b9670ad14039b2739167fd35a60f557c5", "subdir": ""}),
+        ({"module": "github.com/multiformats/go-base36", "version": "v0.2.0", "repo_url": "https://github.com/multiformats/go-base36", "commit": "da52c98bb97cfaa321be04030bc97dcee7de63ff", "subdir": ""}),
+        ({"module": "github.com/erikdubbelboer/gspt", "version": "v0.0.0-20190125194910-e68493906b83", "repo_url": "https://github.com/erikdubbelboer/gspt.git", "commit": "e68493906b8382891943ddc9960cb9c6ecd1a1f0", "subdir": ""}),
+        ({"module": "github.com/chai2010/gettext-go", "version": "v1.0.2", "repo_url": "https://github.com/chai2010/gettext-go.git", "commit": "274d1753d015d0362761b6a1cc2a572e6a035913", "subdir": ""}),
+        ({"module": "gopkg.in/yaml.v3", "version": "v3.0.1", "repo_url": "https://github.com/go-yaml/yaml", "commit": "f6f7691b1fdeb513f56608cd2c32c51f8194bf51", "subdir": ""}),
+        ({"module": "github.com/dustin/go-humanize", "version": "v1.0.1", "repo_url": "https://github.com/dustin/go-humanize", "commit": "9ec74ab2f7a7161664182fd4e5e292fccffbc75f", "subdir": ""}),
+        ({"module": "go.uber.org/mock", "version": "v0.5.2", "repo_url": "https://github.com/uber/mock", "commit": "0b8095f698fe3b6414a8d1321e990100ba8ce5bc", "subdir": ""}),
+        ({"module": "gopkg.in/inf.v0", "version": "v0.9.1", "repo_url": "https://github.com/go-inf/inf", "commit": "d2d2541c53f18d2a059457998ce2876cc8e67cbf", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/dynamic-resource-allocation", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/dynamic-resource-allocation"}),
+        ({"module": "github.com/go-logr/stdr", "version": "v1.2.3-0.20220714215716-96bad1d688c5", "repo_url": "https://github.com/go-logr/stdr.git", "commit": "96bad1d688c524409b0da98c82fb7d3d51e60639", "subdir": ""}),
+        ({"module": "tags.cncf.io/container-device-interface/specs-go", "version": "v1.0.0", "repo_url": "https://github.com/cncf-tags/container-device-interface", "commit": "40e4c311613750fb2bf8766635d4ed60c0bf3194", "subdir": "specs-go"}),
+        ({"module": "github.com/k3s-io/kubernetes", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": ""}),
+        ({"module": "github.com/k3s-io/etcd/server/v3", "version": "v3.6.4-k3s3", "repo_url": "https://github.com/k3s-io/etcd", "commit": "182208f36cfc0932344aa6e1aca96cfd9a317841", "subdir": ""}),
+        ({"module": "go.opentelemetry.io/contrib/propagators/b3", "version": "v1.19.0", "repo_url": "https://github.com/open-telemetry/opentelemetry-go-contrib", "commit": "fdfa6e3abf03caa6a1d3267913e01526d97eab8a", "subdir": "propagators/b3"}),
+        ({"module": "github.com/containers/ocicrypt", "version": "v1.2.1", "repo_url": "https://github.com/containers/ocicrypt", "commit": "1db71af9f28553231f0b59880d3fe5b162fa8c61", "subdir": ""}),
+        ({"module": "github.com/libp2p/go-yamux/v5", "version": "v5.0.0", "repo_url": "https://github.com/libp2p/go-yamux", "commit": "ea96c0b850325d55dca998ffc511211d14116d04", "subdir": ""}),
+        ({"module": "github.com/spaolacci/murmur3", "version": "v1.1.0", "repo_url": "https://github.com/spaolacci/murmur3.git", "commit": "f09979ecbc725b9e6d41a297405f65e7e8804acc", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/cloud-provider", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/cloud-provider"}),
+        ({"module": "github.com/Masterminds/semver/v3", "version": "v3.3.1", "repo_url": "https://github.com/Masterminds/semver", "commit": "1558ca3488226e3490894a145e831ad58a5ff958", "subdir": ""}),
+        ({"module": "github.com/davidlazar/go-crypto", "version": "v0.0.0-20200604182044-b73af7476f6c", "repo_url": "https://github.com/davidlazar/go-crypto.git", "commit": "b73af7476f6c55b31aa2797d1f98afc94699548d", "subdir": ""}),
+        ({"module": "github.com/grpc-ecosystem/go-grpc-prometheus", "version": "v1.2.0", "repo_url": "https://github.com/grpc-ecosystem/go-grpc-prometheus.git", "commit": "c225b8c3b01faf2899099b768856a9e916e5087b", "subdir": ""}),
+        ({"module": "github.com/cenkalti/backoff/v4", "version": "v4.3.0", "repo_url": "https://github.com/cenkalti/backoff", "commit": "720b78985a65c0452fd37bb155c7cac4157a7c45", "subdir": ""}),
+        ({"module": "go.uber.org/goleak", "version": "v1.3.0", "repo_url": "https://github.com/uber-go/goleak", "commit": "31095c657c34bba405a8d480db27989aa5f60b9c", "subdir": ""}),
+        ({"module": "github.com/cilium/ebpf", "version": "v0.12.3", "repo_url": "https://github.com/cilium/ebpf", "commit": "1a65b78df6d9fbe88cd546d689e3e1af54227f23", "subdir": ""}),
+        ({"module": "github.com/cenkalti/backoff/v5", "version": "v5.0.3", "repo_url": "https://github.com/cenkalti/backoff", "commit": "7cad66a637c4ffff09d0795608116ddcc7eb1769", "subdir": ""}),
+        ({"module": "github.com/marten-seemann/tcp", "version": "v0.0.0-20210406111302-dfbc87cc63fd", "repo_url": "https://github.com/marten-seemann/tcp.git", "commit": "dfbc87cc63fd003b9a070c76d605769fa3e2e3b2", "subdir": ""}),
+        ({"module": "github.com/vishvananda/netns", "version": "v0.0.5", "repo_url": "https://github.com/vishvananda/netns", "commit": "4c46424d73b556b3ea4bc5a7cec9e7376dcb2a73", "subdir": ""}),
+        ({"module": "github.com/evanphx/json-patch", "version": "v5.9.11+incompatible", "repo_url": "https://github.com/evanphx/json-patch", "commit": "84a4bb100ade42a86fce2647c95a7dbcbf569cb2", "subdir": ""}),
+        ({"module": "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp", "version": "v0.60.0", "repo_url": "https://github.com/open-telemetry/opentelemetry-go-contrib", "commit": "bc53d2b4eb4de79471bc54f64a5c3dcefa8720d7", "subdir": "instrumentation/net/http/otelhttp"}),
+        ({"module": "github.com/hashicorp/errwrap", "version": "v1.1.0", "repo_url": "https://github.com/hashicorp/errwrap.git", "commit": "7b00e5db719c64d14dd0caaacbd13e76254d02c0", "subdir": ""}),
+        ({"module": "github.com/libp2p/go-libp2p-record", "version": "v0.3.1", "repo_url": "https://github.com/libp2p/go-libp2p-record", "commit": "865384fbdd41d98d724ae888c69f94bfb448dab1", "subdir": ""}),
+        ({"module": "gopkg.in/go-jose/go-jose.v2", "version": "v2.6.3", "repo_url": "https://gopkg.in/go-jose/go-jose.v2", "commit": "0dd4dd541c665fb292d664f77604ba694726f298", "subdir": ""}),
+        ({"module": "go.opencensus.io", "version": "v0.24.0", "repo_url": "https://github.com/census-instrumentation/opencensus-go", "commit": "b1a01ee95db0e690d91d7193d037447816fae4c5", "subdir": ""}),
+        ({"module": "github.com/invopop/jsonschema", "version": "v0.13.0", "repo_url": "https://github.com/invopop/jsonschema", "commit": "328cc73c3399c73df18b708fa00d29669cb0e4cc", "subdir": ""}),
+        ({"module": "github.com/hashicorp/go-cleanhttp", "version": "v0.5.2", "repo_url": "https://github.com/hashicorp/go-cleanhttp.git", "commit": "6d9e2ac5d828e5f8594b97f88c4bde14a67bb6d2", "subdir": ""}),
+        ({"module": "github.com/containerd/continuity", "version": "v0.4.5", "repo_url": "https://github.com/containerd/continuity", "commit": "44e2adf7e9cd87330f3ad656e7a006ef91ed8c1e", "subdir": ""}),
+        ({"module": "github.com/karrick/godirwalk", "version": "v1.17.0", "repo_url": "https://github.com/karrick/godirwalk.git", "commit": "9a7752c108e7ea76255201b9f47bd4d4d2df868e", "subdir": ""}),
+        ({"module": "go.opentelemetry.io/otel/exporters/otlp/otlptrace", "version": "v1.37.0", "repo_url": "https://github.com/open-telemetry/opentelemetry-go", "commit": "69e81088ad40f45a0764597326722dea8f3f00a8", "subdir": "exporters/otlp/otlptrace"}),
+        ({"module": "github.com/mikioh/tcp", "version": "v0.0.0-20190314235350-803a9b46060c", "repo_url": "https://github.com/mikioh/tcp.git", "commit": "803a9b46060c1d8b9ee03ff0386b87c179f50227", "subdir": ""}),
+        ({"module": "github.com/rancher/dynamiclistener", "version": "v0.7.0", "repo_url": "https://github.com/rancher/dynamiclistener", "commit": "242c2af2db15d1c29283f31efcfff4ae9d5fa0da", "subdir": ""}),
+        ({"module": "github.com/emicklei/go-restful", "version": "v2.16.0+incompatible", "repo_url": "https://github.com/emicklei/go-restful.git", "commit": "ac666c045e035603f2704c98c59e979fccbfa94f", "subdir": ""}),
+        ({"module": "github.com/sirupsen/logrus", "version": "v1.9.3", "repo_url": "https://github.com/sirupsen/logrus", "commit": "d40e25cd45ed9c6b2b66e6b97573a0413e4c23bd", "subdir": ""}),
+        ({"module": "filippo.io/edwards25519", "version": "v1.1.0", "repo_url": "https://github.com/FiloSottile/edwards25519", "commit": "325f520de716c1d2d2b4e8dc2f82c7ccc5fac764", "subdir": ""}),
+        ({"module": "github.com/jonboulle/clockwork", "version": "v0.5.0", "repo_url": "https://github.com/jonboulle/clockwork", "commit": "6d8d032a18422c2e3ef651170a8a55012d1f704c", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/apimachinery", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/apimachinery"}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/component-helpers", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/component-helpers"}),
+        ({"module": "github.com/klauspost/compress", "version": "v1.18.0", "repo_url": "https://github.com/klauspost/compress", "commit": "8e79dc4b98d4c5a09c62a2546b79c14edf7c3e38", "subdir": ""}),
+        ({"module": "github.com/polydawn/refmt", "version": "v0.89.0", "repo_url": "https://github.com/polydawn/refmt", "commit": "ad1efcb83999082a4ec5ac34b9d5c08bc388faf3", "subdir": ""}),
+        ({"module": "go.opentelemetry.io/auto/sdk", "version": "v1.1.0", "repo_url": "https://github.com/open-telemetry/opentelemetry-go-instrumentation", "commit": "b93ae2eed39af4db57ef0da19b3942b17d961ba1", "subdir": "sdk"}),
+        ({"module": "cel.dev/expr", "version": "v0.24.0", "repo_url": "https://github.com/google/cel-spec", "commit": "9f069b3ee58b02d6f6736c5ebd6587075c1a1b22", "subdir": ""}),
+        ({"module": "github.com/onsi/gomega", "version": "v1.38.0", "repo_url": "https://github.com/onsi/gomega", "commit": "c1237df9d4dbb138d19c835940657cc5c7fbd506", "subdir": ""}),
+        ({"module": "github.com/coreos/go-semver", "version": "v0.3.1", "repo_url": "https://github.com/coreos/go-semver", "commit": "c16f28124668daf02b2a32a431dec2f183977ffc", "subdir": ""}),
+        ({"module": "github.com/prometheus/client_model", "version": "v0.6.2", "repo_url": "https://github.com/prometheus/client_model", "commit": "eb136e513d419e0c31ad750922f0a6f7675c2dee", "subdir": ""}),
+        ({"module": "github.com/otiai10/mint", "version": "v1.3.3", "repo_url": "https://github.com/otiai10/mint.git", "commit": "f8e74d5076fdd79c3db0aa8b1dda35e603c328e5", "subdir": ""}),
+        ({"module": "github.com/smartystreets/assertions", "version": "v1.2.0", "repo_url": "https://github.com/smartystreets/assertions.git", "commit": "a2ad282d643d747de44bfe6deaca88113a257e04", "subdir": ""}),
+        ({"module": "github.com/containerd/errdefs/pkg", "version": "v0.3.0", "repo_url": "https://github.com/containerd/errdefs", "commit": "4817405e4a3caeb7aee9dac68ed55339c59cb635", "subdir": "pkg"}),
+        ({"module": "github.com/docker/docker-credential-helpers", "version": "v0.7.0", "repo_url": "https://github.com/docker/docker-credential-helpers", "commit": "ac5992b5f4756fc0398a7d0c93c609e624368bde", "subdir": ""}),
+        ({"module": "github.com/JeffAshton/win_pdh", "version": "v0.0.0-20161109143554-76bb4ee9f0ab", "repo_url": "https://github.com/JeffAshton/win_pdh.git", "commit": "76bb4ee9f0ab50f77826f2a2ee7fb9d3880d6ec2", "subdir": ""}),
+        ({"module": "github.com/vishvananda/netlink", "version": "v1.3.1", "repo_url": "https://github.com/vishvananda/netlink", "commit": "17daef607c6442d47b0565343cf8a69f985a4cb7", "subdir": ""}),
+        ({"module": "github.com/jackpal/go-nat-pmp", "version": "v1.0.2", "repo_url": "https://github.com/jackpal/go-nat-pmp.git", "commit": "059203efa1edd7130293a583541b8308e7c640c4", "subdir": ""}),
+        ({"module": "github.com/moby/sys/user", "version": "v0.4.0", "repo_url": "https://github.com/moby/sys", "commit": "71f0c5ead442a11945a589a7aafd6ef5976fffc8", "subdir": "user"}),
+        ({"module": "github.com/opencontainers/image-spec", "version": "v1.1.1", "repo_url": "https://github.com/opencontainers/image-spec", "commit": "147f9c13cedb47a0c4d9a11a222961073d585877", "subdir": ""}),
+        ({"module": "github.com/google/uuid", "version": "v1.6.0", "repo_url": "https://github.com/google/uuid", "commit": "0f11ee6918f41a04c201eceeadf612a377bc7fbc", "subdir": ""}),
+        ({"module": "github.com/prometheus/procfs", "version": "v0.17.0", "repo_url": "https://github.com/prometheus/procfs", "commit": "61fe41207276bc95c4c391762e9ef137385e8a5d", "subdir": ""}),
+        ({"module": "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp", "version": "v1.35.0", "repo_url": "https://github.com/open-telemetry/opentelemetry-go", "commit": "5ba5e7a449f36c1c02710bbaa517263797046db0", "subdir": "exporters/otlp/otlptrace/otlptracehttp"}),
+        ({"module": "github.com/buger/jsonparser", "version": "v1.1.1", "repo_url": "https://github.com/buger/jsonparser.git", "commit": "df3ea76ece10095374fd1c9a22a4fb85a44efc42", "subdir": ""}),
+        ({"module": "github.com/emicklei/go-restful/v3", "version": "v3.11.0", "repo_url": "https://github.com/emicklei/go-restful", "commit": "30bec7807481e62e1e1e59ad57e7f22054806966", "subdir": ""}),
+        ({"module": "github.com/k3s-io/etcd/server/v3", "version": "v3.6.4-k3s3", "repo_url": "https://github.com/k3s-io/etcd", "commit": "182208f36cfc0932344aa6e1aca96cfd9a317841", "subdir": ""}),
+        ({"module": "github.com/peterbourgon/diskv", "version": "v2.0.1+incompatible", "repo_url": "https://github.com/peterbourgon/diskv.git", "commit": "5f041e8faa004a95c88a202771f4cc3e991971e6", "subdir": ""}),
+        ({"module": "go.uber.org/multierr", "version": "v1.11.0", "repo_url": "https://github.com/uber-go/multierr", "commit": "de75ae527b39a27afcb50a84427ec7b84021d5f4", "subdir": ""}),
+        ({"module": "github.com/google/go-tpm", "version": "v0.9.5", "repo_url": "https://github.com/google/go-tpm", "commit": "d88acdb2077207b23d3b5dacc2873169283cf11c", "subdir": ""}),
+        ({"module": "github.com/pmezard/go-difflib", "version": "v1.0.1-0.20181226105442-5d4384ee4fb2", "repo_url": "https://github.com/pmezard/go-difflib.git", "commit": "5d4384ee4fb2527b0a1256a821ebfc92f91efefc", "subdir": ""}),
+        ({"module": "github.com/moby/locker", "version": "v1.0.1", "repo_url": "https://github.com/moby/locker.git", "commit": "281af2d563954745bea9d1487c965f24d30742fe", "subdir": ""}),
+        ({"module": "github.com/raulk/go-watchdog", "version": "v1.3.0", "repo_url": "https://github.com/raulk/go-watchdog.git", "commit": "9c5e371109037bec1852ea63c9512a94307bfea0", "subdir": ""}),
+        ({"module": "github.com/bronze1man/goStrongswanVici", "version": "v0.0.0-20231128135937-211cef3b0b20", "repo_url": "https://github.com/bronze1man/goStrongswanVici", "commit": "211cef3b0b20c5c00c0ad49f7b4ccb78c06eee58", "subdir": ""}),
+        ({"module": "github.com/antlr4-go/antlr/v4", "version": "v4.13.1", "repo_url": "https://github.com/antlr4-go/antlr", "commit": "4d7e18847d8881a176db3d7cca909e3f3942a05f", "subdir": ""}),
+        ({"module": "github.com/containerd/errdefs", "version": "v1.0.0", "repo_url": "https://github.com/containerd/errdefs", "commit": "4817405e4a3caeb7aee9dac68ed55339c59cb635", "subdir": ""}),
+        ({"module": "github.com/containerd/go-runc", "version": "v1.1.0", "repo_url": "https://github.com/containerd/go-runc", "commit": "df3c22d088ca919d1943efa8ae0cfc0514da0542", "subdir": ""}),
+        ({"module": "github.com/coreos/go-oidc", "version": "v2.3.0+incompatible", "repo_url": "https://github.com/coreos/go-oidc", "commit": "b7e896c40598f5307b3b5a163b6ad02ae97ec1a5", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/kubelet", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/kubelet"}),
+        ({"module": "github.com/benbjohnson/clock", "version": "v1.3.5", "repo_url": "https://github.com/benbjohnson/clock", "commit": "96c602caabb567343046c08a8fca8560b4f00bb4", "subdir": ""}),
+        ({"module": "github.com/pion/dtls/v3", "version": "v3.0.4", "repo_url": "https://github.com/pion/dtls", "commit": "b3e02c4ba7e207c6dfce4e490f30fe09c8c926be", "subdir": ""}),
+        ({"module": "github.com/rs/xid", "version": "v1.6.0", "repo_url": "https://github.com/rs/xid", "commit": "7aed5a87c88ebb644e4e6d077f58147ac42f03b9", "subdir": ""}),
+        ({"module": "gotest.tools/v3", "version": "v3.5.0", "repo_url": "https://github.com/gotestyourself/gotest.tools", "commit": "a80f057529047c44e1a85d0d017b200787e537e0", "subdir": ""}),
+        ({"module": "github.com/ipfs/go-test", "version": "v0.2.1", "repo_url": "https://github.com/ipfs/go-test", "commit": "f3ae76318f77ca73afecab447ac9ca25404299ae", "subdir": ""}),
+        ({"module": "github.com/rogpeppe/go-internal", "version": "v1.13.1", "repo_url": "https://github.com/rogpeppe/go-internal", "commit": "e67a4aa07a58fd7f4cc884153739cb77b34f0edb", "subdir": ""}),
+        ({"module": "github.com/pion/ice/v4", "version": "v4.0.8", "repo_url": "https://github.com/pion/ice", "commit": "37fb5d2fc34dd7df9d09fe4d9fc2541e80a1b675", "subdir": ""}),
+        ({"module": "github.com/hashicorp/go-hclog", "version": "v1.6.3", "repo_url": "https://github.com/hashicorp/go-hclog", "commit": "d12136aa2e51933c460084f5083b6d5bb9d41960", "subdir": ""}),
+        ({"module": "github.com/decred/dcrd/dcrec/secp256k1/v4", "version": "v4.4.0", "repo_url": "https://github.com/decred/dcrd", "commit": "f98d08ef138a99711dbbc86c569935ded8d6a986", "subdir": "dcrec/secp256k1"}),
+        ({"module": "github.com/libp2p/go-cidranger", "version": "v1.1.0", "repo_url": "https://github.com/libp2p/go-cidranger.git", "commit": "1dec7f87b45b32e24d3f59548ad61647de34586d", "subdir": ""}),
+        ({"module": "github.com/goccy/go-json", "version": "v0.10.5", "repo_url": "https://github.com/goccy/go-json", "commit": "9872089c316cfe2d0f29b331b75d45bf6d522d96", "subdir": ""}),
+        ({"module": "github.com/jtolds/gls", "version": "v4.20.0+incompatible", "repo_url": "https://github.com/jtolds/gls.git", "commit": "b4936e06046bbecbb94cae9c18127ebe510a2cb9", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/api", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/api"}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/kubectl", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/kubectl"}),
+        ({"module": "github.com/opencontainers/selinux", "version": "v1.11.1", "repo_url": "https://github.com/opencontainers/selinux", "commit": "44b3337c67171896cf6f299ece82ec31abfe8c0d", "subdir": ""}),
+        ({"module": "github.com/json-iterator/go", "version": "v1.1.12", "repo_url": "https://github.com/json-iterator/go.git", "commit": "024077e996b048517130b21ea6bf12aa23055d3d", "subdir": ""}),
+        ({"module": "github.com/dgraph-io/badger", "version": "v1.6.2", "repo_url": "https://github.com/dgraph-io/badger.git", "commit": "c5d36c806aa80954a24606a982a475a717d44de2", "subdir": ""}),
+        ({"module": "gopkg.in/yaml.v2", "version": "v2.4.0", "repo_url": "https://github.com/go-yaml/yaml", "commit": "7649d4548cb53a614db133b2a8ac1f31859dda8c", "subdir": ""}),
+        ({"module": "github.com/mailru/easyjson", "version": "v0.9.0", "repo_url": "https://github.com/mailru/easyjson", "commit": "5e854fb809ec83ff18eb74554fd5c693e28eaadb", "subdir": ""}),
+        ({"module": "github.com/syndtr/goleveldb", "version": "v1.0.0", "repo_url": "https://github.com/syndtr/goleveldb.git", "commit": "9d007e481048296f09f59bd19bb7ae584563cd95", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/cri-api", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/cri-api"}),
+        ({"module": "github.com/k3s-io/etcd/server/v3", "version": "v3.6.4-k3s3", "repo_url": "https://github.com/k3s-io/etcd", "commit": "182208f36cfc0932344aa6e1aca96cfd9a317841", "subdir": ""}),
+        ({"module": "github.com/inetaf/tcpproxy", "version": "v0.0.0-20240214030015-3ce58045626c", "repo_url": "https://github.com/inetaf/tcpproxy", "commit": "3ce58045626c8bc343a593c90354975e61b1817a", "subdir": ""}),
+        ({"module": "github.com/moby/sys/userns", "version": "v0.1.0", "repo_url": "https://github.com/moby/sys", "commit": "54475191138bd297c627eb1a59e1e54b953957f1", "subdir": "userns"}),
+        ({"module": "github.com/go-openapi/swag/netutils", "version": "v0.24.0", "repo_url": "https://github.com/go-openapi/swag", "commit": "04b65d3aff180750a2ad252c8b3da549a1c02dfa", "subdir": "netutils"}),
+        ({"module": "github.com/tidwall/btree", "version": "v1.8.1", "repo_url": "https://github.com/tidwall/btree", "commit": "490165c8137d1cb1f669d07554305665b4c2067a", "subdir": ""}),
+        ({"module": "github.com/x448/float16", "version": "v0.8.4", "repo_url": "https://github.com/x448/float16.git", "commit": "cb9afec31f2649663ebb64da5c6c32c3d365c3ca", "subdir": ""}),
+        ({"module": "github.com/antithesishq/antithesis-sdk-go", "version": "v0.4.3-default-no-op", "repo_url": "https://github.com/antithesishq/antithesis-sdk-go", "commit": "d4f8d02f7899b36d7af1a858622d51f89dcd6cba", "subdir": ""}),
+        ({"module": "github.com/cyphar/filepath-securejoin", "version": "v0.4.1", "repo_url": "https://github.com/cyphar/filepath-securejoin", "commit": "7abd870410ccf784788af4f55c6413c9ef47222d", "subdir": ""}),
+        ({"module": "github.com/go-openapi/swag/yamlutils", "version": "v0.24.0", "repo_url": "https://github.com/go-openapi/swag", "commit": "04b65d3aff180750a2ad252c8b3da549a1c02dfa", "subdir": "yamlutils"}),
+        ({"module": "github.com/libp2p/go-flow-metrics", "version": "v0.2.0", "repo_url": "https://github.com/libp2p/go-flow-metrics", "commit": "0aae1a1aba2c8823c356a1b6cbfb62f39fb173e2", "subdir": ""}),
+        ({"module": "github.com/docker/cli", "version": "v28.3.2+incompatible", "repo_url": "https://github.com/docker/cli", "commit": "578ccf607d24abc5270e9a4cbd5ba9b5355b042f", "subdir": ""}),
+        ({"module": "github.com/google/gopacket", "version": "v1.1.19", "repo_url": "https://github.com/google/gopacket.git", "commit": "a9779d139771f6a06fc983b18e0efd23ca30222f", "subdir": ""}),
+        ({"module": "golang.zx2c4.com/wireguard/wgctrl", "version": "v0.0.0-20241231184526-a9ab2273dd10", "repo_url": "https://github.com/WireGuard/wgctrl-go", "commit": "a9ab2273dd1075ea74b88c76f8757f8b4003fcbf", "subdir": ""}),
+        ({"module": "github.com/stefanberger/go-pkcs11uri", "version": "v0.0.0-20230803200340-78284954bff6", "repo_url": "https://github.com/stefanberger/go-pkcs11uri", "commit": "78284954bff6dcce7888166bb79bbba93bea0879", "subdir": ""}),
+        ({"module": "github.com/wlynxg/anet", "version": "v0.0.5", "repo_url": "https://github.com/wlynxg/anet", "commit": "839bc3a920f1b87dd3ce1386e425aa5ef2e69d24", "subdir": ""}),
+        ({"module": "github.com/opencontainers/runtime-spec", "version": "v1.2.1", "repo_url": "https://github.com/opencontainers/runtime-spec", "commit": "524fc0e1b8ab0180e2fc9abd31837a0f4ed1fd6b", "subdir": ""}),
+        ({"module": "golang.org/x/tools", "version": "v0.36.0", "repo_url": "https://go.googlesource.com/tools", "commit": "44d18e11572cd133e1eec6811ba57d78ff20addf", "subdir": ""}),
+        ({"module": "github.com/intel/goresctrl", "version": "v0.8.0", "repo_url": "https://github.com/intel/goresctrl", "commit": "f7cfa04536314eacecaa523f3b87d3978fbe28e3", "subdir": ""}),
+        ({"module": "github.com/stoewer/go-strcase", "version": "v1.3.1", "repo_url": "https://github.com/stoewer/go-strcase", "commit": "992183722cdb474a541bf3bc9d205b302edd47c2", "subdir": ""}),
+        ({"module": "github.com/containerd/imgcrypt/v2", "version": "v2.0.1", "repo_url": "https://github.com/containerd/imgcrypt", "commit": "c377ec98ff79ec9205eabf555ebd2ea784738c6c", "subdir": ""}),
+        ({"module": "github.com/docker/go-units", "version": "v0.5.0", "repo_url": "https://github.com/docker/go-units", "commit": "e682442797b36348f8e1f98defdbf32bac0b6c6f", "subdir": ""}),
+        ({"module": "github.com/golang/mock", "version": "v1.6.0", "repo_url": "https://github.com/golang/mock.git", "commit": "aba2ff9a6844d5e3289e8472d3217d5b3090f083", "subdir": ""}),
+        ({"module": "golang.org/x/net", "version": "v0.38.0", "repo_url": "https://go.googlesource.com/net", "commit": "e1fcd82abba34df74614020343be8eb1fe85f0d9", "subdir": ""}),
+        ({"module": "github.com/ipfs/go-ds-badger", "version": "v0.3.0", "repo_url": "https://github.com/ipfs/go-ds-badger.git", "commit": "f461792fa44987cac9b4c683e31af53868e887e2", "subdir": ""}),
+        ({"module": "github.com/containerd/nri", "version": "v0.8.0", "repo_url": "https://github.com/containerd/nri", "commit": "6d486acd3f7190d39f3b22490b59f7b7bb937b22", "subdir": ""}),
+        ({"module": "github.com/morikuni/aec", "version": "v1.0.0", "repo_url": "https://github.com/morikuni/aec.git", "commit": "39771216ff4c63d11f5e604076f9c45e8be1067b", "subdir": ""}),
+        ({"module": "github.com/coreos/go-systemd/v22", "version": "v22.6.0", "repo_url": "https://github.com/coreos/go-systemd", "commit": "8214e15a7a799dc18f0ef8dd788b830f815d7530", "subdir": ""}),
+        ({"module": "github.com/mattn/go-colorable", "version": "v0.1.13", "repo_url": "https://github.com/mattn/go-colorable", "commit": "11a925cff3d38c293ddc8c05a16b504e3e2c63be", "subdir": ""}),
+        ({"module": "github.com/otiai10/copy", "version": "v1.7.0", "repo_url": "https://github.com/otiai10/copy.git", "commit": "323db161ae97db91e6e13dbcda403fdb29c3fff8", "subdir": ""}),
+        ({"module": "github.com/nats-io/nats-server/v2", "version": "v2.11.6", "repo_url": "https://github.com/nats-io/nats-server", "commit": "bc813ee3cb111d81bd1ad2190e88ec0e9637c57b", "subdir": ""}),
+        ({"module": "github.com/google/pprof", "version": "v0.0.0-20250403155104-27863c87afa6", "repo_url": "https://github.com/google/pprof", "commit": "27863c87afa6df68fb88a574f81b47d6fb7fbf29", "subdir": ""}),
+        ({"module": "github.com/koron/go-ssdp", "version": "v0.0.5", "repo_url": "https://github.com/koron/go-ssdp", "commit": "156d60dcc8ad19f8079697dd8c7faffdc257f13d", "subdir": ""}),
+        ({"module": "gopkg.in/check.v1", "version": "v1.0.0-20201130134442-10cb98267c6c", "repo_url": "https://github.com/go-check/check", "commit": "10cb98267c6cb43ea9cd6793f29ff4089c306974", "subdir": ""}),
+        ({"module": "github.com/pquerna/cachecontrol", "version": "v0.1.0", "repo_url": "https://github.com/pquerna/cachecontrol.git", "commit": "fb00f8a766ae43bf209f50299ce7d69669416dfb", "subdir": ""}),
+        ({"module": "github.com/libp2p/go-libp2p-kbucket", "version": "v0.7.0", "repo_url": "https://github.com/libp2p/go-libp2p-kbucket", "commit": "d581bff96da20b4f6c0cdddefddf78cb7c196211", "subdir": ""}),
+        ({"module": "github.com/libp2p/go-libp2p-asn-util", "version": "v0.4.1", "repo_url": "https://github.com/libp2p/go-libp2p-asn-util", "commit": "3ec6bf02c86c57c28d29b2963a9d7b9d6d74bfb2", "subdir": ""}),
+        ({"module": "github.com/gopherjs/gopherjs", "version": "v0.0.0-20190430165422-3e4dfb77656c", "repo_url": "https://github.com/gopherjs/gopherjs.git", "commit": "3e4dfb77656c424b6d1196a4d5fed0fcf63677cc", "subdir": ""}),
+        ({"module": "github.com/coreos/go-iptables", "version": "v0.8.0", "repo_url": "https://github.com/coreos/go-iptables", "commit": "26e42518b22e6878bd6e479a574122c319fa923e", "subdir": ""}),
+        ({"module": "github.com/multiformats/go-multiaddr-fmt", "version": "v0.1.0", "repo_url": "https://github.com/multiformats/go-multiaddr-fmt.git", "commit": "113ed87ed03cfff94f29fd95236be3ccd933fd36", "subdir": ""}),
+        ({"module": "github.com/ipfs/go-ds-leveldb", "version": "v0.5.0", "repo_url": "https://github.com/ipfs/go-ds-leveldb.git", "commit": "6f6dc580f7325ad411fc5967ccee67e40545e208", "subdir": ""}),
+        ({"module": "github.com/multiformats/go-varint", "version": "v0.0.7", "repo_url": "https://github.com/multiformats/go-varint", "commit": "8c8129accb08fc978bb276c81d568c41eafdd48f", "subdir": ""}),
+        ({"module": "golang.org/x/crypto", "version": "v0.36.0", "repo_url": "https://go.googlesource.com/crypto", "commit": "49bf5b80c8108983f588ecabd7bf996e6e63a515", "subdir": ""}),
+        ({"module": "github.com/opencontainers/go-digest", "version": "v1.0.0", "repo_url": "https://github.com/opencontainers/go-digest.git", "commit": "ea51bea511f75cfa3ef6098cc253c5c3609b037a", "subdir": ""}),
+        ({"module": "github.com/pion/rtcp", "version": "v1.2.15", "repo_url": "https://github.com/pion/rtcp", "commit": "b5ab305d1920e7ea5bd98ee68a3242d42424a445", "subdir": ""}),
+        ({"module": "github.com/containerd/console", "version": "v1.0.5", "repo_url": "https://github.com/containerd/console", "commit": "c8d962180f543ac07c008ecc79a413406ea10c0b", "subdir": ""}),
+        ({"module": "gopkg.in/tomb.v1", "version": "v1.0.0-20141024135613-dd632973f1e7", "repo_url": "https://github.com/go-tomb/tomb", "commit": "dd632973f1e7218eb1089048e0798ec9ae7dceb8", "subdir": ""}),
+        ({"module": "github.com/sergi/go-diff", "version": "v1.2.0", "repo_url": "https://github.com/sergi/go-diff.git", "commit": "0a651d56613f9de4bed8b9c4769b776ef168bfca", "subdir": ""}),
+        ({"module": "github.com/xrash/smetrics", "version": "v0.0.0-20240521201337-686a1a2994c1", "repo_url": "https://github.com/xrash/smetrics", "commit": "686a1a2994c11fac124829fadcb683a24ab8d25f", "subdir": ""}),
+        ({"module": "github.com/decred/dcrd/crypto/blake256", "version": "v1.1.0", "repo_url": "https://github.com/decred/dcrd", "commit": "0d2e94857b109d8bcf1056b3d5061ca90f0f8b94", "subdir": "crypto/blake256"}),
+        ({"module": "github.com/k3s-io/helm-controller", "version": "v0.16.13", "repo_url": "https://github.com/k3s-io/helm-controller", "commit": "dac1b5e95969ebc2ca26c202144493c1deedc2ab", "subdir": ""}),
+        ({"module": "github.com/grpc-ecosystem/go-grpc-middleware/v2", "version": "v2.3.0", "repo_url": "https://github.com/grpc-ecosystem/go-grpc-middleware", "commit": "8ce5e4220c2f6cb6440bad4e977536099a6002f9", "subdir": ""}),
+        ({"module": "github.com/creack/pty", "version": "v1.1.18", "repo_url": "https://github.com/creack/pty.git", "commit": "d301b27172d49dd53f82d18d37105669ba84fbe1", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/kube-aggregator", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/kube-aggregator"}),
+        ({"module": "github.com/ipfs/go-ipfs-util", "version": "v0.0.3", "repo_url": "https://github.com/ipfs/go-ipfs-util", "commit": "f92bd273d9d66cc552c795bc5a4c002ca19fd0cd", "subdir": ""}),
+        ({"module": "github.com/multiformats/go-multiaddr-dns", "version": "v0.4.1", "repo_url": "https://github.com/multiformats/go-multiaddr-dns", "commit": "2c774f3c835321ab48ee63492dedd1aec8691a51", "subdir": ""}),
+        ({"module": "github.com/joho/godotenv", "version": "v1.5.1", "repo_url": "https://github.com/joho/godotenv", "commit": "3fc4292b58a67b78e1dbb6e47b4879a6cc602ec4", "subdir": ""}),
+        ({"module": "github.com/pion/logging", "version": "v0.2.3", "repo_url": "https://github.com/pion/logging", "commit": "770cd0b2bbb63d76bc06c128f626cd78099eb76a", "subdir": ""}),
+        ({"module": "google.golang.org/genproto/googleapis/rpc", "version": "v0.0.0-20250826171959-ef028d996bc1", "repo_url": "https://github.com/googleapis/go-genproto", "commit": "ef028d996bc1e7e0d82a6f72fba4a35dea082183", "subdir": "googleapis/rpc"}),
+        ({"module": "github.com/petermattis/goid", "version": "v0.0.0-20240813172612-4fcff4a6cae7", "repo_url": "https://github.com/petermattis/goid", "commit": "4fcff4a6cae7cd8fdaeeaa8bb87443eda9dec107", "subdir": ""}),
+        ({"module": "github.com/pion/rtp", "version": "v1.8.11", "repo_url": "https://github.com/pion/rtp", "commit": "3e1f46acd19383dabe489c90182fe860cdc1808f", "subdir": ""}),
+        ({"module": "tags.cncf.io/container-device-interface", "version": "v1.0.1", "repo_url": "https://github.com/cncf-tags/container-device-interface", "commit": "79790445c2d70820f6824eb42832d2efd0f08dd2", "subdir": ""}),
+        ({"module": "go.yaml.in/yaml/v2", "version": "v2.4.2", "repo_url": "https://github.com/yaml/go-yaml", "commit": "246a95c22c57f15ef6d3305a1f1b8a0b05e4d560", "subdir": "", "alias_of": "gopkg.in/yaml.v2"}),
+        ({"module": "github.com/NYTimes/gziphandler", "version": "v1.1.1", "repo_url": "https://github.com/NYTimes/gziphandler.git", "commit": "dd0439581c7657cb652dfe5c71d7d48baf39541d", "subdir": ""}),
+        ({"module": "github.com/k3s-io/cadvisor", "version": "v0.52.1", "repo_url": "https://github.com/k3s-io/cadvisor", "commit": "0b675defd46277198f7c15c1053301421a4b733e", "subdir": ""}),
+        ({"module": "github.com/bahlo/generic-list-go", "version": "v0.2.0", "repo_url": "https://github.com/bahlo/generic-list-go.git", "commit": "89fb9b4cdfd4b5295651f72e9f892f1595b4d6c9", "subdir": ""}),
+        ({"module": "github.com/k3s-io/stargz-snapshotter", "version": "v0.17.0-k3s1", "repo_url": "https://github.com/k3s-io/stargz-snapshotter", "commit": "f908e753e01dd906fee13b005bad431f0b2448a7", "subdir": ""}),
+        ({"module": "github.com/checkpoint-restore/go-criu/v7", "version": "v7.2.0", "repo_url": "https://github.com/checkpoint-restore/go-criu", "commit": "39135d0112fa0fb12e80ba04ef843eea097add46", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/cluster-bootstrap", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/cluster-bootstrap"}),
+        ({"module": "gonum.org/v1/gonum", "version": "v0.15.1", "repo_url": "https://github.com/gonum/gonum", "commit": "bdcda9a453049449163d160b98285b64ec8093a1", "subdir": ""}),
+        ({"module": "github.com/minio/sha256-simd", "version": "v1.0.1", "repo_url": "https://github.com/minio/sha256-simd", "commit": "6096f891a77bfe490cbea7a424c821b5fdb92849", "subdir": ""}),
+        ({"module": "github.com/Rican7/retry", "version": "v0.3.1", "repo_url": "https://github.com/Rican7/retry.git", "commit": "e6cc9ad35993d0a7edf857b494c854e0804440cd", "subdir": ""}),
+        ({"module": "github.com/cpuguy83/go-md2man/v2", "version": "v2.0.7", "repo_url": "https://github.com/cpuguy83/go-md2man", "commit": "061b6c7cbecd6752049221aa15b7a05160796698", "subdir": ""}),
+        ({"module": "github.com/rootless-containers/rootlesskit", "version": "v1.1.1", "repo_url": "https://github.com/rootless-containers/rootlesskit", "commit": "a2c596ff9b3fddc0c2becb38f2ef4004f15765b5", "subdir": ""}),
+        ({"module": "github.com/xiang90/probing", "version": "v0.0.0-20221125231312-a49e3df8f510", "repo_url": "https://github.com/xiang90/probing", "commit": "a49e3df8f510ee8b42e68345ca4636dbb161bd0a", "subdir": ""}),
+        ({"module": "golang.org/x/mod", "version": "v0.27.0", "repo_url": "https://go.googlesource.com/mod", "commit": "f8a9fe217cff893cb67f4acad96a0021c13ee6e7", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/kms", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/kms"}),
+        ({"module": "github.com/minio/minio-go/v7", "version": "v7.0.91", "repo_url": "https://github.com/minio/minio-go", "commit": "e8e8acaa6eaaefd79cea2d814b99a1217078bf3f", "subdir": ""}),
+        ({"module": "github.com/go-logr/zapr", "version": "v1.3.0", "repo_url": "https://github.com/go-logr/zapr", "commit": "78b8af5329abd1ba8695aad821f95fb2e7f4e651", "subdir": ""}),
+        ({"module": "k8s.io/cri-client", "version": "v0.34.1", "repo_url": "https://github.com/kubernetes/cri-client", "commit": "6063f15166ef1384cca5a06281c5da320e25c843", "subdir": ""}),
+        ({"module": "github.com/AndreasBriese/bbloom", "version": "v0.0.0-20190825152654-46b345b51c96", "repo_url": "https://github.com/AndreasBriese/bbloom.git", "commit": "46b345b51c9667fcbaad862a370d73bd7aa802b6", "subdir": ""}),
+        ({"module": "github.com/jackc/puddle/v2", "version": "v2.2.2", "repo_url": "https://github.com/jackc/puddle", "commit": "bd09d14bd4018b6d65a9d7770e2f3ddf8b00af1c", "subdir": ""}),
+        ({"module": "go.uber.org/dig", "version": "v1.18.0", "repo_url": "https://github.com/uber-go/dig", "commit": "9b9307c6dfdb50bca7bda38c95b1f2a5d7c27a3a", "subdir": ""}),
+        ({"module": "github.com/go-openapi/swag/jsonutils", "version": "v0.24.0", "repo_url": "https://github.com/go-openapi/swag", "commit": "04b65d3aff180750a2ad252c8b3da549a1c02dfa", "subdir": "jsonutils"}),
+        ({"module": "github.com/fxamacker/cbor/v2", "version": "v2.9.0", "repo_url": "https://github.com/fxamacker/cbor", "commit": "d29ad7351b55b1844387cf9306c4101658cc5256", "subdir": ""}),
+        ({"module": "github.com/docker/distribution", "version": "v2.8.3+incompatible", "repo_url": "https://github.com/docker/distribution", "commit": "4772604ae973031ab32dd9805a4bccf61d94909f", "subdir": ""}),
+        ({"module": "github.com/mdlayher/genetlink", "version": "v1.3.2", "repo_url": "https://github.com/mdlayher/genetlink", "commit": "7531bffe0f5e10d1ce558d35e6feb5d1d1600851", "subdir": ""}),
+        ({"module": "google.golang.org/genproto/googleapis/api", "version": "v0.0.0-20250826171959-ef028d996bc1", "repo_url": "https://github.com/googleapis/go-genproto", "commit": "ef028d996bc1e7e0d82a6f72fba4a35dea082183", "subdir": "googleapis/api"}),
+        ({"module": "github.com/moby/sys/signal", "version": "v0.7.1", "repo_url": "https://github.com/moby/sys", "commit": "cafbe42351600ca9b363e220722f66d96f6e71f4", "subdir": "signal"}),
+        ({"module": "github.com/lithammer/dedent", "version": "v1.1.0", "repo_url": "https://github.com/lithammer/dedent.git", "commit": "8478954c3bc893cf36c5ee7c822266b993a3b3ee", "subdir": ""}),
+        ({"module": "github.com/go-openapi/swag/typeutils", "version": "v0.24.0", "repo_url": "https://github.com/go-openapi/swag", "commit": "04b65d3aff180750a2ad252c8b3da549a1c02dfa", "subdir": "typeutils"}),
+        ({"module": "github.com/pion/turn/v4", "version": "v4.0.0", "repo_url": "https://github.com/pion/turn", "commit": "f5deeb891cae25aa0935bc36e7c5d8e5eec3f6a9", "subdir": ""}),
+        ({"module": "github.com/francoispqt/gojay", "version": "v1.2.13", "repo_url": "https://github.com/francoispqt/gojay.git", "commit": "1398296d938f9fae26750ddc2fe356b6d897f799", "subdir": ""}),
+        ({"module": "lukechampine.com/blake3", "version": "v1.4.0", "repo_url": "https://github.com/lukechampine/blake3", "commit": "02493b41ff331bc2aca183bae5d7e8cdeef8125e", "subdir": ""}),
+        ({"module": "github.com/docker/go-connections", "version": "v0.6.0", "repo_url": "https://github.com/docker/go-connections", "commit": "42faf792bde28c414a060127d6351769408a675f", "subdir": ""}),
+        ({"module": "github.com/golang/protobuf", "version": "v1.5.4", "repo_url": "https://github.com/golang/protobuf", "commit": "75de7c059e36b64f01d0dd234ff2fff404ec3374", "subdir": ""}),
+        ({"module": "github.com/nxadm/tail", "version": "v1.4.11", "repo_url": "https://github.com/nxadm/tail", "commit": "cbff2e202a24674b7bc70720b0e45adbbbef5d0b", "subdir": ""}),
+        ({"module": "github.com/pion/srtp/v3", "version": "v3.0.4", "repo_url": "https://github.com/pion/srtp", "commit": "099a0b0c209aa5907faea57ff7b1db2409555541", "subdir": ""}),
+        ({"module": "github.com/gogo/protobuf", "version": "v1.3.2", "repo_url": "https://github.com/gogo/protobuf.git", "commit": "b03c65ea87cdc3521ede29f62fe3ce239267c1bc", "subdir": ""}),
+        ({"module": "github.com/docker/go-metrics", "version": "v0.0.1", "repo_url": "https://github.com/docker/go-metrics.git", "commit": "b619b3592b65de4f087d9f16863a7e6ff905973c", "subdir": ""}),
+        ({"module": "github.com/pion/sctp", "version": "v1.8.37", "repo_url": "https://github.com/pion/sctp", "commit": "bf53986cb1bbb4f7a71552bdd47f3e5a9802526a", "subdir": ""}),
+        ({"module": "github.com/minio/crc64nvme", "version": "v1.0.1", "repo_url": "https://github.com/minio/crc64nvme", "commit": "0a53153041b96db22da97cd5a39090ec49ff8deb", "subdir": ""}),
+        ({"module": "github.com/rancher/permissions", "version": "v0.0.0-20240523180510-4001d3d637f7", "repo_url": "https://github.com/rancher/permissions", "commit": "4001d3d637f7e7f9aa17c84d89b2462539f1b331", "subdir": ""}),
+        ({"module": "github.com/jackc/pgpassfile", "version": "v1.0.0", "repo_url": "https://github.com/jackc/pgpassfile.git", "commit": "99d8e8e28945ffceaf75b0299fcb2bb656b8a683", "subdir": ""}),
+        ({"module": "github.com/mitchellh/go-wordwrap", "version": "v1.0.1", "repo_url": "https://github.com/mitchellh/go-wordwrap.git", "commit": "ecf0936a077a4bd73a1cc2ac5c370f2b55618d62", "subdir": ""}),
+        ({"module": "golang.org/x/sys", "version": "v0.31.0", "repo_url": "https://go.googlesource.com/sys", "commit": "74cfc93a99be6ca6f193856132e6799065b071af", "subdir": ""}),
+        ({"module": "github.com/expr-lang/expr", "version": "v1.17.5", "repo_url": "https://github.com/expr-lang/expr", "commit": "eeb1b8b6259d9a34ad5fb06bdd8cde80841396ac", "subdir": ""}),
+        ({"module": "github.com/cespare/xxhash", "version": "v1.1.0", "repo_url": "https://github.com/cespare/xxhash.git", "commit": "569f7c8abf1f58d9043ab804d364483cb1c853b6", "subdir": ""}),
+        ({"module": "github.com/multiformats/go-multiaddr", "version": "v0.15.0", "repo_url": "https://github.com/multiformats/go-multiaddr", "commit": "30b45fbe13b3a116675a49a799d13d18a9306f60", "subdir": ""}),
+        ({"module": "golang.org/x/time", "version": "v0.12.0", "repo_url": "https://go.googlesource.com/time", "commit": "1616a7fa5fe23b54fee0cc3dd6d0bd48abc19914", "subdir": ""}),
+        ({"module": "github.com/onsi/ginkgo", "version": "v1.16.5", "repo_url": "https://github.com/onsi/ginkgo.git", "commit": "d38b9d946d52cd175495d30143fbecc5aff98f13", "subdir": ""}),
+        ({"module": "go.uber.org/zap", "version": "v1.27.0", "repo_url": "https://github.com/uber-go/zap", "commit": "fcf8ee58669e358bbd6460bef5c2ee7a53c0803a", "subdir": ""}),
+        ({"module": "github.com/containerd/platforms", "version": "v1.0.0-rc.1", "repo_url": "https://github.com/containerd/platforms", "commit": "e3566b8ff1994b8dc88bae5768d32830e0cd0cfd", "subdir": ""}),
+        ({"module": "github.com/minio/highwayhash", "version": "v1.0.3", "repo_url": "https://github.com/minio/highwayhash", "commit": "030a8b332625f1501d534324055b1de810fe9233", "subdir": ""}),
+        ({"module": "github.com/libp2p/go-libp2p-kad-dht", "version": "v0.31.0", "repo_url": "https://github.com/libp2p/go-libp2p-kad-dht", "commit": "0af416971f51f07a60afb16851f030deea29ce2b", "subdir": ""}),
+        ({"module": "github.com/rancher/lasso", "version": "v0.2.3", "repo_url": "https://github.com/rancher/lasso", "commit": "d9be1e6a051ddf344ab23f18d8ec92f8b1ece3ea", "subdir": ""}),
+        ({"module": "github.com/pion/interceptor", "version": "v0.1.37", "repo_url": "https://github.com/pion/interceptor", "commit": "0eab1887cec79081e21457c0f9f89be2537c5df5", "subdir": ""}),
+        ({"module": "k8s.io/kube-openapi", "version": "v0.0.0-20250710124328-f3f2b991d03b", "repo_url": "https://github.com/kubernetes/kube-openapi", "commit": "f3f2b991d03be98072466d6aff0880ad93184b2c", "subdir": ""}),
+        ({"module": "github.com/kr/pretty", "version": "v0.3.1", "repo_url": "https://github.com/kr/pretty", "commit": "3cd153a126da607b78d1762779b1e1054f9889fc", "subdir": ""}),
+        ({"module": "github.com/mattn/go-isatty", "version": "v0.0.20", "repo_url": "https://github.com/mattn/go-isatty", "commit": "a7c02353c47bc4ec6b30dc9628154ae4fe760c11", "subdir": ""}),
+        ({"module": "golang.org/x/oauth2", "version": "v0.30.0", "repo_url": "https://go.googlesource.com/oauth2", "commit": "cf1431934151b3a93e0b3286eb6798ca08ea3770", "subdir": ""}),
+        ({"module": "github.com/k3s-io/etcd/server/v3", "version": "v3.6.4-k3s3", "repo_url": "https://github.com/k3s-io/etcd", "commit": "182208f36cfc0932344aa6e1aca96cfd9a317841", "subdir": ""}),
+        ({"module": "github.com/stretchr/objx", "version": "v0.5.2", "repo_url": "https://github.com/stretchr/objx", "commit": "307d0db21292676ac9d469826525c3630f47f63a", "subdir": ""}),
+        ({"module": "github.com/fsnotify/fsnotify", "version": "v1.9.0", "repo_url": "https://github.com/fsnotify/fsnotify", "commit": "ae0e7923765f64fb8061396db7edebb558cf6093", "subdir": ""}),
+        ({"module": "github.com/robfig/cron/v3", "version": "v3.0.1", "repo_url": "https://github.com/robfig/cron.git", "commit": "ccba498c397bb90a9c84945bbb0f7af2d72b6309", "subdir": ""}),
+        ({"module": "golang.org/x/sync", "version": "v0.16.0", "repo_url": "https://go.googlesource.com/sync", "commit": "7fad2c9213e0821bd78435a9c106806f2fc383f1", "subdir": ""}),
+        ({"module": "github.com/urfave/cli/v2", "version": "v2.27.7", "repo_url": "https://github.com/urfave/cli", "commit": "19b951ab78929023a9a670722b26ffb1d67c733a", "subdir": ""}),
+        ({"module": "github.com/containerd/fuse-overlayfs-snapshotter/v2", "version": "v2.1.6", "repo_url": "https://github.com/containerd/fuse-overlayfs-snapshotter", "commit": "8b4beab359e7d031f06783f60a34f2a9b7297ef5", "subdir": ""}),
+        ({"module": "github.com/spf13/pflag", "version": "v1.0.7", "repo_url": "https://github.com/spf13/pflag", "commit": "f9cbdd9ca94287ab4ef0848e67ecd77cf1361d48", "subdir": ""}),
+        ({"module": "github.com/libp2p/go-netroute", "version": "v0.2.2", "repo_url": "https://github.com/libp2p/go-netroute", "commit": "598d3840947c4d855652ef346bbda169ce71d0e5", "subdir": ""}),
+        ({"module": "github.com/pion/mdns/v2", "version": "v2.0.7", "repo_url": "https://github.com/pion/mdns", "commit": "689cdb9fc66c6202b75bd96f17caf12078aa8c95", "subdir": ""}),
+        ({"module": "github.com/spf13/afero", "version": "v1.14.0", "repo_url": "https://github.com/spf13/afero", "commit": "ea38482beffb2485aed022e0c1ed3b4b561f67b6", "subdir": ""}),
+        ({"module": "github.com/pbnjay/memory", "version": "v0.0.0-20210728143218-7b4eea64cf58", "repo_url": "https://github.com/pbnjay/memory.git", "commit": "7b4eea64cf580186c0eceb10dc94ba3a098af46c", "subdir": ""}),
+        ({"module": "sigs.k8s.io/json", "version": "v0.0.0-20250730193827-2d320260d730", "repo_url": "https://github.com/kubernetes-sigs/json", "commit": "2d320260d730f3842fef7b08d9a807bdbc617824", "subdir": ""}),
+        ({"module": "go.opentelemetry.io/contrib/instrumentation/github.com/emicklei/go-restful/otelrestful", "version": "v0.44.0", "repo_url": "https://github.com/open-telemetry/opentelemetry-go-contrib", "commit": "fdfa6e3abf03caa6a1d3267913e01526d97eab8a", "subdir": "instrumentation/github.com/emicklei/go-restful/otelrestful"}),
+        ({"module": "go.uber.org/automaxprocs", "version": "v1.6.0", "repo_url": "https://github.com/uber-go/automaxprocs", "commit": "1ea14c35ce47a73089b824e504d1c92eeb61a5a6", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kine", "version": "v0.14.0", "repo_url": "https://github.com/k3s-io/kine", "commit": "adbb708512a6be82e7f1beaabc618b95f490d820", "subdir": ""}),
+        ({"module": "github.com/k3s-io/etcd/server/v3", "version": "v3.6.4-k3s3", "repo_url": "https://github.com/k3s-io/etcd", "commit": "182208f36cfc0932344aa6e1aca96cfd9a317841", "subdir": ""}),
+        ({"module": "github.com/Azure/go-ansiterm", "version": "v0.0.0-20250102033503-faa5f7b0171c", "repo_url": "https://github.com/Azure/go-ansiterm", "commit": "faa5f7b0171c46bb398a91b4a0c906324d3664cf", "subdir": ""}),
+        ({"module": "github.com/quic-go/qpack", "version": "v0.5.1", "repo_url": "https://github.com/quic-go/qpack", "commit": "696c8e28d3f57014b5d86790095e7894f9168bc4", "subdir": ""}),
+        ({"module": "github.com/shengdoushi/base58", "version": "v1.0.0", "repo_url": "https://github.com/shengdoushi/base58.git", "commit": "c5f44ca1af76fb63925d5fba8fa7b85870199839", "subdir": ""}),
+        ({"module": "github.com/natefinch/lumberjack", "version": "v2.0.0+incompatible", "repo_url": "https://github.com/natefinch/lumberjack.git", "commit": "7d6a1875575e09256dc552b4c0e450dcd02bd10e", "subdir": ""}),
+        ({"module": "github.com/avast/retry-go/v4", "version": "v4.6.1", "repo_url": "https://github.com/avast/retry-go", "commit": "93932f8b6d01fb56dec3eb0ca7cbaa0e90cbbc25", "subdir": ""}),
+        ({"module": "golang.org/x/term", "version": "v0.34.0", "repo_url": "https://go.googlesource.com/term", "commit": "a35244d18d7756b12deca31a518c0fa1327d050a", "subdir": ""}),
+        ({"module": "github.com/ipfs/go-log", "version": "v1.0.5", "repo_url": "https://github.com/ipfs/go-log.git", "commit": "c39ee80c0915c5cca41dc1311e848c2fd7fa4101", "subdir": ""}),
+        ({"module": "github.com/moby/sys/mountinfo", "version": "v0.7.2", "repo_url": "https://github.com/moby/sys", "commit": "cafbe42351600ca9b363e220722f66d96f6e71f4", "subdir": "mountinfo"}),
+        ({"module": "github.com/kr/text", "version": "v0.2.0", "repo_url": "https://github.com/kr/text.git", "commit": "702c74938df48b97370179f33ce2107bd7ff3b3e", "subdir": ""}),
+        ({"module": "github.com/whyrusleeping/go-keyspace", "version": "v0.0.0-20160322163242-5b898ac5add1", "repo_url": "https://github.com/whyrusleeping/go-keyspace.git", "commit": "5b898ac5add1da7178a4a98e69cb7b9205c085ee", "subdir": ""}),
+        ({"module": "k8s.io/utils", "version": "v0.0.0-20250820121507-0af2bda4dd1d", "repo_url": "https://github.com/kubernetes/utils", "commit": "0af2bda4dd1d4b5b10c2a000f68c34d1e0b83acf", "subdir": ""}),
+        ({"module": "github.com/rancher/wrangler/v3", "version": "v3.2.3", "repo_url": "https://github.com/rancher/wrangler", "commit": "cc0fd777bcfd3be1f98587c2663fbb7f308922d7", "subdir": ""}),
+        ({"module": "go.opentelemetry.io/otel/sdk", "version": "v1.37.0", "repo_url": "https://github.com/open-telemetry/opentelemetry-go", "commit": "69e81088ad40f45a0764597326722dea8f3f00a8", "subdir": "sdk"}),
+        ({"module": "github.com/godbus/dbus/v5", "version": "v5.1.0", "repo_url": "https://github.com/godbus/dbus.git", "commit": "e523abc905595cf17fb0001a7d77eaaddfaa216d", "subdir": ""}),
+        ({"module": "github.com/libp2p/go-buffer-pool", "version": "v0.1.0", "repo_url": "https://github.com/libp2p/go-buffer-pool.git", "commit": "c5070857211a0615ebd7b56588154941af580a4d", "subdir": ""}),
+        ({"module": "github.com/golang-jwt/jwt/v5", "version": "v5.2.2", "repo_url": "https://github.com/golang-jwt/jwt", "commit": "0951d184286dece21f73c85673fd308786ffe9c3", "subdir": ""}),
+        ({"module": "github.com/golang/snappy", "version": "v0.0.4", "repo_url": "https://github.com/golang/snappy.git", "commit": "544b4180ac705b7605231d4a4550a1acb22a19fe", "subdir": ""}),
+        ({"module": "github.com/go-openapi/swag/mangling", "version": "v0.24.0", "repo_url": "https://github.com/go-openapi/swag", "commit": "04b65d3aff180750a2ad252c8b3da549a1c02dfa", "subdir": "mangling"}),
+        ({"module": "github.com/go-openapi/jsonpointer", "version": "v0.22.0", "repo_url": "https://github.com/go-openapi/jsonpointer", "commit": "ea421064bbd1a1dc07bf3cecd02a049066f02146", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/mount-utils", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/mount-utils"}),
+        ({"module": "github.com/k3s-io/klog/v2", "version": "v2.120.1-k3s1", "repo_url": "https://github.com/k3s-io/klog", "commit": "8aec94690700c54117016f97845530e7c75b6aeb", "subdir": ""}),
+        ({"module": "github.com/gofrs/flock", "version": "v0.8.1", "repo_url": "https://github.com/gofrs/flock.git", "commit": "6f010d1acea74a32f2f2066bfe324c08bbee30e3", "subdir": ""}),
+        ({"module": "github.com/inconshreveable/mousetrap", "version": "v1.1.0", "repo_url": "https://github.com/inconshreveable/mousetrap", "commit": "4e8053ee7ef85a6bd26368364a6d27f1641c1d21", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/client-go", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/client-go"}),
+        ({"module": "github.com/smallstep/pkcs7", "version": "v0.1.1", "repo_url": "https://github.com/smallstep/pkcs7", "commit": "21b5bd412d3d388540388c0165151f7e3df92213", "subdir": ""}),
+        ({"module": "github.com/go-openapi/swag/stringutils", "version": "v0.24.0", "repo_url": "https://github.com/go-openapi/swag", "commit": "04b65d3aff180750a2ad252c8b3da549a1c02dfa", "subdir": "stringutils"}),
+        ({"module": "github.com/hashicorp/go-multierror", "version": "v1.1.1", "repo_url": "https://github.com/hashicorp/go-multierror.git", "commit": "9974e9ec57696378079ecc3accd3d6f29401b3a0", "subdir": ""}),
+        ({"module": "github.com/k3s-io/containerd/v2", "version": "v2.1.4-k3s2", "repo_url": "https://github.com/k3s-io/containerd", "commit": "5eca7d3c1473fba001474f1cac8b4c1407950a6f", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/kube-proxy", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/kube-proxy"}),
+        ({"module": "github.com/miekg/dns", "version": "v1.1.63", "repo_url": "https://github.com/miekg/dns", "commit": "97c29ffb8fbdcc2ee5c9bd842f441a18eab0dc90", "subdir": ""}),
+        ({"module": "github.com/AdaLogics/go-fuzz-headers", "version": "v0.0.0-20240806141605-e8a1dd7889d6", "repo_url": "https://github.com/AdaLogics/go-fuzz-headers", "commit": "e8a1dd7889d65b8a6f02175e0d79d7c0557db7f9", "subdir": ""}),
+        ({"module": "sigs.k8s.io/knftables", "version": "v0.0.18", "repo_url": "https://github.com/kubernetes-sigs/knftables", "commit": "007fc6b3ddf2de86708d11af4d4bdaac1c68ea5f", "subdir": ""}),
+        ({"module": "github.com/mikioh/ipaddr", "version": "v0.0.0-20190404000644-d465c8ab6721", "repo_url": "https://github.com/mikioh/ipaddr.git", "commit": "d465c8ab672111787b24b8f03326449059a4aa33", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/apiextensions-apiserver", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/apiextensions-apiserver"}),
+        ({"module": "github.com/prashantv/gostub", "version": "v1.1.0", "repo_url": "https://github.com/prashantv/gostub.git", "commit": "9fc4f583f114a72d2d711ec21d8963c7dfda9a8c", "subdir": ""}),
+        ({"module": "github.com/hashicorp/go-version", "version": "v1.7.0", "repo_url": "https://github.com/hashicorp/go-version", "commit": "fcaa53267960208632e9308c93aa89535526a018", "subdir": ""}),
+        ({"module": "golang.org/x/exp", "version": "v0.0.0-20250717185816-542afb5b7346", "repo_url": "https://go.googlesource.com/exp", "commit": "542afb5b7346d69c3c878cfdd23a583e8524294d", "subdir": ""}),
+        ({"module": "github.com/gorilla/websocket", "version": "v1.5.4-0.20250319132907-e064f32e3674", "repo_url": "https://github.com/gorilla/websocket", "commit": "e064f32e3674d9d79a8fd417b5bc06fa5c6cad8f", "subdir": ""}),
+        ({"module": "github.com/libp2p/go-libp2p-testing", "version": "v0.12.0", "repo_url": "https://github.com/libp2p/go-libp2p-testing", "commit": "aac9ce834b218b0d51ab729256812a1b4ea9164b", "subdir": ""}),
+        ({"module": "github.com/kylelemons/godebug", "version": "v1.1.0", "repo_url": "https://github.com/kylelemons/godebug.git", "commit": "9ff306d4fbead574800b66369df5b6144732d58e", "subdir": ""}),
+        ({"module": "github.com/syndtr/gocapability", "version": "v0.0.0-20200815063812-42c35b437635", "repo_url": "https://github.com/syndtr/gocapability.git", "commit": "42c35b4376354fd554efc7ad35e0b7f94e3a0ffb", "subdir": ""}),
+        ({"module": "github.com/nats-io/nuid", "version": "v1.0.1", "repo_url": "https://github.com/nats-io/nuid.git", "commit": "4b96681fa6d28dd0ab5fe79bac63b3a493d9ee94", "subdir": ""}),
+        ({"module": "github.com/mitchellh/go-homedir", "version": "v1.1.0", "repo_url": "https://github.com/mitchellh/go-homedir.git", "commit": "af06845cf3004701891bf4fdb884bfe4920b3727", "subdir": ""}),
+        ({"module": "github.com/miekg/pkcs11", "version": "v1.1.1", "repo_url": "https://github.com/miekg/pkcs11.git", "commit": "f3481918a208bd212aa995a41f92d786eb418a7d", "subdir": ""}),
+        ({"module": "github.com/multiformats/go-multistream", "version": "v0.6.0", "repo_url": "https://github.com/multiformats/go-multistream", "commit": "6275fc7b9cee338515acd5a48db506e4666bfc7a", "subdir": ""}),
+        ({"module": "github.com/jackc/pgx/v5", "version": "v5.7.5", "repo_url": "https://github.com/jackc/pgx", "commit": "15bca4a4e14e0049777c1245dba4c16300fe4fd0", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/kube-controller-manager", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/kube-controller-manager"}),
+        ({"module": "github.com/ipfs/go-cid", "version": "v0.5.0", "repo_url": "https://github.com/ipfs/go-cid", "commit": "5cddba5d532ac5adeec87f5542c057e1dbfbce9b", "subdir": ""}),
+        ({"module": "github.com/go-openapi/jsonreference", "version": "v0.21.1", "repo_url": "https://github.com/go-openapi/jsonreference", "commit": "6973d2f8636af9d72c2d4b37d6779cf3699afe8d", "subdir": ""}),
+        ({"module": "github.com/gregjones/httpcache", "version": "v0.0.0-20190611155906-901d90724c79", "repo_url": "https://github.com/gregjones/httpcache.git", "commit": "901d90724c7919163f472a9812253fb26761123d", "subdir": ""}),
+        ({"module": "github.com/mxk/go-flowrate", "version": "v0.0.0-20140419014527-cca7078d478f", "repo_url": "https://github.com/mxk/go-flowrate.git", "commit": "cca7078d478f8520f85629ad7c68962d31ed7682", "subdir": ""}),
+        ({"module": "google.golang.org/protobuf", "version": "v1.36.8", "repo_url": "https://go.googlesource.com/protobuf", "commit": "0833cf304e6344e895e819f769afa28107fe8892", "subdir": ""}),
+        ({"module": "github.com/go-task/slim-sprig/v3", "version": "v3.0.0", "repo_url": "https://github.com/go-task/slim-sprig", "commit": "b05cce61fffa5c6dea6ac8b9a1f12b6e3fb7c894", "subdir": ""}),
+        ({"module": "github.com/jackc/pgservicefile", "version": "v0.0.0-20240606120523-5a60cdf6a761", "repo_url": "https://github.com/jackc/pgservicefile", "commit": "5a60cdf6a76120dc3d5152b95f3b5fd8aa7cc9eb", "subdir": ""}),
+        ({"module": "github.com/mistifyio/go-zfs/v3", "version": "v3.0.1", "repo_url": "https://github.com/mistifyio/go-zfs", "commit": "f6d5c373cf63ae2477370aa9bda9fa49804c2d72", "subdir": ""}),
+        ({"module": "github.com/jackc/pgerrcode", "version": "v0.0.0-20240316143900-6e2875d9b438", "repo_url": "https://github.com/jackc/pgerrcode", "commit": "6e2875d9b438d43808cc033afe2d978db3b9c9e7", "subdir": ""}),
+        ({"module": "github.com/containerd/btrfs/v2", "version": "v2.0.0", "repo_url": "https://github.com/containerd/btrfs", "commit": "f611cf12b33f43269574b2ad82bcb55e4d6f9982", "subdir": ""}),
+        ({"module": "github.com/containerd/stargz-snapshotter/estargz", "version": "v0.17.0", "repo_url": "https://github.com/containerd/stargz-snapshotter", "commit": "6f6aacb044960a0820a2d2954f5cbcc40b17fbdb", "subdir": "estargz"}),
+        ({"module": "github.com/cespare/xxhash/v2", "version": "v2.3.0", "repo_url": "https://github.com/cespare/xxhash", "commit": "998dce232f17418a7a5721ecf87ca714025a3243", "subdir": ""}),
+        ({"module": "github.com/container-storage-interface/spec", "version": "v1.9.0", "repo_url": "https://github.com/container-storage-interface/spec", "commit": "80d53107c70981b9da8aaf9cd1c90249562b22f0", "subdir": ""}),
+        ({"module": "github.com/Microsoft/hcsshim", "version": "v0.12.9", "repo_url": "https://github.com/Microsoft/hcsshim", "commit": "7392335b540ccd5edc26ca1e0dce0da393c17eff", "subdir": ""}),
+        ({"module": "github.com/moby/sys/sequential", "version": "v0.6.0", "repo_url": "https://github.com/moby/sys", "commit": "cafbe42351600ca9b363e220722f66d96f6e71f4", "subdir": "sequential"}),
+        ({"module": "github.com/containerd/typeurl/v2", "version": "v2.2.3", "repo_url": "https://github.com/containerd/typeurl", "commit": "5b047adad57d172afa9654c019fe65bf0540cc4d", "subdir": ""}),
+        ({"module": "github.com/go-openapi/swag/loading", "version": "v0.24.0", "repo_url": "https://github.com/go-openapi/swag", "commit": "04b65d3aff180750a2ad252c8b3da549a1c02dfa", "subdir": "loading"}),
+        ({"module": "github.com/k3s-io/spegel", "version": "v0.2.0-k3s1", "repo_url": "https://github.com/k3s-io/spegel", "commit": "17350c5f87a2968040cb71ff21028735be7b3007", "subdir": ""}),
+        ({"module": "github.com/blang/semver", "version": "v3.5.1+incompatible", "repo_url": "https://github.com/blang/semver.git", "commit": "2ee87856327ba09384cabd113bc6b5d174e9ec0f", "subdir": ""}),
+        ({"module": "github.com/euank/go-kmsg-parser", "version": "v2.0.0+incompatible", "repo_url": "https://github.com/euank/go-kmsg-parser.git", "commit": "5ba4d492e455a77d25dcf0d2c4acc9f2afebef4e", "subdir": ""}),
+        ({"module": "github.com/k3s-io/cri-dockerd", "version": "v0.3.19-k3s3", "repo_url": "https://github.com/k3s-io/cri-dockerd", "commit": "dab06f1f70e915cbf03c8108cb5627bd46a9ef02", "subdir": ""}),
+        ({"module": "github.com/libp2p/go-msgio", "version": "v0.3.0", "repo_url": "https://github.com/libp2p/go-msgio", "commit": "12f8f7a72c7dbbb246151e4c98b5a6d59e27e0c6", "subdir": ""}),
+        ({"module": "github.com/go-logr/logr", "version": "v1.4.3", "repo_url": "https://github.com/go-logr/logr", "commit": "38a1c47ef633fa6b2eee6b8f2e1371ba8626e557", "subdir": ""}),
+        ({"module": "github.com/pion/datachannel", "version": "v1.5.10", "repo_url": "https://github.com/pion/datachannel", "commit": "687754f965a2cda0420848905505ec11bedc25b6", "subdir": ""}),
+        ({"module": "github.com/ipfs/go-detect-race", "version": "v0.0.1", "repo_url": "https://github.com/ipfs/go-detect-race.git", "commit": "52daa73989bc95b2fa97d6c610adf62d04eb7822", "subdir": ""}),
+        ({"module": "github.com/multiformats/go-multibase", "version": "v0.2.0", "repo_url": "https://github.com/multiformats/go-multibase", "commit": "58a41f7df1d82d16599e259325b3337d69f70e3b", "subdir": ""}),
+        ({"module": "github.com/frankban/quicktest", "version": "v1.14.6", "repo_url": "https://github.com/frankban/quicktest", "commit": "7c937a98c92dfcaffbb7feee5f64965f6aece031", "subdir": ""}),
+        ({"module": "github.com/pelletier/go-toml/v2", "version": "v2.2.4", "repo_url": "https://github.com/pelletier/go-toml", "commit": "ee07c9203b72060f12e31c04ace80e8a187d5a67", "subdir": ""}),
+        ({"module": "github.com/modern-go/concurrent", "version": "v0.0.0-20180306012644-bacd9c7ef1dd", "repo_url": "https://github.com/modern-go/concurrent.git", "commit": "bacd9c7ef1dd9b15be4a9909b8ac7a4e313eec94", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/component-base", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/component-base"}),
+        ({"module": "github.com/containerd/otelttrpc", "version": "v0.1.0", "repo_url": "https://github.com/containerd/otelttrpc", "commit": "fa91cafe17adf59a0edc10650135dfd1dfb761c2", "subdir": ""}),
+        ({"module": "github.com/multiformats/go-base32", "version": "v0.1.0", "repo_url": "https://github.com/multiformats/go-base32", "commit": "a16b66327f327428b32b919939b8c93482507e1f", "subdir": ""}),
+        ({"module": "github.com/sasha-s/go-deadlock", "version": "v0.3.5", "repo_url": "https://github.com/sasha-s/go-deadlock", "commit": "464d34347a399b840a4f963cc96dfc993ccf8c62", "subdir": ""}),
+        ({"module": "github.com/golang/groupcache", "version": "v0.0.0-20241129210726-2c02b8208cf8", "repo_url": "https://github.com/golang/groupcache", "commit": "2c02b8208cf8c02a3e358cb1d9b60950647543fc", "subdir": ""}),
+        ({"module": "github.com/distribution/reference", "version": "v0.6.0", "repo_url": "https://github.com/distribution/reference", "commit": "ff14fafe2236e51c2894ac07d4bdfc778e96d682", "subdir": ""}),
+        ({"module": "github.com/containerd/plugin", "version": "v1.0.0", "repo_url": "https://github.com/containerd/plugin", "commit": "19cedbf730bb9ae1c106c4d4df8492bb3d3fb8fd", "subdir": ""}),
+        ({"module": "github.com/go-sql-driver/mysql", "version": "v1.9.3", "repo_url": "https://github.com/go-sql-driver/mysql", "commit": "62984ada4402df6571557bc3fed2bcbde48ec908", "subdir": ""}),
+        ({"module": "github.com/go-openapi/swag/conv", "version": "v0.24.0", "repo_url": "https://github.com/go-openapi/swag", "commit": "04b65d3aff180750a2ad252c8b3da549a1c02dfa", "subdir": "conv"}),
+        ({"module": "sigs.k8s.io/randfill", "version": "v1.0.0", "repo_url": "https://github.com/kubernetes-sigs/randfill", "commit": "1b6128de8ceabf6d20c4d81d770bf439c1494960", "subdir": ""}),
+        ({"module": "github.com/rancher/wharfie", "version": "v0.7.0", "repo_url": "https://github.com/rancher/wharfie", "commit": "532348fc570e63bb96d25d33f48f18d2b48ec8bd", "subdir": ""}),
+        ({"module": "github.com/pion/transport/v3", "version": "v3.0.7", "repo_url": "https://github.com/pion/transport", "commit": "5d0649ff1ab47d750626ed3c240a2e65b5aa9376", "subdir": ""}),
+        ({"module": "github.com/elastic/gosigar", "version": "v0.14.3", "repo_url": "https://github.com/elastic/gosigar", "commit": "a1c62e5557684c3b690284ec229176b842c0bf6b", "subdir": ""}),
+        ({"module": "github.com/ipfs/go-block-format", "version": "v0.2.0", "repo_url": "https://github.com/ipfs/go-block-format", "commit": "f2d9400e8a49f4ae64a2e4e66834dbc7453be478", "subdir": ""}),
+        ({"module": "github.com/containerd/ttrpc", "version": "v1.2.7", "repo_url": "https://github.com/containerd/ttrpc", "commit": "3b8c8b75577584e412043afb7b561193a4a47d2e", "subdir": ""}),
+        ({"module": "github.com/klauspost/cpuid/v2", "version": "v2.2.10", "repo_url": "https://github.com/klauspost/cpuid", "commit": "22ab8b9e7d0bace6b004331e4541a0779db894df", "subdir": ""}),
+        ({"module": "github.com/flynn/noise", "version": "v1.1.0", "repo_url": "https://github.com/flynn/noise", "commit": "4d9f71cd4ba1fe81415efac312664ccc4bc79b46", "subdir": ""}),
+        ({"module": "github.com/stretchr/testify", "version": "v1.11.1", "repo_url": "https://github.com/stretchr/testify", "commit": "2a57335dc9cd6833daa820bc94d9b40c26a7917d", "subdir": ""}),
+        ({"module": "github.com/Microsoft/hnslib", "version": "v0.1.1", "repo_url": "https://github.com/Microsoft/hnslib", "commit": "e9f96c28f48e99445cc26600ec444979640d42fd", "subdir": ""}),
+        ({"module": "github.com/cockroachdb/datadriven", "version": "v1.0.2", "repo_url": "https://github.com/cockroachdb/datadriven", "commit": "26b70ec25f5935afbf28f0fa1ffea6b385636e27", "subdir": ""}),
+        ({"module": "github.com/pion/dtls/v2", "version": "v2.2.12", "repo_url": "https://github.com/pion/dtls", "commit": "48e76cc261c359aa3f14e32471d43993202faf29", "subdir": ""}),
+        ({"module": "github.com/pion/webrtc/v4", "version": "v4.0.10", "repo_url": "https://github.com/pion/webrtc", "commit": "70f0211065c83e75b9ce69dba554aa61b13988ec", "subdir": ""}),
+        ({"module": "github.com/ipld/go-ipld-prime", "version": "v0.21.0", "repo_url": "https://github.com/ipld/go-ipld-prime", "commit": "b6717c4b2f7fbbb4a7fa2d328c757abebe005fef", "subdir": ""}),
+        ({"module": "github.com/pion/sdp/v3", "version": "v3.0.10", "repo_url": "https://github.com/pion/sdp", "commit": "edabe23cdd7c2b7f27826e15b23be6be84df5659", "subdir": ""}),
+        ({"module": "go.yaml.in/yaml/v3", "version": "v3.0.4", "repo_url": "https://github.com/yaml/go-yaml", "commit": "c3552c15f996075a7634df5159d9161c67bf3d76", "subdir": "", "alias_of": "gopkg.in/yaml.v3"}),
+        ({"module": "github.com/mohae/deepcopy", "version": "v0.0.0-20170929034955-c48cc78d4826", "repo_url": "https://github.com/mohae/deepcopy.git", "commit": "c48cc78d482608239f6c4c92a4abd87eb8761c90", "subdir": ""}),
+        ({"module": "github.com/liggitt/tabwriter", "version": "v0.0.0-20181228230101-89fcab3d43de", "repo_url": "https://github.com/liggitt/tabwriter.git", "commit": "89fcab3d43de07060e4fd4c1547430ed57e87f24", "subdir": ""}),
+        ({"module": "github.com/go-errors/errors", "version": "v1.4.2", "repo_url": "https://github.com/go-errors/errors.git", "commit": "33d496f939bc762321a636d4035e15c302eb0b00", "subdir": ""}),
+        ({"module": "github.com/moby/spdystream", "version": "v0.5.0", "repo_url": "https://github.com/moby/spdystream", "commit": "77eb080123d208697674a07b74ceaf94c98bee8b", "subdir": ""}),
+        ({"module": "go.opentelemetry.io/otel/metric", "version": "v1.37.0", "repo_url": "https://github.com/open-telemetry/opentelemetry-go", "commit": "69e81088ad40f45a0764597326722dea8f3f00a8", "subdir": "metric"}),
+        ({"module": "github.com/beorn7/perks", "version": "v1.0.1", "repo_url": "https://github.com/beorn7/perks.git", "commit": "37c8de3658fcb183f997c4e13e8337516ab753e6", "subdir": ""}),
+        ({"module": "github.com/k3s-io/cri-dockerd", "version": "v0.3.19-k3s3", "repo_url": "https://github.com/k3s-io/cri-dockerd", "commit": "dab06f1f70e915cbf03c8108cb5627bd46a9ef02", "subdir": "", "replaced_paths": ["github.com/Mirantis/cri-dockerd"]}),
+        ({"module": "github.com/k3s-io/kube-router/v2", "version": "v2.5.0", "repo_url": "https://github.com/k3s-io/kube-router", "commit": "70545914453cec949ba7e0ab1f84d07f2e080073", "subdir": "", "replaced_paths": ["github.com/cloudnativelabs/kube-router/v2"]}),
+        ({"module": "github.com/k3s-io/containerd/v2", "version": "v2.1.4-k3s2", "repo_url": "https://github.com/k3s-io/containerd", "commit": "5eca7d3c1473fba001474f1cac8b4c1407950a6f", "subdir": "", "replaced_paths": ["github.com/containerd/containerd/v2"]}),
+        ({"module": "github.com/k3s-io/stargz-snapshotter", "version": "v0.17.0-k3s1", "repo_url": "https://github.com/k3s-io/stargz-snapshotter", "commit": "f908e753e01dd906fee13b005bad431f0b2448a7", "subdir": "", "replaced_paths": ["github.com/containerd/stargz-snapshotter"]}),
+        ({"module": "github.com/k3s-io/cadvisor", "version": "v0.52.1", "repo_url": "https://github.com/k3s-io/cadvisor", "commit": "0b675defd46277198f7c15c1053301421a4b733e", "subdir": "", "replaced_paths": ["github.com/google/cadvisor"]}),
+        ({"module": "github.com/k3s-io/spegel", "version": "v0.2.0-k3s1", "repo_url": "https://github.com/k3s-io/spegel", "commit": "17350c5f87a2968040cb71ff21028735be7b3007", "subdir": "", "replaced_paths": ["github.com/spegel-org/spegel"]}),
+        ({"module": "github.com/k3s-io/etcd/server/v3", "version": "v3.6.4-k3s3", "repo_url": "https://github.com/k3s-io/etcd", "commit": "182208f36cfc0932344aa6e1aca96cfd9a317841", "subdir": "", "replaced_paths": ["go.etcd.io/etcd/api/v3"]}),
+        ({"module": "github.com/k3s-io/etcd/server/v3", "version": "v3.6.4-k3s3", "repo_url": "https://github.com/k3s-io/etcd", "commit": "182208f36cfc0932344aa6e1aca96cfd9a317841", "subdir": "", "replaced_paths": ["go.etcd.io/etcd/client/pkg/v3"]}),
+        ({"module": "github.com/k3s-io/etcd/server/v3", "version": "v3.6.4-k3s3", "repo_url": "https://github.com/k3s-io/etcd", "commit": "182208f36cfc0932344aa6e1aca96cfd9a317841", "subdir": "", "replaced_paths": ["go.etcd.io/etcd/client/v3"]}),
+        ({"module": "github.com/k3s-io/etcd/server/v3", "version": "v3.6.4-k3s3", "repo_url": "https://github.com/k3s-io/etcd", "commit": "182208f36cfc0932344aa6e1aca96cfd9a317841", "subdir": "", "replaced_paths": ["go.etcd.io/etcd/etcdutl/v3"]}),
+        ({"module": "github.com/k3s-io/etcd/server/v3", "version": "v3.6.4-k3s3", "repo_url": "https://github.com/k3s-io/etcd", "commit": "182208f36cfc0932344aa6e1aca96cfd9a317841", "subdir": "", "replaced_paths": ["go.etcd.io/etcd/pkg/v3"]}),
+        ({"module": "github.com/k3s-io/etcd/server/v3", "version": "v3.6.4-k3s3", "repo_url": "https://github.com/k3s-io/etcd", "commit": "182208f36cfc0932344aa6e1aca96cfd9a317841", "subdir": "", "replaced_paths": ["go.etcd.io/etcd/server/v3"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/api", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/api", "replaced_paths": ["k8s.io/api"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/apiextensions-apiserver", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/apiextensions-apiserver", "replaced_paths": ["k8s.io/apiextensions-apiserver"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/apimachinery", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/apimachinery", "replaced_paths": ["k8s.io/apimachinery"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/apiserver", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/apiserver", "replaced_paths": ["k8s.io/apiserver"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/cli-runtime", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/cli-runtime", "replaced_paths": ["k8s.io/cli-runtime"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/client-go", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/client-go", "replaced_paths": ["k8s.io/client-go"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/cloud-provider", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/cloud-provider", "replaced_paths": ["k8s.io/cloud-provider"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/cluster-bootstrap", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/cluster-bootstrap", "replaced_paths": ["k8s.io/cluster-bootstrap"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/code-generator", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/code-generator", "replaced_paths": ["k8s.io/code-generator"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/component-base", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/component-base", "replaced_paths": ["k8s.io/component-base"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/component-helpers", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/component-helpers", "replaced_paths": ["k8s.io/component-helpers"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/controller-manager", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/controller-manager", "replaced_paths": ["k8s.io/controller-manager"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/cri-api", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/cri-api", "replaced_paths": ["k8s.io/cri-api"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/csi-translation-lib", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/csi-translation-lib", "replaced_paths": ["k8s.io/csi-translation-lib"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/dynamic-resource-allocation", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/dynamic-resource-allocation", "replaced_paths": ["k8s.io/dynamic-resource-allocation"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/endpointslice", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/endpointslice", "replaced_paths": ["k8s.io/endpointslice"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/externaljwt", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/externaljwt", "replaced_paths": ["k8s.io/externaljwt"]}),
+        ({"module": "github.com/k3s-io/klog", "version": "v1.0.0-k3s2", "repo_url": "https://github.com/k3s-io/klog.git", "commit": "e94f416e9301d90f5c8d6043c999ea179bd9b455", "subdir": "", "replaced_paths": ["k8s.io/klog"]}),
+        ({"module": "github.com/k3s-io/klog/v2", "version": "v2.120.1-k3s1", "repo_url": "https://github.com/k3s-io/klog", "commit": "8aec94690700c54117016f97845530e7c75b6aeb", "subdir": "", "replaced_paths": ["k8s.io/klog/v2"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/kms", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/kms", "replaced_paths": ["k8s.io/kms"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/kube-aggregator", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/kube-aggregator", "replaced_paths": ["k8s.io/kube-aggregator"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/kube-controller-manager", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/kube-controller-manager", "replaced_paths": ["k8s.io/kube-controller-manager"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/kube-proxy", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/kube-proxy", "replaced_paths": ["k8s.io/kube-proxy"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/kube-scheduler", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/kube-scheduler", "replaced_paths": ["k8s.io/kube-scheduler"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/kubectl", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/kubectl", "replaced_paths": ["k8s.io/kubectl"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/kubelet", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/kubelet", "replaced_paths": ["k8s.io/kubelet"]}),
+        ({"module": "github.com/k3s-io/kubernetes", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "", "replaced_paths": ["k8s.io/kubernetes"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/metrics", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/metrics", "replaced_paths": ["k8s.io/metrics"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/mount-utils", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/mount-utils", "replaced_paths": ["k8s.io/mount-utils"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/pod-security-admission", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/pod-security-admission", "replaced_paths": ["k8s.io/pod-security-admission"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/sample-apiserver", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/sample-apiserver", "replaced_paths": ["k8s.io/sample-apiserver"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/sample-cli-plugin", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/sample-cli-plugin", "replaced_paths": ["k8s.io/sample-cli-plugin"]}),
+        ({"module": "github.com/k3s-io/kubernetes/staging/src/k8s.io/sample-controller", "version": "v1.34.1-k3s1", "repo_url": "https://github.com/k3s-io/kubernetes", "commit": "60d88720366a4d886c37933d148e07697c40de75", "subdir": "staging/src/k8s.io/sample-controller", "replaced_paths": ["k8s.io/sample-controller"]}),
+        ({"module": "github.com/k3s-io/cri-tools", "version": "v1.34.0-k3s2", "repo_url": "https://github.com/k3s-io/cri-tools", "commit": "524e6a42ddbb56bd3cba6997202fca8a9b16f541", "subdir": "", "replaced_paths": ["sigs.k8s.io/cri-tools"]}),
+        ({"module": "github.com/sourcegraph/go-diff", "version": "v0.6.0", "repo_url": "https://github.com/sourcegraph/go-diff.git", "commit": "96789e3401eadc2247f02d416dc90be9ccd98962", "subdir": "", "replaced_paths": ["sourcegraph.com/sourcegraph/go-diff"]}),
+        ({"module": "github.com/k3s-io/etcd", "version": "v3.6.4-k3s3", "repo_url": "https://github.com/k3s-io/etcd.git", "commit": "182208f36cfc0932344aa6e1aca96cfd9a317841", "subdir": ""}),
+        ({"module": "github.com/k3s-io/containerd", "version": "v2.1.4-k3s2", "repo_url": "https://github.com/k3s-io/containerd.git", "commit": "5eca7d3c1473fba001474f1cac8b4c1407950a6f", "subdir": ""}),
+        ({"module": "github.com/k3s-io/kube-router", "version": "v2.5.0", "repo_url": "https://github.com/k3s-io/kube-router.git", "commit": "70545914453cec949ba7e0ab1f84d07f2e080073", "subdir": ""}),
+        ({"module": "github.com/containerd/containerd", "version": "v1.9.0", "repo_url": "https://github.com/containerd/containerd.git", "commit": "a7e49900aa74c23f294fe050f88f2bbfcdaadd2a", "subdir": ""}),
+        ({"module": "github.com/containerd/stargz-snapshotter", "version": "v0.17.0", "repo_url": "https://github.com/containerd/stargz-snapshotter", "commit": "6f6aacb044960a0820a2d2954f5cbcc40b17fbdb", "subdir": ""}),
+        ({"module": "github.com/decred/dcrd", "version": "v1.1.0", "repo_url": "https://github.com/decred/dcrd.git", "commit": "1500e972e2b0f0a687bc83308c868708ca5f7c16", "subdir": ""}),
+        ({"module": "github.com/decred/dcrd", "version": "v4.4.0", "repo_url": "https://github.com/decred/dcrd.git", "commit": "455e90adfdd6d2f5063eb865763ce05aabb5adff", "subdir": ""}),
+        ({"module": "github.com/grpc-ecosystem/go-grpc-middleware", "version": "v1.0.1", "repo_url": "https://github.com/grpc-ecosystem/go-grpc-middleware.git", "commit": "2dc9821e1ff0d0b1cf2c76f7c86118de6b05a832", "subdir": ""}),
+        ({"module": "github.com/moby/sys", "version": "v0.1.0", "repo_url": "https://github.com/moby/sys.git", "commit": "9dc3a90b82699c54554635f76a6a49757e02c523", "subdir": ""}),
+        ({"module": "github.com/moby/sys", "version": "v0.3.0", "repo_url": "https://github.com/moby/sys.git", "commit": "9dc3a90b82699c54554635f76a6a49757e02c523", "subdir": ""}),
+        ({"module": "github.com/moby/sys", "version": "v0.4.0", "repo_url": "https://github.com/moby/sys.git", "commit": "9dc3a90b82699c54554635f76a6a49757e02c523", "subdir": ""}),
+        ({"module": "github.com/moby/sys", "version": "v0.6.0", "repo_url": "https://github.com/moby/sys.git", "commit": "9dc3a90b82699c54554635f76a6a49757e02c523", "subdir": ""}),
+        ({"module": "github.com/moby/sys", "version": "v0.7.1", "repo_url": "https://github.com/moby/sys.git", "commit": "9dc3a90b82699c54554635f76a6a49757e02c523", "subdir": ""}),
+        ({"module": "github.com/moby/sys", "version": "v0.7.2", "repo_url": "https://github.com/moby/sys.git", "commit": "9dc3a90b82699c54554635f76a6a49757e02c523", "subdir": ""})
+
     ]
+
+    # Version requirements from go.sum (for post-processing)
+    go_sum_requirements = {
+        "cel.dev/expr": {"v0.15.0/go.mod", "v0.16.0/go.mod", "v0.19.0/go.mod", "v0.20.0/go.mod", "v0.24.0", "v0.24.0/go.mod"},
+        "cloud.google.com/go": {"v0.100.2/go.mod", "v0.102.0/go.mod", "v0.102.1/go.mod", "v0.104.0/go.mod", "v0.105.0/go.mod", "v0.107.0/go.mod", "v0.110.0/go.mod", "v0.31.0/go.mod", "v0.34.0/go.mod", "v0.37.0/go.mod", "v0.38.0/go.mod", "v0.44.1/go.mod", "v0.44.2/go.mod", "v0.44.3/go.mod", "v0.45.1/go.mod", "v0.46.3/go.mod", "v0.50.0/go.mod", "v0.52.0/go.mod", "v0.53.0/go.mod", "v0.54.0/go.mod", "v0.56.0/go.mod", "v0.57.0/go.mod", "v0.62.0/go.mod", "v0.65.0/go.mod", "v0.72.0/go.mod", "v0.74.0/go.mod", "v0.75.0/go.mod", "v0.78.0/go.mod", "v0.79.0/go.mod", "v0.81.0/go.mod", "v0.83.0/go.mod", "v0.84.0/go.mod", "v0.87.0/go.mod", "v0.90.0/go.mod", "v0.93.3/go.mod", "v0.94.1/go.mod", "v0.97.0/go.mod", "v0.99.0/go.mod"},
+        "cloud.google.com/go/accessapproval": {"v1.6.0/go.mod"},
+        "cloud.google.com/go/accesscontextmanager": {"v1.7.0/go.mod"},
+        "cloud.google.com/go/aiplatform": {"v1.37.0/go.mod"},
+        "cloud.google.com/go/analytics": {"v0.19.0/go.mod"},
+        "cloud.google.com/go/apigateway": {"v1.5.0/go.mod"},
+        "cloud.google.com/go/apigeeconnect": {"v1.5.0/go.mod"},
+        "cloud.google.com/go/apigeeregistry": {"v0.6.0/go.mod"},
+        "cloud.google.com/go/appengine": {"v1.7.1/go.mod"},
+        "cloud.google.com/go/area120": {"v0.7.1/go.mod"},
+        "cloud.google.com/go/artifactregistry": {"v1.13.0/go.mod"},
+        "cloud.google.com/go/asset": {"v1.13.0/go.mod"},
+        "cloud.google.com/go/assuredworkloads": {"v1.10.0/go.mod"},
+        "cloud.google.com/go/automl": {"v1.12.0/go.mod"},
+        "cloud.google.com/go/baremetalsolution": {"v0.5.0/go.mod"},
+        "cloud.google.com/go/batch": {"v0.7.0/go.mod"},
+        "cloud.google.com/go/beyondcorp": {"v0.5.0/go.mod"},
+        "cloud.google.com/go/bigquery": {"v1.0.1/go.mod", "v1.3.0/go.mod", "v1.4.0/go.mod", "v1.5.0/go.mod", "v1.50.0/go.mod", "v1.7.0/go.mod", "v1.8.0/go.mod"},
+        "cloud.google.com/go/billing": {"v1.13.0/go.mod"},
+        "cloud.google.com/go/binaryauthorization": {"v1.5.0/go.mod"},
+        "cloud.google.com/go/certificatemanager": {"v1.6.0/go.mod"},
+        "cloud.google.com/go/channel": {"v1.12.0/go.mod"},
+        "cloud.google.com/go/cloudbuild": {"v1.9.0/go.mod"},
+        "cloud.google.com/go/clouddms": {"v1.5.0/go.mod"},
+        "cloud.google.com/go/cloudtasks": {"v1.10.0/go.mod"},
+        "cloud.google.com/go/compute": {"v0.1.0/go.mod", "v1.10.0/go.mod", "v1.12.0/go.mod", "v1.12.1/go.mod", "v1.13.0/go.mod", "v1.14.0/go.mod", "v1.15.1/go.mod", "v1.18.0/go.mod", "v1.19.0/go.mod", "v1.19.3/go.mod", "v1.3.0/go.mod", "v1.5.0/go.mod", "v1.6.0/go.mod", "v1.6.1/go.mod", "v1.7.0/go.mod"},
+        "cloud.google.com/go/compute/metadata": {"v0.1.0/go.mod", "v0.2.0/go.mod", "v0.2.1/go.mod", "v0.2.3/go.mod", "v0.3.0/go.mod", "v0.5.2/go.mod", "v0.6.0/go.mod"},
+        "cloud.google.com/go/contactcenterinsights": {"v1.6.0/go.mod"},
+        "cloud.google.com/go/container": {"v1.15.0/go.mod"},
+        "cloud.google.com/go/containeranalysis": {"v0.9.0/go.mod"},
+        "cloud.google.com/go/datacatalog": {"v1.13.0/go.mod"},
+        "cloud.google.com/go/dataflow": {"v0.8.0/go.mod"},
+        "cloud.google.com/go/dataform": {"v0.7.0/go.mod"},
+        "cloud.google.com/go/datafusion": {"v1.6.0/go.mod"},
+        "cloud.google.com/go/datalabeling": {"v0.7.0/go.mod"},
+        "cloud.google.com/go/dataplex": {"v1.6.0/go.mod"},
+        "cloud.google.com/go/dataproc": {"v1.12.0/go.mod"},
+        "cloud.google.com/go/dataqna": {"v0.7.0/go.mod"},
+        "cloud.google.com/go/datastore": {"v1.0.0/go.mod", "v1.1.0/go.mod", "v1.11.0/go.mod"},
+        "cloud.google.com/go/datastream": {"v1.7.0/go.mod"},
+        "cloud.google.com/go/deploy": {"v1.8.0/go.mod"},
+        "cloud.google.com/go/dialogflow": {"v1.32.0/go.mod"},
+        "cloud.google.com/go/dlp": {"v1.9.0/go.mod"},
+        "cloud.google.com/go/documentai": {"v1.18.0/go.mod"},
+        "cloud.google.com/go/domains": {"v0.8.0/go.mod"},
+        "cloud.google.com/go/edgecontainer": {"v1.0.0/go.mod"},
+        "cloud.google.com/go/errorreporting": {"v0.3.0/go.mod"},
+        "cloud.google.com/go/essentialcontacts": {"v1.5.0/go.mod"},
+        "cloud.google.com/go/eventarc": {"v1.11.0/go.mod"},
+        "cloud.google.com/go/filestore": {"v1.6.0/go.mod"},
+        "cloud.google.com/go/firestore": {"v1.9.0/go.mod"},
+        "cloud.google.com/go/functions": {"v1.13.0/go.mod"},
+        "cloud.google.com/go/gaming": {"v1.9.0/go.mod"},
+        "cloud.google.com/go/gkebackup": {"v0.4.0/go.mod"},
+        "cloud.google.com/go/gkeconnect": {"v0.7.0/go.mod"},
+        "cloud.google.com/go/gkehub": {"v0.12.0/go.mod"},
+        "cloud.google.com/go/gkemulticloud": {"v0.5.0/go.mod"},
+        "cloud.google.com/go/grafeas": {"v0.2.0/go.mod"},
+        "cloud.google.com/go/gsuiteaddons": {"v1.5.0/go.mod"},
+        "cloud.google.com/go/iam": {"v0.11.0/go.mod", "v0.12.0/go.mod", "v0.13.0/go.mod", "v0.3.0/go.mod", "v0.6.0/go.mod", "v0.7.0/go.mod", "v0.8.0/go.mod"},
+        "cloud.google.com/go/iap": {"v1.7.1/go.mod"},
+        "cloud.google.com/go/ids": {"v1.3.0/go.mod"},
+        "cloud.google.com/go/iot": {"v1.6.0/go.mod"},
+        "cloud.google.com/go/kms": {"v1.10.1/go.mod", "v1.6.0/go.mod", "v1.9.0/go.mod"},
+        "cloud.google.com/go/language": {"v1.9.0/go.mod"},
+        "cloud.google.com/go/lifesciences": {"v0.8.0/go.mod"},
+        "cloud.google.com/go/logging": {"v1.7.0/go.mod"},
+        "cloud.google.com/go/longrunning": {"v0.1.1/go.mod", "v0.3.0/go.mod", "v0.4.1/go.mod"},
+        "cloud.google.com/go/managedidentities": {"v1.5.0/go.mod"},
+        "cloud.google.com/go/maps": {"v0.7.0/go.mod"},
+        "cloud.google.com/go/mediatranslation": {"v0.7.0/go.mod"},
+        "cloud.google.com/go/memcache": {"v1.9.0/go.mod"},
+        "cloud.google.com/go/metastore": {"v1.10.0/go.mod"},
+        "cloud.google.com/go/monitoring": {"v1.13.0/go.mod"},
+        "cloud.google.com/go/networkconnectivity": {"v1.11.0/go.mod"},
+        "cloud.google.com/go/networkmanagement": {"v1.6.0/go.mod"},
+        "cloud.google.com/go/networksecurity": {"v0.8.0/go.mod"},
+        "cloud.google.com/go/notebooks": {"v1.8.0/go.mod"},
+        "cloud.google.com/go/optimization": {"v1.3.1/go.mod"},
+        "cloud.google.com/go/orchestration": {"v1.6.0/go.mod"},
+        "cloud.google.com/go/orgpolicy": {"v1.10.0/go.mod"},
+        "cloud.google.com/go/osconfig": {"v1.11.0/go.mod"},
+        "cloud.google.com/go/oslogin": {"v1.9.0/go.mod"},
+        "cloud.google.com/go/phishingprotection": {"v0.7.0/go.mod"},
+        "cloud.google.com/go/policytroubleshooter": {"v1.6.0/go.mod"},
+        "cloud.google.com/go/privatecatalog": {"v0.8.0/go.mod"},
+        "cloud.google.com/go/pubsub": {"v1.0.1/go.mod", "v1.1.0/go.mod", "v1.2.0/go.mod", "v1.28.0/go.mod", "v1.3.1/go.mod", "v1.30.0/go.mod"},
+        "cloud.google.com/go/pubsublite": {"v1.7.0/go.mod"},
+        "cloud.google.com/go/recaptchaenterprise": {"v1.3.1/go.mod"},
+        "cloud.google.com/go/recaptchaenterprise/v2": {"v2.7.0/go.mod"},
+        "cloud.google.com/go/recommendationengine": {"v0.7.0/go.mod"},
+        "cloud.google.com/go/recommender": {"v1.9.0/go.mod"},
+        "cloud.google.com/go/redis": {"v1.11.0/go.mod"},
+        "cloud.google.com/go/resourcemanager": {"v1.7.0/go.mod"},
+        "cloud.google.com/go/resourcesettings": {"v1.5.0/go.mod"},
+        "cloud.google.com/go/retail": {"v1.12.0/go.mod"},
+        "cloud.google.com/go/run": {"v0.9.0/go.mod"},
+        "cloud.google.com/go/scheduler": {"v1.9.0/go.mod"},
+        "cloud.google.com/go/secretmanager": {"v1.10.0/go.mod"},
+        "cloud.google.com/go/security": {"v1.13.0/go.mod"},
+        "cloud.google.com/go/securitycenter": {"v1.19.0/go.mod"},
+        "cloud.google.com/go/servicedirectory": {"v1.9.0/go.mod"},
+        "cloud.google.com/go/shell": {"v1.6.0/go.mod"},
+        "cloud.google.com/go/spanner": {"v1.45.0/go.mod"},
+        "cloud.google.com/go/speech": {"v1.15.0/go.mod"},
+        "cloud.google.com/go/storage": {"v1.0.0/go.mod", "v1.10.0/go.mod", "v1.14.0/go.mod", "v1.22.1/go.mod", "v1.23.0/go.mod", "v1.27.0/go.mod", "v1.28.1/go.mod", "v1.29.0/go.mod", "v1.5.0/go.mod", "v1.6.0/go.mod", "v1.8.0/go.mod"},
+        "cloud.google.com/go/storagetransfer": {"v1.8.0/go.mod"},
+        "cloud.google.com/go/talent": {"v1.5.0/go.mod"},
+        "cloud.google.com/go/texttospeech": {"v1.6.0/go.mod"},
+        "cloud.google.com/go/tpu": {"v1.5.0/go.mod"},
+        "cloud.google.com/go/trace": {"v1.9.0/go.mod"},
+        "cloud.google.com/go/translate": {"v1.7.0/go.mod"},
+        "cloud.google.com/go/video": {"v1.15.0/go.mod"},
+        "cloud.google.com/go/videointelligence": {"v1.10.0/go.mod"},
+        "cloud.google.com/go/vision": {"v1.2.0/go.mod"},
+        "cloud.google.com/go/vision/v2": {"v2.7.0/go.mod"},
+        "cloud.google.com/go/vmmigration": {"v1.6.0/go.mod"},
+        "cloud.google.com/go/vmwareengine": {"v0.3.0/go.mod"},
+        "cloud.google.com/go/vpcaccess": {"v1.6.0/go.mod"},
+        "cloud.google.com/go/webrisk": {"v1.8.0/go.mod"},
+        "cloud.google.com/go/websecurityscanner": {"v1.5.0/go.mod"},
+        "cloud.google.com/go/workflows": {"v1.10.0/go.mod"},
+        "dario.cat/mergo": {"v1.0.1", "v1.0.1/go.mod"},
+        "dmitri.shuralyov.com/app/changes": {"v0.0.0-20180602232624-0a106ad413e3/go.mod"},
+        "dmitri.shuralyov.com/gpu/mtl": {"v0.0.0-20190408044501-666a987793e9/go.mod"},
+        "dmitri.shuralyov.com/html/belt": {"v0.0.0-20180602232347-f7d459c86be0/go.mod"},
+        "dmitri.shuralyov.com/service/change": {"v0.0.0-20181023043359-a85b471d5412/go.mod"},
+        "dmitri.shuralyov.com/state": {"v0.0.0-20180228185332-28bcc343414c/go.mod"},
+        "filippo.io/edwards25519": {"v1.1.0", "v1.1.0/go.mod"},
+        "gioui.org": {"v0.0.0-20210308172011-57750fc8a0a6/go.mod"},
+        "git.apache.org/thrift.git": {"v0.0.0-20180902110319-2566ecd5d999/go.mod"},
+        "git.sr.ht/~sbinet/gg": {"v0.3.1/go.mod"},
+        "github.com/AdaLogics/go-fuzz-headers": {"v0.0.0-20240806141605-e8a1dd7889d6", "v0.0.0-20240806141605-e8a1dd7889d6/go.mod"},
+        "github.com/AndreasBriese/bbloom": {"v0.0.0-20190825152654-46b345b51c96", "v0.0.0-20190825152654-46b345b51c96/go.mod"},
+        "github.com/Azure/go-ansiterm": {"v0.0.0-20250102033503-faa5f7b0171c", "v0.0.0-20250102033503-faa5f7b0171c/go.mod"},
+        "github.com/BurntSushi/toml": {"v0.3.1/go.mod", "v1.5.0", "v1.5.0/go.mod"},
+        "github.com/BurntSushi/xgb": {"v0.0.0-20160522181843-27f122750802/go.mod"},
+        "github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp": {"v1.25.0/go.mod", "v1.26.0/go.mod"},
+        "github.com/JeffAshton/win_pdh": {"v0.0.0-20161109143554-76bb4ee9f0ab", "v0.0.0-20161109143554-76bb4ee9f0ab/go.mod"},
+        "github.com/JohnCGriffin/overflow": {"v0.0.0-20211019200055-46fa312c352c/go.mod"},
+        "github.com/MakeNowJust/heredoc": {"v1.0.0", "v1.0.0/go.mod"},
+        "github.com/Masterminds/semver/v3": {"v3.3.1", "v3.3.1/go.mod"},
+        "github.com/Microsoft/go-winio": {"v0.6.2", "v0.6.2/go.mod"},
+        "github.com/Microsoft/hcsshim": {"v0.12.9", "v0.12.9/go.mod"},
+        "github.com/Microsoft/hnslib": {"v0.1.1", "v0.1.1/go.mod"},
+        "github.com/NYTimes/gziphandler": {"v1.1.1", "v1.1.1/go.mod"},
+        "github.com/Rican7/retry": {"v0.3.1", "v0.3.1/go.mod"},
+        "github.com/ajstarks/deck": {"v0.0.0-20200831202436-30c9fc6549a9/go.mod"},
+        "github.com/ajstarks/deck/generate": {"v0.0.0-20210309230005-c3f852c02e19/go.mod"},
+        "github.com/ajstarks/svgo": {"v0.0.0-20180226025133-644b8db467af/go.mod", "v0.0.0-20211024235047-1546f124cd8b/go.mod"},
+        "github.com/alecthomas/kingpin/v2": {"v2.4.0/go.mod"},
+        "github.com/alecthomas/units": {"v0.0.0-20211218093645-b94a6e3cc137/go.mod"},
+        "github.com/andybalholm/brotli": {"v1.0.4/go.mod"},
+        "github.com/anmitsu/go-shlex": {"v0.0.0-20161002113705-648efa622239/go.mod"},
+        "github.com/antihax/optional": {"v1.0.0/go.mod"},
+        "github.com/antithesishq/antithesis-sdk-go": {"v0.4.3-default-no-op", "v0.4.3-default-no-op/go.mod"},
+        "github.com/antlr4-go/antlr/v4": {"v4.13.1", "v4.13.1/go.mod"},
+        "github.com/apache/arrow/go/v11": {"v11.0.0/go.mod"},
+        "github.com/apache/thrift": {"v0.16.0/go.mod"},
+        "github.com/armon/circbuf": {"v0.0.0-20190214190532-5111143e8da2", "v0.0.0-20190214190532-5111143e8da2/go.mod"},
+        "github.com/armon/go-proxyproto": {"v0.0.0-20210323213023-7e956b284f0a/go.mod"},
+        "github.com/armon/go-socks5": {"v0.0.0-20160902184237-e75332964ef5", "v0.0.0-20160902184237-e75332964ef5/go.mod"},
+        "github.com/avast/retry-go/v4": {"v4.6.1", "v4.6.1/go.mod"},
+        "github.com/bahlo/generic-list-go": {"v0.2.0", "v0.2.0/go.mod"},
+        "github.com/benbjohnson/clock": {"v1.1.0/go.mod", "v1.3.0/go.mod", "v1.3.5", "v1.3.5/go.mod"},
+        "github.com/beorn7/perks": {"v0.0.0-20180321164747-3a771d992973/go.mod", "v1.0.1", "v1.0.1/go.mod"},
+        "github.com/blang/semver": {"v3.5.1+incompatible", "v3.5.1+incompatible/go.mod"},
+        "github.com/blang/semver/v4": {"v4.0.0", "v4.0.0/go.mod"},
+        "github.com/boombuler/barcode": {"v1.0.0/go.mod", "v1.0.1/go.mod"},
+        "github.com/bradfitz/go-smtpd": {"v0.0.0-20170404230938-deb6d6237625/go.mod"},
+        "github.com/bronze1man/goStrongswanVici": {"v0.0.0-20231128135937-211cef3b0b20", "v0.0.0-20231128135937-211cef3b0b20/go.mod"},
+        "github.com/buger/jsonparser": {"v0.0.0-20181115193947-bf1c66bbce23/go.mod", "v1.1.1", "v1.1.1/go.mod"},
+        "github.com/cenkalti/backoff/v4": {"v4.3.0", "v4.3.0/go.mod"},
+        "github.com/cenkalti/backoff/v5": {"v5.0.3", "v5.0.3/go.mod"},
+        "github.com/census-instrumentation/opencensus-proto": {"v0.3.0/go.mod", "v0.4.1/go.mod"},
+        "github.com/cespare/xxhash": {"v1.1.0", "v1.1.0/go.mod"},
+        "github.com/cespare/xxhash/v2": {"v2.2.0/go.mod", "v2.3.0", "v2.3.0/go.mod"},
+        "github.com/chai2010/gettext-go": {"v1.0.2", "v1.0.2/go.mod"},
+        "github.com/checkpoint-restore/checkpointctl": {"v1.3.0", "v1.3.0/go.mod"},
+        "github.com/checkpoint-restore/go-criu/v7": {"v7.2.0", "v7.2.0/go.mod"},
+        "github.com/chzyer/logex": {"v1.1.10/go.mod"},
+        "github.com/chzyer/readline": {"v0.0.0-20180603132655-2972be24d48e/go.mod"},
+        "github.com/chzyer/test": {"v0.0.0-20180213035817-a1ea475d72b1/go.mod"},
+        "github.com/cilium/ebpf": {"v0.12.3", "v0.12.3/go.mod"},
+        "github.com/cncf/udpa/go": {"v0.0.0-20220112060539-c52dc94e7fbe/go.mod"},
+        "github.com/cncf/xds/go": {"v0.0.0-20210922020428-25de7278fc84/go.mod", "v0.0.0-20220314180256-7f1daf1720fc/go.mod", "v0.0.0-20230105202645-06c439db220b/go.mod", "v0.0.0-20240723142845-024c85f92f20/go.mod", "v0.0.0-20240905190251-b4127c9b8d78/go.mod", "v0.0.0-20250121191232-2f005788dc42/go.mod"},
+        "github.com/cockroachdb/datadriven": {"v1.0.2", "v1.0.2/go.mod"},
+        "github.com/container-storage-interface/spec": {"v1.9.0", "v1.9.0/go.mod"},
+        "github.com/containerd/btrfs/v2": {"v2.0.0", "v2.0.0/go.mod"},
+        "github.com/containerd/cgroups": {"v0.0.0-20201119153540-4cbc285b3327/go.mod", "v1.1.0", "v1.1.0/go.mod"},
+        "github.com/containerd/cgroups/v3": {"v3.0.5", "v3.0.5/go.mod"},
+        "github.com/containerd/console": {"v1.0.5", "v1.0.5/go.mod"},
+        "github.com/containerd/containerd/api": {"v1.9.0", "v1.9.0/go.mod"},
+        "github.com/containerd/continuity": {"v0.4.5", "v0.4.5/go.mod"},
+        "github.com/containerd/errdefs": {"v1.0.0", "v1.0.0/go.mod"},
+        "github.com/containerd/errdefs/pkg": {"v0.3.0", "v0.3.0/go.mod"},
+        "github.com/containerd/fifo": {"v1.1.0", "v1.1.0/go.mod"},
+        "github.com/containerd/fuse-overlayfs-snapshotter/v2": {"v2.1.6", "v2.1.6/go.mod"},
+        "github.com/containerd/go-cni": {"v1.1.12", "v1.1.12/go.mod"},
+        "github.com/containerd/go-runc": {"v1.1.0", "v1.1.0/go.mod"},
+        "github.com/containerd/imgcrypt/v2": {"v2.0.1", "v2.0.1/go.mod"},
+        "github.com/containerd/log": {"v0.1.0", "v0.1.0/go.mod"},
+        "github.com/containerd/nri": {"v0.8.0", "v0.8.0/go.mod"},
+        "github.com/containerd/otelttrpc": {"v0.1.0", "v0.1.0/go.mod"},
+        "github.com/containerd/platforms": {"v1.0.0-rc.1", "v1.0.0-rc.1/go.mod"},
+        "github.com/containerd/plugin": {"v1.0.0", "v1.0.0/go.mod"},
+        "github.com/containerd/stargz-snapshotter/estargz": {"v0.17.0", "v0.17.0/go.mod"},
+        "github.com/containerd/ttrpc": {"v1.2.7", "v1.2.7/go.mod"},
+        "github.com/containerd/typeurl/v2": {"v2.2.3", "v2.2.3/go.mod"},
+        "github.com/containerd/zfs/v2": {"v2.0.0-rc.0", "v2.0.0-rc.0/go.mod"},
+        "github.com/containernetworking/cni": {"v1.3.0", "v1.3.0/go.mod"},
+        "github.com/containernetworking/plugins": {"v1.7.1", "v1.7.1/go.mod"},
+        "github.com/containers/ocicrypt": {"v1.2.1", "v1.2.1/go.mod"},
+        "github.com/coreos/go-iptables": {"v0.8.0", "v0.8.0/go.mod"},
+        "github.com/coreos/go-oidc": {"v2.3.0+incompatible", "v2.3.0+incompatible/go.mod"},
+        "github.com/coreos/go-semver": {"v0.3.1", "v0.3.1/go.mod"},
+        "github.com/coreos/go-systemd": {"v0.0.0-20181012123002-c6f51f82210d/go.mod"},
+        "github.com/coreos/go-systemd/v22": {"v22.1.0/go.mod", "v22.6.0", "v22.6.0/go.mod"},
+        "github.com/cpuguy83/go-md2man/v2": {"v2.0.0-20190314233015-f79a8a8ca69d/go.mod", "v2.0.0/go.mod", "v2.0.6/go.mod", "v2.0.7", "v2.0.7/go.mod"},
+        "github.com/creack/pty": {"v1.1.18", "v1.1.18/go.mod", "v1.1.9/go.mod"},
+        "github.com/cyphar/filepath-securejoin": {"v0.4.1", "v0.4.1/go.mod"},
+        "github.com/davecgh/go-spew": {"v1.1.0/go.mod", "v1.1.1/go.mod", "v1.1.2-0.20180830191138-d8f796af33cc", "v1.1.2-0.20180830191138-d8f796af33cc/go.mod"},
+        "github.com/davidlazar/go-crypto": {"v0.0.0-20200604182044-b73af7476f6c", "v0.0.0-20200604182044-b73af7476f6c/go.mod"},
+        "github.com/decred/dcrd/crypto/blake256": {"v1.1.0", "v1.1.0/go.mod"},
+        "github.com/decred/dcrd/dcrec/secp256k1/v4": {"v4.4.0", "v4.4.0/go.mod"},
+        "github.com/dgraph-io/badger": {"v1.6.2", "v1.6.2/go.mod"},
+        "github.com/dgraph-io/ristretto": {"v0.0.2", "v0.0.2/go.mod"},
+        "github.com/distribution/reference": {"v0.6.0", "v0.6.0/go.mod"},
+        "github.com/docker/cli": {"v28.3.2+incompatible", "v28.3.2+incompatible/go.mod"},
+        "github.com/docker/distribution": {"v2.8.3+incompatible", "v2.8.3+incompatible/go.mod"},
+        "github.com/docker/docker": {"v25.0.8+incompatible", "v25.0.8+incompatible/go.mod"},
+        "github.com/docker/docker-credential-helpers": {"v0.7.0", "v0.7.0/go.mod"},
+        "github.com/docker/go-connections": {"v0.6.0", "v0.6.0/go.mod"},
+        "github.com/docker/go-events": {"v0.0.0-20190806004212-e31b211e4f1c", "v0.0.0-20190806004212-e31b211e4f1c/go.mod"},
+        "github.com/docker/go-metrics": {"v0.0.1", "v0.0.1/go.mod"},
+        "github.com/docker/go-units": {"v0.4.0/go.mod", "v0.5.0", "v0.5.0/go.mod"},
+        "github.com/docopt/docopt-go": {"v0.0.0-20180111231733-ee0de3bc6815/go.mod"},
+        "github.com/dustin/go-humanize": {"v1.0.0/go.mod", "v1.0.1", "v1.0.1/go.mod"},
+        "github.com/elastic/gosigar": {"v0.12.0/go.mod", "v0.14.3", "v0.14.3/go.mod"},
+        "github.com/emicklei/go-restful": {"v2.16.0+incompatible", "v2.16.0+incompatible/go.mod"},
+        "github.com/emicklei/go-restful/v3": {"v3.11.0", "v3.11.0/go.mod"},
+        "github.com/envoyproxy/go-control-plane": {"v0.10.3/go.mod", "v0.13.4/go.mod"},
+        "github.com/envoyproxy/go-control-plane/envoy": {"v1.32.2/go.mod", "v1.32.3/go.mod", "v1.32.4/go.mod"},
+        "github.com/envoyproxy/go-control-plane/ratelimit": {"v0.1.0/go.mod"},
+        "github.com/envoyproxy/protoc-gen-validate": {"v0.1.0/go.mod", "v0.6.7/go.mod", "v0.9.1/go.mod", "v1.0.4/go.mod", "v1.1.0/go.mod", "v1.2.1/go.mod"},
+        "github.com/erikdubbelboer/gspt": {"v0.0.0-20190125194910-e68493906b83", "v0.0.0-20190125194910-e68493906b83/go.mod"},
+        "github.com/euank/go-kmsg-parser": {"v2.0.0+incompatible", "v2.0.0+incompatible/go.mod"},
+        "github.com/evanphx/json-patch": {"v5.9.11+incompatible", "v5.9.11+incompatible/go.mod"},
+        "github.com/exponent-io/jsonpath": {"v0.0.0-20210407135951-1de76d718b3f", "v0.0.0-20210407135951-1de76d718b3f/go.mod"},
+        "github.com/expr-lang/expr": {"v1.17.5", "v1.17.5/go.mod"},
+        "github.com/fatih/camelcase": {"v1.0.0", "v1.0.0/go.mod"},
+        "github.com/fatih/color": {"v1.16.0", "v1.16.0/go.mod"},
+        "github.com/felixge/httpsnoop": {"v1.0.4", "v1.0.4/go.mod"},
+        "github.com/flannel-io/flannel": {"v0.27.0", "v0.27.0/go.mod"},
+        "github.com/flynn/go-shlex": {"v0.0.0-20150515145356-3f9db97f8568/go.mod"},
+        "github.com/flynn/noise": {"v1.1.0", "v1.1.0/go.mod"},
+        "github.com/fogleman/gg": {"v1.2.1-0.20190220221249-0403632d5b90/go.mod", "v1.3.0/go.mod"},
+        "github.com/francoispqt/gojay": {"v1.2.13", "v1.2.13/go.mod"},
+        "github.com/frankban/quicktest": {"v1.14.5/go.mod", "v1.14.6", "v1.14.6/go.mod"},
+        "github.com/fsnotify/fsnotify": {"v1.4.7/go.mod", "v1.9.0", "v1.9.0/go.mod"},
+        "github.com/fxamacker/cbor/v2": {"v2.9.0", "v2.9.0/go.mod"},
+        "github.com/ghodss/yaml": {"v1.0.0", "v1.0.0/go.mod"},
+        "github.com/gliderlabs/ssh": {"v0.1.1/go.mod"},
+        "github.com/go-errors/errors": {"v1.0.1/go.mod", "v1.4.2", "v1.4.2/go.mod"},
+        "github.com/go-fonts/dejavu": {"v0.1.0/go.mod"},
+        "github.com/go-fonts/latin-modern": {"v0.2.0/go.mod"},
+        "github.com/go-fonts/liberation": {"v0.1.1/go.mod", "v0.2.0/go.mod"},
+        "github.com/go-fonts/stix": {"v0.1.0/go.mod"},
+        "github.com/go-gl/glfw": {"v0.0.0-20190409004039-e6da0acd62b1/go.mod"},
+        "github.com/go-gl/glfw/v3.3/glfw": {"v0.0.0-20191125211704-12ad95a8df72/go.mod", "v0.0.0-20200222043503-6f7a984d4dc4/go.mod"},
+        "github.com/go-ini/ini": {"v1.67.0", "v1.67.0/go.mod"},
+        "github.com/go-jose/go-jose/v4": {"v4.0.4/go.mod", "v4.0.5", "v4.0.5/go.mod"},
+        "github.com/go-latex/latex": {"v0.0.0-20210118124228-b3d85cf34e07/go.mod", "v0.0.0-20210823091927-c0d11ff05a81/go.mod"},
+        "github.com/go-logr/logr": {"v1.2.2/go.mod", "v1.4.2/go.mod", "v1.4.3", "v1.4.3/go.mod"},
+        "github.com/go-logr/stdr": {"v1.2.2/go.mod", "v1.2.3-0.20220714215716-96bad1d688c5", "v1.2.3-0.20220714215716-96bad1d688c5/go.mod"},
+        "github.com/go-logr/zapr": {"v1.3.0", "v1.3.0/go.mod"},
+        "github.com/go-openapi/jsonpointer": {"v0.22.0", "v0.22.0/go.mod"},
+        "github.com/go-openapi/jsonreference": {"v0.21.1", "v0.21.1/go.mod"},
+        "github.com/go-openapi/swag": {"v0.24.1", "v0.24.1/go.mod"},
+        "github.com/go-openapi/swag/cmdutils": {"v0.24.0", "v0.24.0/go.mod"},
+        "github.com/go-openapi/swag/conv": {"v0.24.0", "v0.24.0/go.mod"},
+        "github.com/go-openapi/swag/fileutils": {"v0.24.0", "v0.24.0/go.mod"},
+        "github.com/go-openapi/swag/jsonname": {"v0.24.0", "v0.24.0/go.mod"},
+        "github.com/go-openapi/swag/jsonutils": {"v0.24.0", "v0.24.0/go.mod"},
+        "github.com/go-openapi/swag/loading": {"v0.24.0", "v0.24.0/go.mod"},
+        "github.com/go-openapi/swag/mangling": {"v0.24.0", "v0.24.0/go.mod"},
+        "github.com/go-openapi/swag/netutils": {"v0.24.0", "v0.24.0/go.mod"},
+        "github.com/go-openapi/swag/stringutils": {"v0.24.0", "v0.24.0/go.mod"},
+        "github.com/go-openapi/swag/typeutils": {"v0.24.0", "v0.24.0/go.mod"},
+        "github.com/go-openapi/swag/yamlutils": {"v0.24.0", "v0.24.0/go.mod"},
+        "github.com/go-pdf/fpdf": {"v0.5.0/go.mod", "v0.6.0/go.mod"},
+        "github.com/go-sql-driver/mysql": {"v1.9.3", "v1.9.3/go.mod"},
+        "github.com/go-task/slim-sprig/v3": {"v3.0.0", "v3.0.0/go.mod"},
+        "github.com/go-test/deep": {"v1.0.7", "v1.0.7/go.mod"},
+        "github.com/go-yaml/yaml": {"v2.1.0+incompatible/go.mod"},
+        "github.com/goccy/go-json": {"v0.10.5", "v0.10.5/go.mod", "v0.9.11/go.mod"},
+        "github.com/godbus/dbus/v5": {"v5.0.3/go.mod", "v5.1.0", "v5.1.0/go.mod"},
+        "github.com/gofrs/flock": {"v0.8.1", "v0.8.1/go.mod"},
+        "github.com/gogo/protobuf": {"v1.3.1/go.mod", "v1.3.2", "v1.3.2/go.mod"},
+        "github.com/golang-jwt/jwt/v5": {"v5.2.2", "v5.2.2/go.mod"},
+        "github.com/golang/freetype": {"v0.0.0-20170609003504-e2365dfdc4a0/go.mod"},
+        "github.com/golang/glog": {"v0.0.0-20160126235308-23def4e6c14b/go.mod", "v1.0.0/go.mod", "v1.1.0/go.mod", "v1.2.4/go.mod"},
+        "github.com/golang/groupcache": {"v0.0.0-20190702054246-869f871628b6/go.mod", "v0.0.0-20191227052852-215e87163ea7/go.mod", "v0.0.0-20200121045136-8c9f03a8e57e/go.mod", "v0.0.0-20210331224755-41bb18bfe9da/go.mod", "v0.0.0-20241129210726-2c02b8208cf8", "v0.0.0-20241129210726-2c02b8208cf8/go.mod"},
+        "github.com/golang/mock": {"v1.2.0/go.mod", "v1.3.1/go.mod", "v1.4.0/go.mod", "v1.4.1/go.mod", "v1.4.3/go.mod", "v1.4.4/go.mod", "v1.5.0/go.mod", "v1.6.0", "v1.6.0/go.mod"},
+        "github.com/golang/protobuf": {"v1.5.4", "v1.5.4/go.mod"},
+        "github.com/golang/snappy": {"v0.0.0-20180518054509-2e65f85255db/go.mod", "v0.0.3/go.mod", "v0.0.4", "v0.0.4/go.mod"},
+        "github.com/google/btree": {"v0.0.0-20180813153112-4030bb1f1f0c/go.mod", "v1.0.0/go.mod", "v1.1.3", "v1.1.3/go.mod"},
+        "github.com/google/cel-go": {"v0.26.1", "v0.26.1/go.mod"},
+        "github.com/google/flatbuffers": {"v2.0.8+incompatible/go.mod"},
+        "github.com/google/gnostic-models": {"v0.7.0", "v0.7.0/go.mod"},
+        "github.com/google/go-cmp": {"v0.2.0/go.mod", "v0.3.0/go.mod", "v0.3.1/go.mod", "v0.4.0/go.mod", "v0.4.1/go.mod", "v0.5.0/go.mod", "v0.5.1/go.mod", "v0.5.2/go.mod", "v0.5.3/go.mod", "v0.5.4/go.mod", "v0.5.5/go.mod", "v0.5.6/go.mod", "v0.5.7/go.mod", "v0.5.8/go.mod", "v0.5.9/go.mod", "v0.6.0/go.mod", "v0.7.0", "v0.7.0/go.mod"},
+        "github.com/google/go-containerregistry": {"v0.20.2", "v0.20.2/go.mod"},
+        "github.com/google/go-github": {"v17.0.0+incompatible/go.mod"},
+        "github.com/google/go-querystring": {"v1.0.0/go.mod"},
+        "github.com/google/go-tpm": {"v0.9.5", "v0.9.5/go.mod"},
+        "github.com/google/gofuzz": {"v1.0.0/go.mod"},
+        "github.com/google/gopacket": {"v1.1.19", "v1.1.19/go.mod"},
+        "github.com/google/martian": {"v2.1.0+incompatible/go.mod"},
+        "github.com/google/martian/v3": {"v3.0.0/go.mod", "v3.1.0/go.mod", "v3.2.1/go.mod", "v3.3.2/go.mod"},
+        "github.com/google/pprof": {"v0.0.0-20181206194817-3ea8567a2e57/go.mod", "v0.0.0-20190515194954-54271f7e092f/go.mod", "v0.0.0-20191218002539-d4f498aebedc/go.mod", "v0.0.0-20200212024743-f11f1df84d12/go.mod", "v0.0.0-20200229191704-1ebb73c60ed3/go.mod", "v0.0.0-20200430221834-fc25d7d30c6d/go.mod", "v0.0.0-20200708004538-1a94d8640e99/go.mod", "v0.0.0-20201023163331-3e6fc7fc9c4c/go.mod", "v0.0.0-20201203190320-1bf35d6f28c2/go.mod", "v0.0.0-20201218002935-b9804c9f04c2/go.mod", "v0.0.0-20210122040257-d980be63207e/go.mod", "v0.0.0-20210226084205-cbba55b83ad5/go.mod", "v0.0.0-20210601050228-01bbb1931b22/go.mod", "v0.0.0-20210609004039-a478d1d731e9/go.mod", "v0.0.0-20210720184732-4bb14d4b1be1/go.mod", "v0.0.0-20250403155104-27863c87afa6", "v0.0.0-20250403155104-27863c87afa6/go.mod"},
+        "github.com/google/renameio": {"v0.1.0/go.mod"},
+        "github.com/google/s2a-go": {"v0.1.3/go.mod", "v0.1.4/go.mod"},
+        "github.com/google/uuid": {"v1.1.1/go.mod", "v1.1.2/go.mod", "v1.2.0/go.mod", "v1.3.0/go.mod", "v1.6.0", "v1.6.0/go.mod"},
+        "github.com/googleapis/enterprise-certificate-proxy": {"v0.0.0-20220520183353-fd19c99a87aa/go.mod", "v0.1.0/go.mod", "v0.2.0/go.mod", "v0.2.1/go.mod", "v0.2.3/go.mod", "v0.2.4/go.mod"},
+        "github.com/googleapis/gax-go": {"v2.0.0+incompatible/go.mod"},
+        "github.com/googleapis/gax-go/v2": {"v2.12.0/go.mod"},
+        "github.com/googleapis/go-type-adapters": {"v1.0.0/go.mod"},
+        "github.com/googleapis/google-cloud-go-testing": {"v0.0.0-20200911160855-bcd43fbb19e8/go.mod"},
+        "github.com/gopherjs/gopherjs": {"v0.0.0-20181017120253-0766667cb4d1/go.mod", "v0.0.0-20190430165422-3e4dfb77656c", "v0.0.0-20190430165422-3e4dfb77656c/go.mod"},
+        "github.com/gorilla/mux": {"v1.8.1", "v1.8.1/go.mod"},
+        "github.com/gorilla/websocket": {"v1.4.2/go.mod", "v1.5.4-0.20250319132907-e064f32e3674", "v1.5.4-0.20250319132907-e064f32e3674/go.mod"},
+        "github.com/gregjones/httpcache": {"v0.0.0-20180305231024-9cad4c3443a7/go.mod", "v0.0.0-20190611155906-901d90724c79", "v0.0.0-20190611155906-901d90724c79/go.mod"},
+        "github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus": {"v1.0.1", "v1.0.1/go.mod"},
+        "github.com/grpc-ecosystem/go-grpc-middleware/v2": {"v2.3.0", "v2.3.0/go.mod"},
+        "github.com/grpc-ecosystem/go-grpc-prometheus": {"v1.2.0", "v1.2.0/go.mod"},
+        "github.com/grpc-ecosystem/grpc-gateway": {"v1.5.0/go.mod"},
+        "github.com/grpc-ecosystem/grpc-gateway/v2": {"v2.11.3/go.mod", "v2.16.0/go.mod", "v2.27.2", "v2.27.2/go.mod", "v2.7.0/go.mod"},
+        "github.com/hanwen/go-fuse/v2": {"v2.8.0", "v2.8.0/go.mod"},
+        "github.com/hashicorp/errwrap": {"v1.0.0/go.mod", "v1.1.0", "v1.1.0/go.mod"},
+        "github.com/hashicorp/go-cleanhttp": {"v0.5.2", "v0.5.2/go.mod"},
+        "github.com/hashicorp/go-hclog": {"v1.6.3", "v1.6.3/go.mod"},
+        "github.com/hashicorp/go-multierror": {"v1.1.1", "v1.1.1/go.mod"},
+        "github.com/hashicorp/go-retryablehttp": {"v0.7.8", "v0.7.8/go.mod"},
+        "github.com/hashicorp/go-version": {"v1.7.0", "v1.7.0/go.mod"},
+        "github.com/hashicorp/golang-lru": {"v0.5.0/go.mod", "v0.5.1/go.mod", "v1.0.2", "v1.0.2/go.mod"},
+        "github.com/hashicorp/golang-lru/arc/v2": {"v2.0.7", "v2.0.7/go.mod"},
+        "github.com/hashicorp/golang-lru/v2": {"v2.0.7", "v2.0.7/go.mod"},
+        "github.com/hpcloud/tail": {"v1.0.0/go.mod"},
+        "github.com/huin/goupnp": {"v1.3.0", "v1.3.0/go.mod"},
+        "github.com/iancoleman/strcase": {"v0.2.0/go.mod", "v0.3.0/go.mod"},
+        "github.com/ianlancetaylor/demangle": {"v0.0.0-20181102032728-5e5cf60278f6/go.mod", "v0.0.0-20200824232613-28f6c0f3b639/go.mod"},
+        "github.com/inconshreveable/mousetrap": {"v1.1.0", "v1.1.0/go.mod"},
+        "github.com/inetaf/tcpproxy": {"v0.0.0-20240214030015-3ce58045626c", "v0.0.0-20240214030015-3ce58045626c/go.mod"},
+        "github.com/intel/goresctrl": {"v0.8.0", "v0.8.0/go.mod"},
+        "github.com/invopop/jsonschema": {"v0.13.0", "v0.13.0/go.mod"},
+        "github.com/ipfs/boxo": {"v0.29.1", "v0.29.1/go.mod"},
+        "github.com/ipfs/go-block-format": {"v0.2.0", "v0.2.0/go.mod"},
+        "github.com/ipfs/go-cid": {"v0.5.0", "v0.5.0/go.mod"},
+        "github.com/ipfs/go-datastore": {"v0.5.0/go.mod", "v0.8.2", "v0.8.2/go.mod"},
+        "github.com/ipfs/go-detect-race": {"v0.0.1", "v0.0.1/go.mod"},
+        "github.com/ipfs/go-ds-badger": {"v0.3.0", "v0.3.0/go.mod"},
+        "github.com/ipfs/go-ds-leveldb": {"v0.5.0", "v0.5.0/go.mod"},
+        "github.com/ipfs/go-ipfs-delay": {"v0.0.0-20181109222059-70721b86a9a8/go.mod"},
+        "github.com/ipfs/go-ipfs-util": {"v0.0.3", "v0.0.3/go.mod"},
+        "github.com/ipfs/go-log": {"v1.0.5", "v1.0.5/go.mod"},
+        "github.com/ipfs/go-log/v2": {"v2.1.3/go.mod", "v2.5.1", "v2.5.1/go.mod"},
+        "github.com/ipfs/go-test": {"v0.2.1", "v0.2.1/go.mod"},
+        "github.com/ipld/go-ipld-prime": {"v0.21.0", "v0.21.0/go.mod"},
+        "github.com/jackc/pgerrcode": {"v0.0.0-20240316143900-6e2875d9b438", "v0.0.0-20240316143900-6e2875d9b438/go.mod"},
+        "github.com/jackc/pgpassfile": {"v1.0.0", "v1.0.0/go.mod"},
+        "github.com/jackc/pgservicefile": {"v0.0.0-20240606120523-5a60cdf6a761", "v0.0.0-20240606120523-5a60cdf6a761/go.mod"},
+        "github.com/jackc/pgx/v5": {"v5.7.5", "v5.7.5/go.mod"},
+        "github.com/jackc/puddle/v2": {"v2.2.2", "v2.2.2/go.mod"},
+        "github.com/jackpal/go-nat-pmp": {"v1.0.2", "v1.0.2/go.mod"},
+        "github.com/jbenet/go-cienv": {"v0.1.0/go.mod"},
+        "github.com/jbenet/go-temp-err-catcher": {"v0.1.0", "v0.1.0/go.mod"},
+        "github.com/jbenet/goprocess": {"v0.1.4", "v0.1.4/go.mod"},
+        "github.com/jellevandenhooff/dkim": {"v0.0.0-20150330215556-f50fe3d243e1/go.mod"},
+        "github.com/joho/godotenv": {"v1.5.1", "v1.5.1/go.mod"},
+        "github.com/jonboulle/clockwork": {"v0.5.0", "v0.5.0/go.mod"},
+        "github.com/josharian/intern": {"v1.0.0", "v1.0.0/go.mod"},
+        "github.com/josharian/native": {"v1.1.0", "v1.1.0/go.mod"},
+        "github.com/jpillora/backoff": {"v1.0.0/go.mod"},
+        "github.com/json-iterator/go": {"v1.1.12", "v1.1.12/go.mod", "v1.1.6/go.mod"},
+        "github.com/jstemmer/go-junit-report": {"v0.0.0-20190106144839-af01ea7f8024/go.mod", "v0.9.1/go.mod"},
+        "github.com/jtolds/gls": {"v4.20.0+incompatible", "v4.20.0+incompatible/go.mod"},
+        "github.com/julienschmidt/httprouter": {"v1.3.0/go.mod"},
+        "github.com/jung-kurt/gofpdf": {"v1.0.0/go.mod", "v1.0.3-0.20190309125859-24315acbbda5/go.mod"},
+        "github.com/k3s-io/api": {"v0.1.3", "v0.1.3/go.mod"},
+        "github.com/k3s-io/cadvisor": {"v0.52.1", "v0.52.1/go.mod"},
+        "github.com/k3s-io/containerd/v2": {"v2.1.4-k3s2", "v2.1.4-k3s2/go.mod"},
+        "github.com/k3s-io/cri-dockerd": {"v0.3.19-k3s3", "v0.3.19-k3s3/go.mod"},
+        "github.com/k3s-io/cri-tools": {"v1.34.0-k3s2", "v1.34.0-k3s2/go.mod"},
+        "github.com/k3s-io/etcd/api/v3": {"v3.6.4-k3s3", "v3.6.4-k3s3/go.mod"},
+        "github.com/k3s-io/etcd/client/pkg/v3": {"v3.6.4-k3s3", "v3.6.4-k3s3/go.mod"},
+        "github.com/k3s-io/etcd/client/v3": {"v3.6.4-k3s3", "v3.6.4-k3s3/go.mod"},
+        "github.com/k3s-io/etcd/etcdutl/v3": {"v3.6.4-k3s3", "v3.6.4-k3s3/go.mod"},
+        "github.com/k3s-io/etcd/pkg/v3": {"v3.6.4-k3s3", "v3.6.4-k3s3/go.mod"},
+        "github.com/k3s-io/etcd/server/v3": {"v3.6.4-k3s3", "v3.6.4-k3s3/go.mod"},
+        "github.com/k3s-io/helm-controller": {"v0.16.13", "v0.16.13/go.mod"},
+        "github.com/k3s-io/kine": {"v0.14.0", "v0.14.0/go.mod"},
+        "github.com/k3s-io/klog/v2": {"v2.120.1-k3s1", "v2.120.1-k3s1/go.mod"},
+        "github.com/k3s-io/kube-router/v2": {"v2.5.0", "v2.5.0/go.mod"},
+        "github.com/k3s-io/kubernetes": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/api": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/apiextensions-apiserver": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/apimachinery": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/apiserver": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/cli-runtime": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/client-go": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/cloud-provider": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/cluster-bootstrap": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/component-base": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/component-helpers": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/controller-manager": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/cri-api": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/csi-translation-lib": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/dynamic-resource-allocation": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/endpointslice": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/externaljwt": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/kms": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/kube-aggregator": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/kube-controller-manager": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/kube-proxy": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/kube-scheduler": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/kubectl": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/kubelet": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/metrics": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/mount-utils": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/kubernetes/staging/src/k8s.io/pod-security-admission": {"v1.34.1-k3s1", "v1.34.1-k3s1/go.mod"},
+        "github.com/k3s-io/spegel": {"v0.2.0-k3s1", "v0.2.0-k3s1/go.mod"},
+        "github.com/k3s-io/stargz-snapshotter": {"v0.17.0-k3s1", "v0.17.0-k3s1/go.mod"},
+        "github.com/karrick/godirwalk": {"v1.17.0", "v1.17.0/go.mod"},
+        "github.com/kballard/go-shellquote": {"v0.0.0-20180428030007-95032a82bc51/go.mod"},
+        "github.com/kisielk/errcheck": {"v1.2.0/go.mod", "v1.5.0/go.mod"},
+        "github.com/kisielk/gotool": {"v1.0.0/go.mod"},
+        "github.com/klauspost/asmfmt": {"v1.3.2/go.mod"},
+        "github.com/klauspost/compress": {"v1.15.9/go.mod", "v1.18.0", "v1.18.0/go.mod"},
+        "github.com/klauspost/cpuid/v2": {"v2.0.1/go.mod", "v2.0.9/go.mod", "v2.2.10", "v2.2.10/go.mod"},
+        "github.com/koron/go-ssdp": {"v0.0.5", "v0.0.5/go.mod"},
+        "github.com/kr/fs": {"v0.1.0/go.mod"},
+        "github.com/kr/pretty": {"v0.1.0/go.mod", "v0.2.0/go.mod", "v0.2.1/go.mod", "v0.3.0/go.mod", "v0.3.1", "v0.3.1/go.mod"},
+        "github.com/kr/pty": {"v1.1.1/go.mod", "v1.1.3/go.mod"},
+        "github.com/kr/text": {"v0.1.0/go.mod", "v0.2.0", "v0.2.0/go.mod"},
+        "github.com/kylelemons/godebug": {"v1.1.0", "v1.1.0/go.mod"},
+        "github.com/libopenstorage/openstorage": {"v1.0.0", "v1.0.0/go.mod"},
+        "github.com/libp2p/go-buffer-pool": {"v0.1.0", "v0.1.0/go.mod"},
+        "github.com/libp2p/go-cidranger": {"v1.1.0", "v1.1.0/go.mod"},
+        "github.com/libp2p/go-flow-metrics": {"v0.2.0", "v0.2.0/go.mod"},
+        "github.com/libp2p/go-libp2p": {"v0.41.1", "v0.41.1/go.mod"},
+        "github.com/libp2p/go-libp2p-asn-util": {"v0.4.1", "v0.4.1/go.mod"},
+        "github.com/libp2p/go-libp2p-kad-dht": {"v0.31.0", "v0.31.0/go.mod"},
+        "github.com/libp2p/go-libp2p-kbucket": {"v0.7.0", "v0.7.0/go.mod"},
+        "github.com/libp2p/go-libp2p-record": {"v0.3.1", "v0.3.1/go.mod"},
+        "github.com/libp2p/go-libp2p-routing-helpers": {"v0.7.5", "v0.7.5/go.mod"},
+        "github.com/libp2p/go-libp2p-testing": {"v0.12.0", "v0.12.0/go.mod"},
+        "github.com/libp2p/go-msgio": {"v0.3.0", "v0.3.0/go.mod"},
+        "github.com/libp2p/go-netroute": {"v0.2.2", "v0.2.2/go.mod"},
+        "github.com/libp2p/go-reuseport": {"v0.4.0", "v0.4.0/go.mod"},
+        "github.com/libp2p/go-yamux/v5": {"v5.0.0", "v5.0.0/go.mod"},
+        "github.com/liggitt/tabwriter": {"v0.0.0-20181228230101-89fcab3d43de", "v0.0.0-20181228230101-89fcab3d43de/go.mod"},
+        "github.com/lithammer/dedent": {"v1.1.0", "v1.1.0/go.mod"},
+        "github.com/lunixbochs/vtclean": {"v1.0.0/go.mod"},
+        "github.com/lyft/protoc-gen-star": {"v0.6.0/go.mod", "v0.6.1/go.mod"},
+        "github.com/lyft/protoc-gen-star/v2": {"v2.0.3/go.mod", "v2.0.4-0.20230330145011-496ad1ac90a4/go.mod"},
+        "github.com/mailru/easyjson": {"v0.0.0-20190312143242-1de009706dbe/go.mod", "v0.9.0", "v0.9.0/go.mod"},
+        "github.com/marten-seemann/tcp": {"v0.0.0-20210406111302-dfbc87cc63fd", "v0.0.0-20210406111302-dfbc87cc63fd/go.mod"},
+        "github.com/mattn/go-colorable": {"v0.1.13", "v0.1.13/go.mod"},
+        "github.com/mattn/go-isatty": {"v0.0.12/go.mod", "v0.0.14/go.mod", "v0.0.16/go.mod", "v0.0.20", "v0.0.20/go.mod"},
+        "github.com/mattn/go-sqlite3": {"v1.14.14/go.mod", "v1.14.32", "v1.14.32/go.mod"},
+        "github.com/matttproud/golang_protobuf_extensions": {"v1.0.1/go.mod"},
+        "github.com/mdlayher/genetlink": {"v1.3.2", "v1.3.2/go.mod"},
+        "github.com/mdlayher/netlink": {"v1.7.2", "v1.7.2/go.mod"},
+        "github.com/mdlayher/socket": {"v0.5.1", "v0.5.1/go.mod"},
+        "github.com/mdlayher/vsock": {"v1.2.1", "v1.2.1/go.mod"},
+        "github.com/microcosm-cc/bluemonday": {"v1.0.1/go.mod"},
+        "github.com/miekg/dns": {"v1.1.63", "v1.1.63/go.mod"},
+        "github.com/miekg/pkcs11": {"v1.1.1", "v1.1.1/go.mod"},
+        "github.com/mikioh/ipaddr": {"v0.0.0-20190404000644-d465c8ab6721", "v0.0.0-20190404000644-d465c8ab6721/go.mod"},
+        "github.com/mikioh/tcp": {"v0.0.0-20190314235350-803a9b46060c", "v0.0.0-20190314235350-803a9b46060c/go.mod"},
+        "github.com/mikioh/tcpinfo": {"v0.0.0-20190314235526-30a79bb1804b", "v0.0.0-20190314235526-30a79bb1804b/go.mod"},
+        "github.com/mikioh/tcpopt": {"v0.0.0-20190314235656-172688c1accc", "v0.0.0-20190314235656-172688c1accc/go.mod"},
+        "github.com/minio/asm2plan9s": {"v0.0.0-20200509001527-cdd76441f9d8/go.mod"},
+        "github.com/minio/blake2b-simd": {"v0.0.0-20160723061019-3f5f724cb5b1/go.mod"},
+        "github.com/minio/c2goasm": {"v0.0.0-20190812172519-36a3d3bbc4f3/go.mod"},
+        "github.com/minio/crc64nvme": {"v1.0.1", "v1.0.1/go.mod"},
+        "github.com/minio/highwayhash": {"v1.0.3", "v1.0.3/go.mod"},
+        "github.com/minio/md5-simd": {"v1.1.2", "v1.1.2/go.mod"},
+        "github.com/minio/minio-go/v7": {"v7.0.91", "v7.0.91/go.mod"},
+        "github.com/minio/sha256-simd": {"v0.1.1-0.20190913151208-6de447530771/go.mod", "v1.0.1", "v1.0.1/go.mod"},
+        "github.com/mistifyio/go-zfs": {"v2.1.2-0.20190413222219-f784269be439+incompatible", "v2.1.2-0.20190413222219-f784269be439+incompatible/go.mod"},
+        "github.com/mistifyio/go-zfs/v3": {"v3.0.1", "v3.0.1/go.mod"},
+        "github.com/mitchellh/go-homedir": {"v1.1.0", "v1.1.0/go.mod"},
+        "github.com/mitchellh/go-wordwrap": {"v1.0.1", "v1.0.1/go.mod"},
+        "github.com/mndrix/tap-go": {"v0.0.0-20171203230836-629fa407e90b/go.mod"},
+        "github.com/moby/ipvs": {"v1.1.0", "v1.1.0/go.mod"},
+        "github.com/moby/locker": {"v1.0.1", "v1.0.1/go.mod"},
+        "github.com/moby/spdystream": {"v0.5.0", "v0.5.0/go.mod"},
+        "github.com/moby/sys/mountinfo": {"v0.7.2", "v0.7.2/go.mod"},
+        "github.com/moby/sys/sequential": {"v0.6.0", "v0.6.0/go.mod"},
+        "github.com/moby/sys/signal": {"v0.7.1", "v0.7.1/go.mod"},
+        "github.com/moby/sys/symlink": {"v0.3.0", "v0.3.0/go.mod"},
+        "github.com/moby/sys/user": {"v0.4.0", "v0.4.0/go.mod"},
+        "github.com/moby/sys/userns": {"v0.1.0", "v0.1.0/go.mod"},
+        "github.com/moby/term": {"v0.5.2", "v0.5.2/go.mod"},
+        "github.com/modern-go/concurrent": {"v0.0.0-20180228061459-e0a39a4cb421/go.mod", "v0.0.0-20180306012644-bacd9c7ef1dd", "v0.0.0-20180306012644-bacd9c7ef1dd/go.mod"},
+        "github.com/modern-go/reflect2": {"v1.0.1/go.mod", "v1.0.2/go.mod", "v1.0.3-0.20250322232337-35a7c28c31ee", "v1.0.3-0.20250322232337-35a7c28c31ee/go.mod"},
+        "github.com/mohae/deepcopy": {"v0.0.0-20170929034955-c48cc78d4826", "v0.0.0-20170929034955-c48cc78d4826/go.mod"},
+        "github.com/monochromegane/go-gitignore": {"v0.0.0-20200626010858-205db1a8cc00", "v0.0.0-20200626010858-205db1a8cc00/go.mod"},
+        "github.com/morikuni/aec": {"v1.0.0", "v1.0.0/go.mod"},
+        "github.com/mr-tron/base58": {"v1.1.2/go.mod", "v1.2.0", "v1.2.0/go.mod"},
+        "github.com/mrunalp/fileutils": {"v0.5.0/go.mod"},
+        "github.com/multiformats/go-base32": {"v0.1.0", "v0.1.0/go.mod"},
+        "github.com/multiformats/go-base36": {"v0.2.0", "v0.2.0/go.mod"},
+        "github.com/multiformats/go-multiaddr": {"v0.1.1/go.mod", "v0.15.0", "v0.15.0/go.mod"},
+        "github.com/multiformats/go-multiaddr-dns": {"v0.4.1", "v0.4.1/go.mod"},
+        "github.com/multiformats/go-multiaddr-fmt": {"v0.1.0", "v0.1.0/go.mod"},
+        "github.com/multiformats/go-multibase": {"v0.2.0", "v0.2.0/go.mod"},
+        "github.com/multiformats/go-multicodec": {"v0.9.0", "v0.9.0/go.mod"},
+        "github.com/multiformats/go-multihash": {"v0.0.8/go.mod", "v0.2.3", "v0.2.3/go.mod"},
+        "github.com/multiformats/go-multistream": {"v0.6.0", "v0.6.0/go.mod"},
+        "github.com/multiformats/go-varint": {"v0.0.7", "v0.0.7/go.mod"},
+        "github.com/munnerz/goautoneg": {"v0.0.0-20191010083416-a7dc8b61c822", "v0.0.0-20191010083416-a7dc8b61c822/go.mod"},
+        "github.com/mwitkow/go-conntrack": {"v0.0.0-20190716064945-2f068394615f/go.mod"},
+        "github.com/mwitkow/go-http-dialer": {"v0.0.0-20161116154839-378f744fb2b8", "v0.0.0-20161116154839-378f744fb2b8/go.mod"},
+        "github.com/mxk/go-flowrate": {"v0.0.0-20140419014527-cca7078d478f", "v0.0.0-20140419014527-cca7078d478f/go.mod"},
+        "github.com/natefinch/lumberjack": {"v2.0.0+incompatible", "v2.0.0+incompatible/go.mod"},
+        "github.com/nats-io/jsm.go": {"v0.2.4", "v0.2.4/go.mod"},
+        "github.com/nats-io/jwt/v2": {"v2.7.4", "v2.7.4/go.mod"},
+        "github.com/nats-io/nats-server/v2": {"v2.11.6", "v2.11.6/go.mod"},
+        "github.com/nats-io/nats.go": {"v1.44.0", "v1.44.0/go.mod"},
+        "github.com/nats-io/nkeys": {"v0.4.11", "v0.4.11/go.mod"},
+        "github.com/nats-io/nuid": {"v1.0.1", "v1.0.1/go.mod"},
+        "github.com/neelance/astrewrite": {"v0.0.0-20160511093645-99348263ae86/go.mod"},
+        "github.com/neelance/sourcemap": {"v0.0.0-20151028013722-8c68805598ab/go.mod"},
+        "github.com/nxadm/tail": {"v1.4.11", "v1.4.11/go.mod"},
+        "github.com/onsi/ginkgo": {"v1.16.5", "v1.16.5/go.mod", "v1.6.0/go.mod", "v1.7.0/go.mod"},
+        "github.com/onsi/ginkgo/v2": {"v2.25.0", "v2.25.0/go.mod"},
+        "github.com/onsi/gomega": {"v1.38.0", "v1.38.0/go.mod", "v1.4.3/go.mod"},
+        "github.com/opencontainers/cgroups": {"v0.0.4", "v0.0.4/go.mod"},
+        "github.com/opencontainers/go-digest": {"v1.0.0", "v1.0.0/go.mod"},
+        "github.com/opencontainers/image-spec": {"v1.1.1", "v1.1.1/go.mod"},
+        "github.com/opencontainers/runtime-spec": {"v1.0.2/go.mod", "v1.0.3-0.20220825212826-86290f6a00fb/go.mod", "v1.2.1", "v1.2.1/go.mod"},
+        "github.com/opencontainers/runtime-tools": {"v0.9.1-0.20221107090550-2e043c6bd626", "v0.9.1-0.20221107090550-2e043c6bd626/go.mod"},
+        "github.com/opencontainers/selinux": {"v1.11.1", "v1.11.1/go.mod"},
+        "github.com/opentracing/opentracing-go": {"v1.2.0", "v1.2.0/go.mod"},
+        "github.com/openzipkin/zipkin-go": {"v0.1.1/go.mod"},
+        "github.com/otiai10/copy": {"v1.7.0", "v1.7.0/go.mod"},
+        "github.com/otiai10/curr": {"v0.0.0-20150429015615-9b4961190c95/go.mod", "v1.0.0/go.mod"},
+        "github.com/otiai10/mint": {"v1.3.0/go.mod", "v1.3.3", "v1.3.3/go.mod"},
+        "github.com/pbnjay/memory": {"v0.0.0-20210728143218-7b4eea64cf58", "v0.0.0-20210728143218-7b4eea64cf58/go.mod"},
+        "github.com/pelletier/go-toml/v2": {"v2.2.4", "v2.2.4/go.mod"},
+        "github.com/peterbourgon/diskv": {"v2.0.1+incompatible", "v2.0.1+incompatible/go.mod"},
+        "github.com/petermattis/goid": {"v0.0.0-20240813172612-4fcff4a6cae7", "v0.0.0-20240813172612-4fcff4a6cae7/go.mod"},
+        "github.com/phpdave11/gofpdf": {"v1.4.2/go.mod"},
+        "github.com/phpdave11/gofpdi": {"v1.0.12/go.mod", "v1.0.13/go.mod"},
+        "github.com/pierrec/lz4": {"v2.6.0+incompatible", "v2.6.0+incompatible/go.mod"},
+        "github.com/pierrec/lz4/v4": {"v4.1.15/go.mod"},
+        "github.com/pion/datachannel": {"v1.5.10", "v1.5.10/go.mod"},
+        "github.com/pion/dtls/v2": {"v2.2.12", "v2.2.12/go.mod", "v2.2.7/go.mod"},
+        "github.com/pion/dtls/v3": {"v3.0.4", "v3.0.4/go.mod"},
+        "github.com/pion/ice/v4": {"v4.0.8", "v4.0.8/go.mod"},
+        "github.com/pion/interceptor": {"v0.1.37", "v0.1.37/go.mod"},
+        "github.com/pion/logging": {"v0.2.2/go.mod", "v0.2.3", "v0.2.3/go.mod"},
+        "github.com/pion/mdns/v2": {"v2.0.7", "v2.0.7/go.mod"},
+        "github.com/pion/randutil": {"v0.1.0", "v0.1.0/go.mod"},
+        "github.com/pion/rtcp": {"v1.2.15", "v1.2.15/go.mod"},
+        "github.com/pion/rtp": {"v1.8.11", "v1.8.11/go.mod"},
+        "github.com/pion/sctp": {"v1.8.37", "v1.8.37/go.mod"},
+        "github.com/pion/sdp/v3": {"v3.0.10", "v3.0.10/go.mod"},
+        "github.com/pion/srtp/v3": {"v3.0.4", "v3.0.4/go.mod"},
+        "github.com/pion/stun": {"v0.6.1", "v0.6.1/go.mod"},
+        "github.com/pion/stun/v3": {"v3.0.0", "v3.0.0/go.mod"},
+        "github.com/pion/transport/v2": {"v2.2.1/go.mod", "v2.2.10", "v2.2.10/go.mod", "v2.2.4/go.mod"},
+        "github.com/pion/transport/v3": {"v3.0.7", "v3.0.7/go.mod"},
+        "github.com/pion/turn/v4": {"v4.0.0", "v4.0.0/go.mod"},
+        "github.com/pion/webrtc/v4": {"v4.0.10", "v4.0.10/go.mod"},
+        "github.com/pkg/diff": {"v0.0.0-20210226163009-20ebb0f2a09e/go.mod"},
+        "github.com/pkg/errors": {"v0.8.1/go.mod", "v0.9.1", "v0.9.1/go.mod"},
+        "github.com/pkg/sftp": {"v1.10.1/go.mod", "v1.13.1/go.mod"},
+        "github.com/planetscale/vtprotobuf": {"v0.6.1-0.20240319094008-0393e58bdf10/go.mod"},
+        "github.com/pmezard/go-difflib": {"v1.0.0/go.mod", "v1.0.1-0.20181226105442-5d4384ee4fb2", "v1.0.1-0.20181226105442-5d4384ee4fb2/go.mod"},
+        "github.com/polydawn/refmt": {"v0.89.0", "v0.89.0/go.mod"},
+        "github.com/pquerna/cachecontrol": {"v0.1.0", "v0.1.0/go.mod"},
+        "github.com/prashantv/gostub": {"v1.1.0", "v1.1.0/go.mod"},
+        "github.com/prometheus/client_golang": {"v1.22.0", "v1.22.0/go.mod"},
+        "github.com/prometheus/client_model": {"v0.0.0-20180712105110-5c3871d89910/go.mod", "v0.2.0/go.mod", "v0.6.0/go.mod", "v0.6.1/go.mod", "v0.6.2", "v0.6.2/go.mod"},
+        "github.com/prometheus/common": {"v0.62.0", "v0.62.0/go.mod"},
+        "github.com/prometheus/procfs": {"v0.0.0-20180725123919-05ee40e3a273/go.mod", "v0.15.1/go.mod", "v0.17.0", "v0.17.0/go.mod"},
+        "github.com/quic-go/qpack": {"v0.5.1", "v0.5.1/go.mod"},
+        "github.com/quic-go/quic-go": {"v0.50.1", "v0.50.1/go.mod"},
+        "github.com/quic-go/webtransport-go": {"v0.8.1-0.20241018022711-4ac2c9250e66", "v0.8.1-0.20241018022711-4ac2c9250e66/go.mod"},
+        "github.com/rancher/dynamiclistener": {"v0.7.0", "v0.7.0/go.mod"},
+        "github.com/rancher/lasso": {"v0.2.3", "v0.2.3/go.mod"},
+        "github.com/rancher/permissions": {"v0.0.0-20240523180510-4001d3d637f7", "v0.0.0-20240523180510-4001d3d637f7/go.mod"},
+        "github.com/rancher/remotedialer": {"v0.5.1-0.20250827012652-e6b68fd83a6b", "v0.5.1-0.20250827012652-e6b68fd83a6b/go.mod"},
+        "github.com/rancher/wharfie": {"v0.7.0", "v0.7.0/go.mod"},
+        "github.com/rancher/wrangler/v3": {"v3.2.3", "v3.2.3/go.mod"},
+        "github.com/raulk/go-watchdog": {"v1.3.0", "v1.3.0/go.mod"},
+        "github.com/remyoudompheng/bigfft": {"v0.0.0-20200410134404-eec4a21b6bb0/go.mod"},
+        "github.com/robfig/cron/v3": {"v3.0.1", "v3.0.1/go.mod"},
+        "github.com/rogpeppe/fastuuid": {"v1.2.0/go.mod"},
+        "github.com/rogpeppe/go-internal": {"v1.10.0/go.mod", "v1.12.0/go.mod", "v1.13.1", "v1.13.1/go.mod", "v1.3.0/go.mod", "v1.6.1/go.mod", "v1.9.0/go.mod"},
+        "github.com/rootless-containers/rootlesskit": {"v1.1.1", "v1.1.1/go.mod"},
+        "github.com/rs/xid": {"v1.6.0", "v1.6.0/go.mod"},
+        "github.com/russross/blackfriday": {"v1.5.2/go.mod"},
+        "github.com/russross/blackfriday/v2": {"v2.0.1/go.mod", "v2.1.0", "v2.1.0/go.mod"},
+        "github.com/ruudk/golang-pdf417": {"v0.0.0-20181029194003-1af4ab5afa58/go.mod", "v0.0.0-20201230142125-a7e3863a1245/go.mod"},
+        "github.com/sasha-s/go-deadlock": {"v0.3.5", "v0.3.5/go.mod"},
+        "github.com/sergi/go-diff": {"v1.0.0/go.mod", "v1.2.0", "v1.2.0/go.mod"},
+        "github.com/shengdoushi/base58": {"v1.0.0", "v1.0.0/go.mod"},
+        "github.com/shurcooL/component": {"v0.0.0-20170202220835-f88ec8f54cc4/go.mod"},
+        "github.com/shurcooL/events": {"v0.0.0-20181021180414-410e4ca65f48/go.mod"},
+        "github.com/shurcooL/github_flavored_markdown": {"v0.0.0-20181002035957-2122de532470/go.mod"},
+        "github.com/shurcooL/go": {"v0.0.0-20180423040247-9e1955d9fb6e/go.mod"},
+        "github.com/shurcooL/go-goon": {"v0.0.0-20170922171312-37c2f522c041/go.mod"},
+        "github.com/shurcooL/gofontwoff": {"v0.0.0-20180329035133-29b52fc0a18d/go.mod"},
+        "github.com/shurcooL/gopherjslib": {"v0.0.0-20160914041154-feb6d3990c2c/go.mod"},
+        "github.com/shurcooL/highlight_diff": {"v0.0.0-20170515013008-09bb4053de1b/go.mod"},
+        "github.com/shurcooL/highlight_go": {"v0.0.0-20181028180052-98c3abbbae20/go.mod"},
+        "github.com/shurcooL/home": {"v0.0.0-20181020052607-80b7ffcb30f9/go.mod"},
+        "github.com/shurcooL/htmlg": {"v0.0.0-20170918183704-d01228ac9e50/go.mod"},
+        "github.com/shurcooL/httperror": {"v0.0.0-20170206035902-86b7830d14cc/go.mod"},
+        "github.com/shurcooL/httpfs": {"v0.0.0-20171119174359-809beceb2371/go.mod"},
+        "github.com/shurcooL/httpgzip": {"v0.0.0-20180522190206-b1c53ac65af9/go.mod"},
+        "github.com/shurcooL/issues": {"v0.0.0-20181008053335-6292fdc1e191/go.mod"},
+        "github.com/shurcooL/issuesapp": {"v0.0.0-20180602232740-048589ce2241/go.mod"},
+        "github.com/shurcooL/notifications": {"v0.0.0-20181007000457-627ab5aea122/go.mod"},
+        "github.com/shurcooL/octicon": {"v0.0.0-20181028054416-fa4f57f9efb2/go.mod"},
+        "github.com/shurcooL/reactions": {"v0.0.0-20181006231557-f2e0b4ca5b82/go.mod"},
+        "github.com/shurcooL/sanitized_anchor_name": {"v0.0.0-20170918181015-86672fcb3f95/go.mod", "v1.0.0/go.mod"},
+        "github.com/shurcooL/users": {"v0.0.0-20180125191416-49c67e49c537/go.mod"},
+        "github.com/shurcooL/webdavfs": {"v0.0.0-20170829043945-18c3829fa133/go.mod"},
+        "github.com/sirupsen/logrus": {"v1.7.0/go.mod", "v1.8.1/go.mod", "v1.9.3", "v1.9.3/go.mod"},
+        "github.com/smallstep/pkcs7": {"v0.1.1", "v0.1.1/go.mod"},
+        "github.com/smartystreets/assertions": {"v1.2.0", "v1.2.0/go.mod"},
+        "github.com/smartystreets/goconvey": {"v1.7.2", "v1.7.2/go.mod"},
+        "github.com/soheilhy/cmux": {"v0.1.5", "v0.1.5/go.mod"},
+        "github.com/sourcegraph/annotate": {"v0.0.0-20160123013949-f4cad6c6324d/go.mod"},
+        "github.com/sourcegraph/go-diff": {"v0.6.0/go.mod"},
+        "github.com/sourcegraph/syntaxhighlight": {"v0.0.0-20170531221838-bd320f5d308e/go.mod"},
+        "github.com/spaolacci/murmur3": {"v1.1.0", "v1.1.0/go.mod"},
+        "github.com/spf13/afero": {"v1.10.0/go.mod", "v1.14.0", "v1.14.0/go.mod", "v1.3.3/go.mod", "v1.6.0/go.mod", "v1.9.2/go.mod"},
+        "github.com/spf13/cobra": {"v1.9.1", "v1.9.1/go.mod"},
+        "github.com/spf13/pflag": {"v1.0.6/go.mod", "v1.0.7", "v1.0.7/go.mod"},
+        "github.com/spiffe/go-spiffe/v2": {"v2.5.0/go.mod"},
+        "github.com/stefanberger/go-pkcs11uri": {"v0.0.0-20230803200340-78284954bff6", "v0.0.0-20230803200340-78284954bff6/go.mod"},
+        "github.com/stoewer/go-strcase": {"v1.3.1", "v1.3.1/go.mod"},
+        "github.com/stretchr/objx": {"v0.1.0/go.mod", "v0.4.0/go.mod", "v0.5.0/go.mod", "v0.5.2", "v0.5.2/go.mod"},
+        "github.com/stretchr/testify": {"v1.10.0/go.mod", "v1.11.1", "v1.11.1/go.mod", "v1.2.2/go.mod", "v1.3.0/go.mod", "v1.4.0/go.mod", "v1.6.1/go.mod", "v1.7.0/go.mod", "v1.7.1/go.mod", "v1.8.0/go.mod", "v1.8.1/go.mod", "v1.8.2/go.mod", "v1.8.3/go.mod", "v1.8.4/go.mod", "v1.9.0/go.mod"},
+        "github.com/syndtr/gocapability": {"v0.0.0-20200815063812-42c35b437635", "v0.0.0-20200815063812-42c35b437635/go.mod"},
+        "github.com/syndtr/goleveldb": {"v1.0.0", "v1.0.0/go.mod"},
+        "github.com/tarm/serial": {"v0.0.0-20180830185346-98f6abe2eb07/go.mod"},
+        "github.com/tchap/go-patricia/v2": {"v2.3.2", "v2.3.2/go.mod"},
+        "github.com/tidwall/btree": {"v1.8.1", "v1.8.1/go.mod"},
+        "github.com/tmc/grpc-websocket-proxy": {"v0.0.0-20220101234140-673ab2c3ae75", "v0.0.0-20220101234140-673ab2c3ae75/go.mod"},
+        "github.com/urfave/cli": {"v1.19.1/go.mod", "v1.22.10/go.mod", "v1.22.2/go.mod"},
+        "github.com/urfave/cli/v2": {"v2.27.7", "v2.27.7/go.mod"},
+        "github.com/vbatts/tar-split": {"v0.12.1", "v0.12.1/go.mod"},
+        "github.com/viant/assertly": {"v0.4.8/go.mod"},
+        "github.com/viant/toolbox": {"v0.24.0/go.mod"},
+        "github.com/vishvananda/netlink": {"v1.3.1", "v1.3.1/go.mod"},
+        "github.com/vishvananda/netns": {"v0.0.5", "v0.0.5/go.mod"},
+        "github.com/warpfork/go-wish": {"v0.0.0-20220906213052-39a1cc7a02d0", "v0.0.0-20220906213052-39a1cc7a02d0/go.mod"},
+        "github.com/whyrusleeping/go-keyspace": {"v0.0.0-20160322163242-5b898ac5add1", "v0.0.0-20160322163242-5b898ac5add1/go.mod"},
+        "github.com/wk8/go-ordered-map/v2": {"v2.1.8", "v2.1.8/go.mod"},
+        "github.com/wlynxg/anet": {"v0.0.3/go.mod", "v0.0.5", "v0.0.5/go.mod"},
+        "github.com/x448/float16": {"v0.8.4", "v0.8.4/go.mod"},
+        "github.com/xeipuuv/gojsonpointer": {"v0.0.0-20180127040702-4e3ac2762d5f/go.mod", "v0.0.0-20190905194746-02993c407bfb", "v0.0.0-20190905194746-02993c407bfb/go.mod"},
+        "github.com/xeipuuv/gojsonreference": {"v0.0.0-20180127040603-bd5ef7bd5415", "v0.0.0-20180127040603-bd5ef7bd5415/go.mod"},
+        "github.com/xeipuuv/gojsonschema": {"v1.2.0", "v1.2.0/go.mod"},
+        "github.com/xhit/go-str2duration/v2": {"v2.1.0/go.mod"},
+        "github.com/xiang90/probing": {"v0.0.0-20221125231312-a49e3df8f510", "v0.0.0-20221125231312-a49e3df8f510/go.mod"},
+        "github.com/xlab/treeprint": {"v1.2.0", "v1.2.0/go.mod"},
+        "github.com/xrash/smetrics": {"v0.0.0-20240521201337-686a1a2994c1", "v0.0.0-20240521201337-686a1a2994c1/go.mod"},
+        "github.com/yl2chen/cidranger": {"v1.0.2", "v1.0.2/go.mod"},
+        "github.com/yuin/goldmark": {"v1.1.25/go.mod", "v1.1.27/go.mod", "v1.1.32/go.mod", "v1.2.1/go.mod", "v1.3.5/go.mod", "v1.4.1/go.mod", "v1.4.13/go.mod"},
+        "github.com/zeebo/assert": {"v1.3.0/go.mod"},
+        "github.com/zeebo/errs": {"v1.4.0/go.mod"},
+        "github.com/zeebo/xxh3": {"v1.0.2/go.mod"},
+        "go.etcd.io/bbolt": {"v1.4.2", "v1.4.2/go.mod"},
+        "go.etcd.io/raft/v3": {"v3.6.0", "v3.6.0/go.mod"},
+        "go.opencensus.io": {"v0.18.0/go.mod", "v0.21.0/go.mod", "v0.22.0/go.mod", "v0.22.2/go.mod", "v0.22.3/go.mod", "v0.22.4/go.mod", "v0.22.5/go.mod", "v0.23.0/go.mod", "v0.24.0", "v0.24.0/go.mod"},
+        "go.opentelemetry.io/auto/sdk": {"v1.1.0", "v1.1.0/go.mod"},
+        "go.opentelemetry.io/contrib/detectors/gcp": {"v1.34.0/go.mod"},
+        "go.opentelemetry.io/contrib/instrumentation/github.com/emicklei/go-restful/otelrestful": {"v0.44.0", "v0.44.0/go.mod"},
+        "go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc": {"v0.60.0", "v0.60.0/go.mod"},
+        "go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp": {"v0.60.0", "v0.60.0/go.mod"},
+        "go.opentelemetry.io/contrib/propagators/b3": {"v1.19.0", "v1.19.0/go.mod"},
+        "go.opentelemetry.io/otel": {"v1.32.0/go.mod", "v1.34.0/go.mod", "v1.37.0", "v1.37.0/go.mod"},
+        "go.opentelemetry.io/otel/exporters/otlp/otlptrace": {"v1.37.0", "v1.37.0/go.mod"},
+        "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc": {"v1.37.0", "v1.37.0/go.mod"},
+        "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp": {"v1.35.0", "v1.35.0/go.mod"},
+        "go.opentelemetry.io/otel/metric": {"v1.32.0/go.mod", "v1.34.0/go.mod", "v1.37.0", "v1.37.0/go.mod"},
+        "go.opentelemetry.io/otel/sdk": {"v1.34.0/go.mod", "v1.37.0", "v1.37.0/go.mod"},
+        "go.opentelemetry.io/otel/sdk/metric": {"v1.34.0/go.mod", "v1.35.0", "v1.35.0/go.mod"},
+        "go.opentelemetry.io/otel/trace": {"v1.32.0/go.mod", "v1.34.0/go.mod", "v1.37.0", "v1.37.0/go.mod"},
+        "go.opentelemetry.io/proto/otlp": {"v0.15.0/go.mod", "v1.0.0/go.mod", "v1.7.0", "v1.7.0/go.mod"},
+        "go.uber.org/atomic": {"v1.6.0/go.mod", "v1.7.0/go.mod"},
+        "go.uber.org/automaxprocs": {"v1.6.0", "v1.6.0/go.mod"},
+        "go.uber.org/dig": {"v1.18.0", "v1.18.0/go.mod"},
+        "go.uber.org/fx": {"v1.23.0", "v1.23.0/go.mod"},
+        "go.uber.org/goleak": {"v1.1.11-0.20210813005559-691160354723/go.mod", "v1.3.0", "v1.3.0/go.mod"},
+        "go.uber.org/mock": {"v0.5.2", "v0.5.2/go.mod"},
+        "go.uber.org/multierr": {"v1.11.0", "v1.11.0/go.mod", "v1.5.0/go.mod", "v1.6.0/go.mod"},
+        "go.uber.org/tools": {"v0.0.0-20190618225709-2cfd321de3ee/go.mod"},
+        "go.uber.org/zap": {"v1.16.0/go.mod", "v1.19.1/go.mod", "v1.27.0", "v1.27.0/go.mod"},
+        "go4.org": {"v0.0.0-20180809161055-417644f6feb5/go.mod"},
+        "golang.org/x/build": {"v0.0.0-20190111050920-041ab4dc3f9d/go.mod"},
+        "golang.org/x/crypto": {"v0.36.0", "v0.36.0/go.mod"},
+        "golang.org/x/exp": {"v0.0.0-20180321215751-8460e604b9de/go.mod", "v0.0.0-20180807140117-3d87b88a115f/go.mod", "v0.0.0-20190121172915-509febef88a4/go.mod", "v0.0.0-20190125153040-c74c464bbbf2/go.mod", "v0.0.0-20190306152737-a1d7652674e8/go.mod", "v0.0.0-20190510132918-efd6b22b2522/go.mod", "v0.0.0-20190829153037-c13cbed26979/go.mod", "v0.0.0-20191002040644-a1355ae1e2c3/go.mod", "v0.0.0-20191030013958-a1ab85dbe136/go.mod", "v0.0.0-20191129062945-2f5052295587/go.mod", "v0.0.0-20191227195350-da58074b4299/go.mod", "v0.0.0-20200119233911-0405dc783f0a/go.mod", "v0.0.0-20200207192155-f17229e696bd/go.mod", "v0.0.0-20200224162631-6cc2880d07d6/go.mod", "v0.0.0-20220827204233-334a2380cb91/go.mod", "v0.0.0-20230224173230-c95f2b4c22f2/go.mod", "v0.0.0-20250717185816-542afb5b7346", "v0.0.0-20250717185816-542afb5b7346/go.mod"},
+        "golang.org/x/image": {"v0.0.0-20180708004352-c73c2afc3b81/go.mod", "v0.0.0-20190227222117-0694c2d4d067/go.mod", "v0.0.0-20190802002840-cff245a6509b/go.mod", "v0.0.0-20190910094157-69e4b8554b2a/go.mod", "v0.0.0-20200119044424-58c23975cae1/go.mod", "v0.0.0-20200430140353-33d19683fad8/go.mod", "v0.0.0-20200618115811-c13761719519/go.mod", "v0.0.0-20201208152932-35266b937fa6/go.mod", "v0.0.0-20210216034530-4410531fe030/go.mod", "v0.0.0-20210607152325-775e3b0c77b9/go.mod", "v0.0.0-20210628002857-a66eb6448b8d/go.mod", "v0.0.0-20211028202545-6944b10bf410/go.mod", "v0.0.0-20220302094943-723b81ca9867/go.mod"},
+        "golang.org/x/lint": {"v0.0.0-20190227174305-5b3e6a55c961/go.mod", "v0.0.0-20190301231843-5614ed5bae6f/go.mod", "v0.0.0-20190409202823-959b441ac422/go.mod", "v0.0.0-20190909230951-414d861bb4ac/go.mod", "v0.0.0-20190930215403-16217165b5de/go.mod", "v0.0.0-20191125180803-fdd1cda4f05f/go.mod", "v0.0.0-20200130185559-910be7a94367/go.mod", "v0.0.0-20200302205851-738671d3881b/go.mod", "v0.0.0-20201208152925-83fdc39ff7b5/go.mod", "v0.0.0-20210508222113-6edffad5e616/go.mod"},
+        "golang.org/x/mobile": {"v0.0.0-20190312151609-d3739f865fa6/go.mod", "v0.0.0-20190719004257-d2bd2a29d028/go.mod"},
+        "golang.org/x/mod": {"v0.0.0-20190513183733-4bf6d317e70e/go.mod", "v0.1.0/go.mod", "v0.1.1-0.20191105210325-c90efee705ee/go.mod", "v0.1.1-0.20191107180719-034126e5016b/go.mod", "v0.12.0/go.mod", "v0.15.0/go.mod", "v0.17.0/go.mod", "v0.18.0/go.mod", "v0.2.0/go.mod", "v0.27.0", "v0.27.0/go.mod", "v0.3.0/go.mod", "v0.4.0/go.mod", "v0.4.1/go.mod", "v0.4.2/go.mod", "v0.5.0/go.mod", "v0.5.1/go.mod", "v0.6.0-dev.0.20220419223038-86c51ed26bb4/go.mod", "v0.6.0/go.mod", "v0.7.0/go.mod", "v0.8.0/go.mod", "v0.9.0/go.mod"},
+        "golang.org/x/net": {"v0.38.0", "v0.38.0/go.mod"},
+        "golang.org/x/oauth2": {"v0.0.0-20181017192945-9dcd33a902f4/go.mod", "v0.0.0-20181203162652-d668ce993890/go.mod", "v0.0.0-20190226205417-e64efc72b421/go.mod", "v0.0.0-20190604053449-0f29369cfe45/go.mod", "v0.0.0-20191202225959-858c2ad4c8b6/go.mod", "v0.0.0-20200107190931-bf48bf16ab8d/go.mod", "v0.0.0-20200902213428-5d25da1a8d43/go.mod", "v0.0.0-20201109201403-9fd604954f58/go.mod", "v0.0.0-20201208152858-08078c50e5b5/go.mod", "v0.0.0-20210218202405-ba52d332ba99/go.mod", "v0.0.0-20210220000619-9bb904979d93/go.mod", "v0.0.0-20210313182246-cd4f82c27b84/go.mod", "v0.0.0-20210514164344-f6687ab2804c/go.mod", "v0.0.0-20210628180205-a41e5a781914/go.mod", "v0.0.0-20210805134026-6f1e6394065a/go.mod", "v0.0.0-20210819190943-2bc19b11175f/go.mod", "v0.0.0-20211104180415-d3ed0bb246c8/go.mod", "v0.0.0-20220309155454-6242fa91716a/go.mod", "v0.0.0-20220411215720-9780585627b5/go.mod", "v0.0.0-20220608161450-d0670ef3b1eb/go.mod", "v0.0.0-20220622183110-fd043fe589d2/go.mod", "v0.0.0-20220822191816-0ebed06d0094/go.mod", "v0.0.0-20220909003341-f21342109be1/go.mod", "v0.0.0-20221006150949-b44042a4b9c1/go.mod", "v0.0.0-20221014153046-6fdb5e3db783/go.mod", "v0.24.0/go.mod", "v0.26.0/go.mod", "v0.30.0", "v0.30.0/go.mod", "v0.4.0/go.mod", "v0.5.0/go.mod", "v0.6.0/go.mod", "v0.7.0/go.mod", "v0.8.0/go.mod"},
+        "golang.org/x/perf": {"v0.0.0-20180704124530-6e6d33e29852/go.mod"},
+        "golang.org/x/sync": {"v0.0.0-20180314180146-1d60e4601c6f/go.mod", "v0.0.0-20181108010431-42b317875d0f/go.mod", "v0.0.0-20181221193216-37e7f081c4d4/go.mod", "v0.0.0-20190227155943-e225da77a7e6/go.mod", "v0.0.0-20190423024810-112230192c58/go.mod", "v0.0.0-20190911185100-cd5d95a43a6e/go.mod", "v0.0.0-20200317015054-43a5402ce75a/go.mod", "v0.0.0-20200625203802-6e8e738ad208/go.mod", "v0.0.0-20201020160332-67f06af15bc9/go.mod", "v0.0.0-20201207232520-09787c993a3a/go.mod", "v0.0.0-20210220032951-036812b2e83c/go.mod", "v0.0.0-20220601150217-0de741cfad7f/go.mod", "v0.0.0-20220722155255-886fb9371eb4/go.mod", "v0.0.0-20220819030929-7fc1605a5dde/go.mod", "v0.0.0-20220929204114-8fcdb60fdcc0/go.mod", "v0.1.0/go.mod", "v0.10.0/go.mod", "v0.11.0/go.mod", "v0.12.0/go.mod", "v0.16.0", "v0.16.0/go.mod", "v0.2.0/go.mod", "v0.3.0/go.mod", "v0.6.0/go.mod", "v0.7.0/go.mod", "v0.8.0/go.mod"},
+        "golang.org/x/sys": {"v0.31.0", "v0.31.0/go.mod"},
+        "golang.org/x/telemetry": {"v0.0.0-20240228155512-f48c80bd79b2/go.mod", "v0.0.0-20240521205824-bda55230c457/go.mod"},
+        "golang.org/x/term": {"v0.30.0/go.mod", "v0.34.0", "v0.34.0/go.mod"},
+        "golang.org/x/text": {"v0.0.0-20170915032832-14c0d48ead0c/go.mod", "v0.12.0/go.mod", "v0.14.0/go.mod", "v0.16.0/go.mod", "v0.17.0/go.mod", "v0.21.0/go.mod", "v0.22.0/go.mod", "v0.23.0/go.mod", "v0.28.0", "v0.28.0/go.mod", "v0.3.0/go.mod", "v0.3.1-0.20180807135948-17ff2d5776d2/go.mod", "v0.3.2/go.mod", "v0.3.3/go.mod", "v0.3.4/go.mod", "v0.3.5/go.mod", "v0.3.6/go.mod", "v0.3.7/go.mod", "v0.3.8/go.mod", "v0.4.0/go.mod", "v0.5.0/go.mod", "v0.6.0/go.mod", "v0.7.0/go.mod", "v0.8.0/go.mod", "v0.9.0/go.mod"},
+        "golang.org/x/time": {"v0.0.0-20180412165947-fbb02b2291d2/go.mod", "v0.0.0-20181108054448-85acf8d2951c/go.mod", "v0.0.0-20190308202827-9d24e82272b4/go.mod", "v0.0.0-20191024005414-555d28b269f0/go.mod", "v0.1.0/go.mod", "v0.12.0", "v0.12.0/go.mod", "v0.3.0/go.mod"},
+        "golang.org/x/tools": {"v0.0.0-20180525024113-a5b4c53f6e8b/go.mod", "v0.0.0-20180917221912-90fa682c2a6e/go.mod", "v0.0.0-20181030000716-a0a13e073c7b/go.mod", "v0.0.0-20181030221726-6c7e314b6563/go.mod", "v0.0.0-20190206041539-40960b6deb8e/go.mod", "v0.0.0-20190226205152-f727befe758c/go.mod", "v0.0.0-20190311212946-11955173bddd/go.mod", "v0.0.0-20190312151545-0bb0c0a6e846/go.mod", "v0.0.0-20190312170243-e65039ee4138/go.mod", "v0.0.0-20190328211700-ab21143f2384/go.mod", "v0.0.0-20190425150028-36563e24a262/go.mod", "v0.0.0-20190506145303-2d16b83fe98c/go.mod", "v0.0.0-20190524140312-2c0ae7006135/go.mod", "v0.0.0-20190606124116-d0a3d012864b/go.mod", "v0.0.0-20190621195816-6e04913cbbac/go.mod", "v0.0.0-20190628153133-6cdbf07be9d0/go.mod", "v0.0.0-20190816200558-6889da9d5479/go.mod", "v0.0.0-20190911174233-4f2ddba30aff/go.mod", "v0.0.0-20190927191325-030b2cf1153e/go.mod", "v0.0.0-20191012152004-8de300cfc20a/go.mod", "v0.0.0-20191029041327-9cc4af7d6b2c/go.mod", "v0.0.0-20191029190741-b9c20aec41a5/go.mod", "v0.0.0-20191113191852-77e3bb0ad9e7/go.mod", "v0.0.0-20191115202509-3a792d9c32b2/go.mod", "v0.0.0-20191119224855-298f0cb1881e/go.mod", "v0.0.0-20191125144606-a911d9008d1f/go.mod", "v0.0.0-20191130070609-6e064ea0cf2d/go.mod", "v0.0.0-20191216173652-a0e659d51361/go.mod", "v0.0.0-20191227053925-7b8e75db28f4/go.mod", "v0.0.0-20200117161641-43d50277825c/go.mod", "v0.0.0-20200122220014-bf1340f18c4a/go.mod", "v0.0.0-20200130002326-2f3ba24bd6e7/go.mod", "v0.0.0-20200204074204-1cc6d1ef6c74/go.mod", "v0.0.0-20200207183749-b753a1ba74fa/go.mod", "v0.0.0-20200212150539-ea181f53ac56/go.mod", "v0.0.0-20200224181240-023911ca70b2/go.mod", "v0.0.0-20200227222343-706bc42d1f0d/go.mod", "v0.0.0-20200304193943-95d2e580d8eb/go.mod", "v0.0.0-20200312045724-11d5b4c81c7d/go.mod", "v0.0.0-20200331025713-a30bf2db82d4/go.mod", "v0.0.0-20200501065659-ab2804fb9c9d/go.mod", "v0.0.0-20200512131952-2bc93b1c0c88/go.mod", "v0.0.0-20200515010526-7d3b6ebf133d/go.mod", "v0.0.0-20200618134242-20370b0cb4b2/go.mod", "v0.0.0-20200619180055-7c47624df98f/go.mod", "v0.0.0-20200729194436-6467de6f59a7/go.mod", "v0.0.0-20200804011535-6c149bb5ef0d/go.mod", "v0.0.0-20200825202427-b303f430e36d/go.mod", "v0.0.0-20200904185747-39188db58858/go.mod", "v0.0.0-20201110124207-079ba7bd75cd/go.mod", "v0.0.0-20201124115921-2c860bdd6e78/go.mod", "v0.0.0-20201201161351-ac6f37ff4c2a/go.mod", "v0.0.0-20201208233053-a543418bbed2/go.mod", "v0.0.0-20210105154028-b0ab187a4818/go.mod", "v0.0.0-20210106214847-113979e3529a/go.mod", "v0.0.0-20210108195828-e2f9c7f1fc8e/go.mod", "v0.1.0/go.mod", "v0.1.1/go.mod", "v0.1.12/go.mod", "v0.1.2/go.mod", "v0.1.4/go.mod", "v0.1.5/go.mod", "v0.1.9/go.mod", "v0.11.0/go.mod", "v0.13.0/go.mod", "v0.2.0/go.mod", "v0.21.1-0.20240508182429-e35e4ccd0d2d/go.mod", "v0.22.0/go.mod", "v0.3.0/go.mod", "v0.36.0", "v0.36.0/go.mod", "v0.6.0/go.mod"},
+        "golang.org/x/xerrors": {"v0.0.0-20190717185122-a985d3407aa7/go.mod", "v0.0.0-20191011141410-1b5146add898/go.mod", "v0.0.0-20191204190536-9bdfabe68543/go.mod", "v0.0.0-20200804184101-5ec99f83aff1/go.mod", "v0.0.0-20220411194840-2f41105eb62f/go.mod", "v0.0.0-20220517211312-f3a8303e98df/go.mod", "v0.0.0-20220609144429-65e65417b02f/go.mod", "v0.0.0-20220907171357-04be3eba64a2/go.mod"},
+        "golang.zx2c4.com/wireguard": {"v0.0.0-20231211153847-12269c276173", "v0.0.0-20231211153847-12269c276173/go.mod"},
+        "golang.zx2c4.com/wireguard/wgctrl": {"v0.0.0-20241231184526-a9ab2273dd10", "v0.0.0-20241231184526-a9ab2273dd10/go.mod"},
+        "gonum.org/v1/gonum": {"v0.0.0-20180816165407-929014505bf4/go.mod", "v0.11.0/go.mod", "v0.15.1", "v0.15.1/go.mod", "v0.8.2/go.mod", "v0.9.3/go.mod"},
+        "gonum.org/v1/netlib": {"v0.0.0-20190313105609-8cb42192e0e0/go.mod"},
+        "gonum.org/v1/plot": {"v0.0.0-20190515093506-e2840ee46a6b/go.mod", "v0.10.1/go.mod", "v0.9.0/go.mod"},
+        "google.golang.org/api": {"v0.0.0-20180910000450-7ca32eb868bf/go.mod", "v0.0.0-20181030000543-1d582fd0359e/go.mod", "v0.1.0/go.mod", "v0.100.0/go.mod", "v0.102.0/go.mod", "v0.103.0/go.mod", "v0.106.0/go.mod", "v0.108.0/go.mod", "v0.110.0/go.mod", "v0.111.0/go.mod", "v0.114.0/go.mod", "v0.122.0/go.mod", "v0.128.0/go.mod", "v0.13.0/go.mod", "v0.14.0/go.mod", "v0.15.0/go.mod", "v0.17.0/go.mod", "v0.18.0/go.mod", "v0.19.0/go.mod", "v0.20.0/go.mod", "v0.22.0/go.mod", "v0.24.0/go.mod", "v0.28.0/go.mod", "v0.29.0/go.mod", "v0.30.0/go.mod", "v0.35.0/go.mod", "v0.36.0/go.mod", "v0.4.0/go.mod", "v0.40.0/go.mod", "v0.41.0/go.mod", "v0.43.0/go.mod", "v0.47.0/go.mod", "v0.48.0/go.mod", "v0.50.0/go.mod", "v0.51.0/go.mod", "v0.54.0/go.mod", "v0.55.0/go.mod", "v0.57.0/go.mod", "v0.61.0/go.mod", "v0.63.0/go.mod", "v0.67.0/go.mod", "v0.7.0/go.mod", "v0.70.0/go.mod", "v0.74.0/go.mod", "v0.75.0/go.mod", "v0.77.0/go.mod", "v0.8.0/go.mod", "v0.80.0/go.mod", "v0.84.0/go.mod", "v0.85.0/go.mod", "v0.9.0/go.mod", "v0.93.0/go.mod", "v0.96.0/go.mod", "v0.97.0/go.mod", "v0.99.0/go.mod"},
+        "google.golang.org/appengine": {"v1.2.0/go.mod", "v1.3.0/go.mod", "v1.4.0/go.mod", "v1.5.0/go.mod", "v1.6.1/go.mod", "v1.6.5/go.mod", "v1.6.6/go.mod", "v1.6.7/go.mod"},
+        "google.golang.org/genproto": {"v0.0.0-20230525234035-dd9d682886f9/go.mod"},
+        "google.golang.org/genproto/googleapis/api": {"v0.0.0-20230525234020-1aefcd67740a/go.mod", "v0.0.0-20230525234035-dd9d682886f9/go.mod", "v0.0.0-20230530153820-e85fd2cbaebc/go.mod", "v0.0.0-20230822172742-b8732ec3820d/go.mod", "v0.0.0-20240814211410-ddb44dafa142/go.mod", "v0.0.0-20241202173237-19429a94021a/go.mod", "v0.0.0-20250218202821-56aae31c358a/go.mod", "v0.0.0-20250826171959-ef028d996bc1", "v0.0.0-20250826171959-ef028d996bc1/go.mod"},
+        "google.golang.org/genproto/googleapis/bytestream": {"v0.0.0-20230530153820-e85fd2cbaebc/go.mod"},
+        "google.golang.org/genproto/googleapis/rpc": {"v0.0.0-20230525234015-3fc162c6f38a/go.mod", "v0.0.0-20230525234030-28d5490b6b19/go.mod", "v0.0.0-20230530153820-e85fd2cbaebc/go.mod", "v0.0.0-20230803162519-f966b187b2e5/go.mod", "v0.0.0-20230822172742-b8732ec3820d/go.mod", "v0.0.0-20240318140521-94a12d6c2237/go.mod", "v0.0.0-20240730163845-b1a4ccb954bf/go.mod", "v0.0.0-20240814211410-ddb44dafa142/go.mod", "v0.0.0-20240826202546-f6391c0de4c7/go.mod", "v0.0.0-20241118233622-e639e219e697/go.mod", "v0.0.0-20241202173237-19429a94021a/go.mod", "v0.0.0-20250212204824-5a70512c5d8b/go.mod", "v0.0.0-20250218202821-56aae31c358a/go.mod", "v0.0.0-20250826171959-ef028d996bc1", "v0.0.0-20250826171959-ef028d996bc1/go.mod"},
+        "google.golang.org/grpc": {"v1.72.1", "v1.72.1/go.mod"},
+        "google.golang.org/grpc/cmd/protoc-gen-go-grpc": {"v1.1.0/go.mod"},
+        "google.golang.org/grpc/examples": {"v0.0.0-20230224211313-3775f633ce20/go.mod"},
+        "google.golang.org/protobuf": {"v1.23.0/go.mod", "v1.25.0/go.mod", "v1.26.0/go.mod", "v1.27.1/go.mod", "v1.28.0/go.mod", "v1.28.1/go.mod", "v1.29.1/go.mod", "v1.30.0/go.mod", "v1.31.0/go.mod", "v1.32.0/go.mod", "v1.33.0/go.mod", "v1.34.2/go.mod", "v1.35.2/go.mod", "v1.36.1/go.mod", "v1.36.3/go.mod", "v1.36.4/go.mod", "v1.36.5/go.mod", "v1.36.8", "v1.36.8/go.mod"},
+        "gopkg.in/check.v1": {"v0.0.0-20161208181325-20d25e280405/go.mod", "v1.0.0-20180628173108-788fd7840127/go.mod", "v1.0.0-20190902080502-41f04d3bba15/go.mod", "v1.0.0-20201130134442-10cb98267c6c", "v1.0.0-20201130134442-10cb98267c6c/go.mod"},
+        "gopkg.in/errgo.v2": {"v2.1.0/go.mod"},
+        "gopkg.in/evanphx/json-patch.v4": {"v4.13.0", "v4.13.0/go.mod"},
+        "gopkg.in/fsnotify.v1": {"v1.4.7/go.mod"},
+        "gopkg.in/go-jose/go-jose.v2": {"v2.6.3", "v2.6.3/go.mod"},
+        "gopkg.in/inf.v0": {"v0.9.1", "v0.9.1/go.mod"},
+        "gopkg.in/natefinch/lumberjack.v2": {"v2.2.1", "v2.2.1/go.mod"},
+        "gopkg.in/tomb.v1": {"v1.0.0-20141024135613-dd632973f1e7", "v1.0.0-20141024135613-dd632973f1e7/go.mod"},
+        "gopkg.in/yaml.v2": {"v2.2.1/go.mod", "v2.2.2/go.mod", "v2.2.8/go.mod", "v2.4.0", "v2.4.0/go.mod", "v2.4.2", "v2.4.2/go.mod"},
+        "gopkg.in/yaml.v3": {"v3.0.0-20200313102051-9f266ea9e77c/go.mod", "v3.0.0-20210107192922-496545a6307b/go.mod", "v3.0.1", "v3.0.1/go.mod", "v3.0.4", "v3.0.4/go.mod"},
+        "gotest.tools/v3": {"v3.5.0", "v3.5.0/go.mod"},
+        "grpc.go4.org": {"v0.0.0-20170609214715-11d0a25b4919/go.mod"},
+        "honnef.co/go/tools": {"v0.0.0-20190102054323-c2f93a96b099/go.mod", "v0.0.0-20190106161140-3f1c8253044a/go.mod", "v0.0.0-20190418001031-e561f6794a2a/go.mod", "v0.0.0-20190523083050-ea95bdfd59fc/go.mod", "v0.0.1-2019.2.3/go.mod", "v0.0.1-2020.1.3/go.mod", "v0.0.1-2020.1.4/go.mod", "v0.1.3/go.mod"},
+        "k8s.io/cri-client": {"v0.34.1", "v0.34.1/go.mod"},
+        "k8s.io/kube-openapi": {"v0.0.0-20250710124328-f3f2b991d03b", "v0.0.0-20250710124328-f3f2b991d03b/go.mod"},
+        "k8s.io/utils": {"v0.0.0-20250820121507-0af2bda4dd1d", "v0.0.0-20250820121507-0af2bda4dd1d/go.mod"},
+        "lukechampine.com/blake3": {"v1.4.0", "v1.4.0/go.mod"},
+        "lukechampine.com/uint128": {"v1.1.1/go.mod", "v1.2.0/go.mod"},
+        "modernc.org/cc/v3": {"v3.36.0/go.mod", "v3.36.2/go.mod", "v3.36.3/go.mod"},
+        "modernc.org/ccgo/v3": {"v3.0.0-20220428102840-41399a37e894/go.mod", "v3.0.0-20220430103911-bc99d88307be/go.mod", "v3.16.4/go.mod", "v3.16.6/go.mod", "v3.16.8/go.mod", "v3.16.9/go.mod"},
+        "modernc.org/ccorpus": {"v1.11.6/go.mod"},
+        "modernc.org/httpfs": {"v1.0.6/go.mod"},
+        "modernc.org/libc": {"v0.0.0-20220428101251-2d5f3daf273b/go.mod", "v1.16.0/go.mod", "v1.16.1/go.mod", "v1.16.17/go.mod", "v1.16.19/go.mod", "v1.17.0/go.mod", "v1.17.1/go.mod"},
+        "modernc.org/mathutil": {"v1.2.2/go.mod", "v1.4.1/go.mod", "v1.5.0/go.mod"},
+        "modernc.org/memory": {"v1.1.1/go.mod", "v1.2.0/go.mod", "v1.2.1/go.mod"},
+        "modernc.org/opt": {"v0.1.1/go.mod", "v0.1.3/go.mod"},
+        "modernc.org/sqlite": {"v1.18.1/go.mod"},
+        "modernc.org/strutil": {"v1.1.1/go.mod", "v1.1.3/go.mod"},
+        "modernc.org/tcl": {"v1.13.1/go.mod"},
+        "modernc.org/token": {"v1.0.0/go.mod"},
+        "modernc.org/z": {"v1.5.1/go.mod"},
+        "rsc.io/binaryregexp": {"v0.2.0/go.mod"},
+        "rsc.io/pdf": {"v0.1.1/go.mod"},
+        "rsc.io/quote/v3": {"v3.1.0/go.mod"},
+        "rsc.io/sampler": {"v1.3.0/go.mod"},
+        "sigs.k8s.io/apiserver-network-proxy/konnectivity-client": {"v0.33.0", "v0.33.0/go.mod"},
+        "sigs.k8s.io/json": {"v0.0.0-20250730193827-2d320260d730", "v0.0.0-20250730193827-2d320260d730/go.mod"},
+        "sigs.k8s.io/knftables": {"v0.0.18", "v0.0.18/go.mod"},
+        "sigs.k8s.io/kustomize/api": {"v0.20.1", "v0.20.1/go.mod"},
+        "sigs.k8s.io/kustomize/kustomize/v5": {"v5.7.1", "v5.7.1/go.mod"},
+        "sigs.k8s.io/kustomize/kyaml": {"v0.20.1", "v0.20.1/go.mod"},
+        "sigs.k8s.io/randfill": {"v1.0.0", "v1.0.0/go.mod"},
+        "sigs.k8s.io/structured-merge-diff/v6": {"v6.3.0", "v6.3.0/go.mod"},
+        "sigs.k8s.io/yaml": {"v1.6.0", "v1.6.0/go.mod"},
+        "tags.cncf.io/container-device-interface": {"v1.0.1", "v1.0.1/go.mod"},
+        "tags.cncf.io/container-device-interface/specs-go": {"v1.0.0", "v1.0.0/go.mod"}
+    }
+
+
+
 
     s = d.getVar('S')
     workdir = d.getVar('WORKDIR')
@@ -561,7 +1980,64 @@ python do_create_module_cache() {
                 except subprocess.CalledProcessError:
                     subprocess.run(["git", "fetch", "--all"], cwd=vcs_cache_path, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                     subprocess.run(["git", "checkout", commit], cwd=vcs_cache_path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                create_module_zip(module_path, version, str(vcs_cache_path), subdir)
+                alias_of = module_data.get('alias_of')
+                create_module_zip(module_path, version, str(vcs_cache_path), subdir, alias_of)
+
+                # CRITICAL FIX for k3s: Handle Go replace directives by creating alias cache entries
+                # When a module replaces another (e.g., k3s fork replaces upstream), create cache
+                # entries for both paths so imports can find the original path
+                replaced_paths = module_data.get('replaced_paths')
+                if replaced_paths:
+                    for replaced_path in replaced_paths:
+                        bb.note(f"Creating alias cache entry for replaced path: {replaced_path}@{version} -> {module_path}@{version}")
+                        create_module_zip(replaced_path, version, str(vcs_cache_path), subdir, alias_of=module_path)
+
+                # CRITICAL FIX: Extract module to pkg/mod for offline Go builds
+                # The zip contains paths like "gopkg.in/yaml.v3@v3.0.4/..." so extract to pkg/mod directly
+                try:
+                    import zipfile
+                    import os
+                    def escape_module_path_local(path):
+                        import re
+                        return re.sub(r'([A-Z])', lambda m: '!' + m.group(1).lower(), path)
+
+                    escaped_module = escape_module_path_local(module_path)
+                    escaped_version = escape_module_path_local(version)
+
+                    zip_path = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_module / "@v" / f"{escaped_version}.zip"
+                    extract_dir = Path(d.getVar('S')) / "pkg" / "mod"
+
+                    # Handle version aliases (e.g., v3.0.1 pointing to v3.0.4)
+                    is_version_alias = module_data.get('is_version_alias', False)
+                    if is_version_alias:
+                        # This is a version alias - create symlink and copy cache files
+                        orig_ver = module_data.get('original_version')
+                        if orig_ver:
+                            # Create symlink in pkg/mod: yaml.v3@v3.0.1 -> yaml.v3@v3.0.4
+                            orig_dir = extract_dir / f"{module_path}@{orig_ver}"
+                            alias_dir = extract_dir / f"{module_path}@{version}"
+                            if orig_dir.exists() and not alias_dir.exists():
+                                os.symlink(f"{module_path}@{orig_ver}", alias_dir)
+                                bb.note(f"Created symlink {module_path}@{version} -> @{orig_ver}")
+
+                            # Copy cache files (.mod, .zip, .info) for the alias version
+                            import shutil
+                            download_dir = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_module / "@v"
+                            orig_escaped_ver = escape_module_path_local(orig_ver)
+                            for ext in ['.mod', '.zip', '.info']:
+                                src = download_dir / f"{orig_escaped_ver}{ext}"
+                                dst = download_dir / f"{escaped_version}{ext}"
+                                if src.exists() and not dst.exists():
+                                    shutil.copy2(src, dst)
+                                    bb.note(f"Copied cache file {escaped_version}{ext}")
+                    elif zip_path.exists():
+                        # Normal extraction for non-alias modules
+                        extract_dir.mkdir(parents=True, exist_ok=True)
+                        with zipfile.ZipFile(zip_path, 'r') as zf:
+                            zf.extractall(extract_dir)
+                        bb.note(f"Extracted {module_path}@{version} to pkg/mod")
+                except Exception as e:
+                    bb.debug(1, f"Module extraction skipped for {module_path}: {e}")
         else:
             bb.warn(f"VCS cache missing for {module_path}: {vcs_cache_path}")
 
@@ -574,11 +2050,332 @@ python do_create_module_cache() {
             except Exception as e:
                 bb.warn(f"Module processing failed: {e}")
 
+    # CRITICAL FIX: Post-process to find version mismatches from transitive dependencies
+    # Use go.sum data to find what versions are needed, create symlinks for missing versions
+    bb.note("Checking for version mismatches using go.sum data...")
+
+    import re
+    import os
+    def escape_module_path_post(path):
+        return re.sub(r'([A-Z])', lambda m: '!' + m.group(1).lower(), path)
+
+    def canonicalize_module_path(module_path):
+        """Normalize alternate module paths to canonical form (e.g., go.yaml.in -> gopkg.in)"""
+        match = re.match(r'^go\.([^\.]+)\.in/(.+)$', module_path)
+        if match:
+            name, rest = match.groups()
+            parts = rest.split('/')
+            if len(parts) >= 2:
+                module_name = parts[0] or name
+                version = parts[1]
+                remainder = '/'.join(parts[2:])
+                canonical = f"gopkg.in/{module_name}.{version}"
+                if remainder:
+                    canonical = f"{canonical}/{remainder}"
+                return canonical
+            return f"gopkg.in/{name}.{rest}"
+        return module_path
+
+    # Track what versions we have extracted
+    # Map canonical path -> {actual_path: versions}
+    extracted_modules = {}  # canonical_path -> set of versions
+    actual_paths = {}  # canonical_path -> actual_extracted_path
+    pkg_mod_dir = Path(d.getVar('S')) / "pkg" / "mod"
+
+    # Scan extracted modules to see what we have
+    if pkg_mod_dir.exists():
+        for item in pkg_mod_dir.iterdir():
+            if item.is_dir() and '@' not in str(item.name):
+                # This is a module directory (e.g., "gopkg.in", "github.com", "go.yaml.in")
+                for subitem in item.rglob("*"):
+                    if subitem.is_dir() and '@' in subitem.name:
+                        # Found a versioned module (e.g., "yaml.v3@v3.0.4" or "go.yaml.in/yaml/v3@v3.0.4")
+                        rel_path = subitem.relative_to(pkg_mod_dir)
+                        parts = str(rel_path).rsplit('@', 1)
+                        if len(parts) == 2:
+                            actual_mod_path = parts[0]
+                            version = parts[1]
+
+                            # Track by canonical path so go.sum lookups work
+                            canonical_path = canonicalize_module_path(actual_mod_path)
+                            extracted_modules.setdefault(canonical_path, set()).add(version)
+
+                            # Remember the actual extracted path for creating symlinks
+                            if canonical_path not in actual_paths:
+                                actual_paths[canonical_path] = actual_mod_path
+
+    # Find mismatches: versions in go.sum but not extracted
+    missing_versions = []
+    for mod_path, req_versions in go_sum_requirements.items():
+        extracted = extracted_modules.get(mod_path, set())
+        for req_ver in req_versions:
+            if req_ver not in extracted:
+                # Find a version we DO have for this module
+                if extracted:
+                    base_ver = sorted(extracted)[-1]  # Use highest version
+                    actual_path = actual_paths.get(mod_path, mod_path)
+                    missing_versions.append((mod_path, actual_path, req_ver, base_ver))
+                else:
+                    bb.debug(1, f"go.sum requires {mod_path}@{req_ver} but no version extracted")
+
+    # Create symlinks and cache files for missing versions
+    if missing_versions:
+        bb.note(f"Found {len(missing_versions)} version mismatches from transitive dependencies")
+        for canonical_path, actual_path, missing_ver, base_ver in missing_versions:
+            try:
+                # Create symlink using actual extracted path (e.g., go.yaml.in/yaml/v3)
+                # module@missing_ver -> module@base_ver
+                base_dir = pkg_mod_dir / f"{actual_path}@{base_ver}"
+                missing_dir = pkg_mod_dir / f"{actual_path}@{missing_ver}"
+                if base_dir.exists() and not missing_dir.exists():
+                    os.symlink(f"{actual_path}@{base_ver}", missing_dir)
+                    bb.note(f"Created symlink: {actual_path}@{missing_ver} -> @{base_ver}")
+
+                # Also create at canonical path if different (e.g., gopkg.in/yaml.v3)
+                if canonical_path != actual_path:
+                    canonical_base = pkg_mod_dir / f"{canonical_path}@{base_ver}"
+                    canonical_missing = pkg_mod_dir / f"{canonical_path}@{missing_ver}"
+                    if base_dir.exists() and not canonical_missing.exists():
+                        # Link to actual extracted location
+                        canonical_missing.parent.mkdir(parents=True, exist_ok=True)
+                        os.symlink(f"../{actual_path}@{base_ver}", canonical_missing)
+                        bb.note(f"Created canonical symlink: {canonical_path}@{missing_ver} -> {actual_path}@{base_ver}")
+
+                # Create cache files with canonical module path by rewriting zips
+                escaped_actual = escape_module_path_post(actual_path)
+                escaped_canonical = escape_module_path_post(canonical_path)
+                escaped_missing = escape_module_path_post(missing_ver)
+                escaped_base = escape_module_path_post(base_ver)
+
+                # Source cache files are at actual_path location
+                src_cache_dir = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_actual / "@v"
+                # Destination cache files need to be at canonical_path location
+                dst_cache_dir = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_canonical / "@v"
+
+                if src_cache_dir.exists():
+                    dst_cache_dir.mkdir(parents=True, exist_ok=True)
+                    import shutil
+                    import zipfile
+                    import tempfile
+
+                    # Copy .mod file with rewritten module path
+                    src_mod = src_cache_dir / f"{escaped_base}.mod"
+                    dst_mod = dst_cache_dir / f"{escaped_missing}.mod"
+                    if src_mod.exists() and not dst_mod.exists():
+                        mod_content = src_mod.read_text()
+                        # Rewrite module directive to use canonical path using a replacement function
+                        import re
+                        def replace_module(match):
+                            return match.group(1) + canonical_path + match.group(3)
+
+                        mod_content = re.sub(
+                            r'^(module\s+)(' + re.escape(actual_path) + r')(\s*)',
+                            replace_module,
+                            mod_content,
+                            count=1,
+                            flags=re.MULTILINE
+                        )
+                        dst_mod.write_text(mod_content)
+                        bb.note(f"Created cache file: {canonical_path}@{missing_ver}.mod (rewritten)")
+
+                    # Create .zip file with canonical module paths
+                    src_zip = src_cache_dir / f"{escaped_base}.zip"
+                    dst_zip = dst_cache_dir / f"{escaped_missing}.zip"
+                    if src_zip.exists() and not dst_zip.exists():
+                        with tempfile.TemporaryDirectory() as tmpdir:
+                            tmppath = Path(tmpdir)
+                            # Extract source zip
+                            with zipfile.ZipFile(src_zip, 'r') as zf:
+                                zf.extractall(tmppath)
+
+                            # Find and rewrite go.mod
+                            for gomod in tmppath.rglob("go.mod"):
+                                content = gomod.read_text()
+                                def replace_in_zip(match):
+                                    return match.group(1) + canonical_path + match.group(3)
+
+                                content = re.sub(
+                                    r'^(module\s+)(' + re.escape(actual_path) + r')(\s*)',
+                                    replace_in_zip,
+                                    content,
+                                    count=1,
+                                    flags=re.MULTILINE
+                                )
+                                gomod.write_text(content)
+
+                            # Rename directory to use canonical path
+                            old_dir = tmppath / f"{actual_path}@{base_ver}"
+                            new_dir = tmppath / f"{canonical_path}@{missing_ver}"
+                            if old_dir.exists():
+                                new_dir.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.move(str(old_dir), str(new_dir))
+
+                            # Create new zip with canonical path
+                            with zipfile.ZipFile(dst_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
+                                for file in new_dir.rglob("*"):
+                                    if file.is_file():
+                                        arcname = str(file.relative_to(tmppath))
+                                        zf.write(file, arcname)
+
+                        bb.note(f"Created cache file: {canonical_path}@{missing_ver}.zip (rewritten)")
+            except Exception as e:
+                bb.debug(1, f"Could not create version alias for {canonical_path}@{missing_ver}: {e}")
+
     bb.note("Module cache creation complete")
 }
 
 # Add task after do_unpack (when git repositories are available)
 addtask create_module_cache after do_unpack before do_configure
+
+
+# ============================================================
+# do_generate_go_sum: Generate go.sum from module cache
+# ============================================================
+
+python do_generate_go_sum() {
+    """
+    Generate go.sum from the module cache artifacts.
+    - Zip checksums: Calculated from our VCS-based builds using Go helper binary
+    - go.mod checksums: Calculated locally using the Hash1(dirhash) algorithm
+
+    This matches Go's expectations while keeping the build offline.
+    """
+    import subprocess
+    import re
+    import hashlib
+    import base64
+    from pathlib import Path
+
+    s = d.getVar('S')
+    cache_dir = Path(s) / "pkg" / "mod" / "cache" / "download"
+    go_sum_path = Path(s) / "src" / "import" / "go.sum"
+    workdir = Path(d.getVar('WORKDIR'))
+    fallback_marker = workdir / ".use-gomodgit-go-sum"
+    fallback_sum = workdir / "go.sum.gomodgit"
+
+    if fallback_marker.exists() or fallback_sum.exists():
+        bb.warn("go.sum.gomodgit fallback detected - skipping helper-based go.sum generation")
+        fallback_marker.touch()
+        return
+
+    # Go helper binary for checksums
+    go_helper = Path(d.getVar('STAGING_BINDIR_NATIVE')) / "dirhash"
+
+    if not cache_dir.exists():
+        bb.fatal("Module cache not found - do_create_module_cache must run first")
+        return
+
+    if not go_helper.exists():
+        bb.fatal(f"Go checksum helper not found at {go_helper}. Ensure go-dirhash-native is in DEPENDS.")
+        return
+
+    bb.note("Generating go.sum from module cache (Hash1 for go.mod files)...")
+
+    def calculate_mod_checksum(mod_path):
+        try:
+            mod_bytes = mod_path.read_bytes()
+        except FileNotFoundError:
+            return None
+
+        file_hash = hashlib.sha256(mod_bytes).hexdigest()
+        summary = f"{file_hash}  go.mod\n".encode('ascii')
+        digest = hashlib.sha256(summary).digest()
+        return "h1:" + base64.b64encode(digest).decode('ascii')
+
+    checksums = {}
+
+    # Scan all .zip files in the module cache and calculate checksums
+    for zip_file in sorted(cache_dir.rglob("*.zip")):
+        try:
+            # Calculate zip checksum using Go helper binary
+            result = subprocess.run(
+                [str(go_helper), str(zip_file)],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            if result.returncode != 0:
+                bb.warn(f"Failed to calculate zip checksum for {zip_file}: {result.stderr}")
+                continue
+
+            zip_checksum = result.stdout.strip()
+
+            # Extract and unescape module path and version
+            parts = zip_file.parts
+            v_index = parts.index('@v')
+            download_index = parts.index('download')
+
+            escaped_module_parts = parts[download_index + 1:v_index]
+            escaped_module = '/'.join(escaped_module_parts)
+            escaped_version = zip_file.stem
+
+            def unescape(s):
+                """Unescape !lowercase back to uppercase"""
+                return re.sub(r'!([a-z])', lambda m: m.group(1).upper(), s)
+
+            module_path = unescape(escaped_module)
+            version = unescape(escaped_version)
+            module_version = f"{module_path} {version}"
+
+            # Calculate go.mod checksum directly from cached .mod file.
+            mod_file = zip_file.with_suffix('.mod')
+            mod_checksum = calculate_mod_checksum(mod_file)
+
+            if module_version not in checksums:
+                checksums[module_version] = {'zip': zip_checksum, 'mod': mod_checksum}
+
+        except Exception as e:
+            bb.warn(f"Error processing {zip_file}: {e}")
+            continue
+
+    # Write go.sum with hybrid checksums
+    go_sum_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(go_sum_path, 'w') as f:
+        for module_version in sorted(checksums.keys()):
+            data = checksums[module_version]
+            f.write(f"{module_version} {data['zip']}\n")
+            if data['mod']:
+                f.write(f"{module_version}/go.mod {data['mod']}\n")
+
+    num_with_mod = sum(1 if data['mod'] else 0 for data in checksums.values())
+    bb.note(f"✅ Generated go.sum with {len(checksums)} modules")
+    bb.note(f"   🎯 Zip checksums: {len(checksums)} calculated from VCS builds")
+    bb.note(f"   📄 go.mod checksums calculated from cached .mod files ({num_with_mod} entries)")
+}
+
+# Generate go.sum from actual module cache BEFORE compile
+addtask generate_go_sum after do_create_module_cache before do_compile
+
+
+# ============================================================
+# do_compile integration helpers
+# ============================================================
+
+do_compile:prepend() {
+    # Ensure offline Go builds consume the generated module cache
+    export GOMODCACHE="${S}/pkg/mod"
+    export GOPROXY="direct"
+    export GOSUMDB="off"
+    export GONOSUMDB="*"
+    export GOPRIVATE="*"
+    export GOFLAGS="${GOFLAGS} -mod=mod -modcacherw"
+
+    fallback_sum="${WORKDIR}/go.sum.gomodgit"
+    fallback_marker="${WORKDIR}/.use-gomodgit-go-sum"
+
+    if [ -f "${fallback_sum}" ]; then
+        bbwarn "Fallback go.sum.gomodgit detected - using provided checksums"
+        install -d "${S}/src/import"
+        install -m 0644 "${fallback_sum}" "${S}/src/import/go.sum"
+        touch "${fallback_marker}"
+    else
+        rm -f "${fallback_marker}"
+    fi
+
+    bbnote "Using offline Go module cache at ${GOMODCACHE}"
+}
 
 
 # ============================================================

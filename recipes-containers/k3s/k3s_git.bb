@@ -20,7 +20,8 @@ SRCREV_k3s = "54f28d21a6208b1f8f9c33e14cf1fc65c2030107"
 SRCREV_FORMAT = "k3s_fuse"
 PV = "v1.34.1+k3s1+git"
 
-include src_uri.inc
+# v3.0.0 hybrid architecture files
+include go-mod-git.inc
 
 CNI_NETWORKING_FILES ?= "${UNPACKDIR}/cni-containerd-net.conf"
 
@@ -49,12 +50,20 @@ DEPENDS += "rsync-native"
 # Explicitly allow them at link time to avoid ld --fatal-warnings aborting the build.
 GO_EXTRA_LDFLAGS:append = " -Wl,-z,notext"
 
-include module_cache_task.inc
+# v3.0.0 module cache builder
+include go-mod-cache.inc
 
 do_compile() {
         export GOPATH="${S}/src/import/.gopath:${S}/src/import/vendor:${STAGING_DIR_TARGET}/${prefix}/local/go"
+        export GOMODCACHE="${S}/pkg/mod"
         export CGO_ENABLED="1"
+        export GOPROXY="off"
+        export GOSUMDB="off"
         # export GOFLAGS="-mod=vendor"
+
+        # Remove go.sum files from git-fetched dependencies to prevent checksum conflicts
+        # Our git-built modules have different checksums than proxy.golang.org tarballs
+        find ${WORKDIR}/sources/vcs_cache -name "go.sum" -delete || true
 
         # TAGS="static_build ctrd no_btrfs netcgo osusergo providerless"
 	TAGS="static_build netcgo osusergo providerless"
