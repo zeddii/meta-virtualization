@@ -1,0 +1,659 @@
+    1  ll
+    2  cd recipes-containers/
+    3  cd buildah/
+    4  vi buildah_git.bb 
+    5  git show
+    6  vi buildah_git.bb 
+    7  git diff
+    8  git add .
+    9  git commit -C e7d9fe52dce9dc8b9f65eb593fda126e84868ac9
+   10  git commit --amend
+   11  cd ..
+   12  cd recipes-networking/cni/
+   13  vi cni_git.bb 
+   14  git diff
+   15  vi cni_git.bb 
+   16  kgit-summary
+   17  git show f533755
+   18  git diff
+   19  vi cni_git.bb 
+   20  git diff
+   21  vi cni_git.bb 
+   22  git diff
+   23  vi cni_git.bb 
+   24  git diff
+   25  vi cni_git.bb 
+   26  git diff
+   27  vi cni_git.bb 
+   28  emacs -nw cni_git.bb 
+   29  cd ..
+   30  cd recipes-containers/runc/
+   31  ll
+   32  emacs -nw runc*
+   33  fg
+   34  emacs -nw runc*
+   35  fg
+   36  cd ..
+   37  ls
+   38  cd ..
+   39  cd recipes-extended/xen/
+   40  ll
+   41  vi xen_4.18.bb 
+   42  git shoow
+   43  git show
+   44  vi xen_4.18.bb 
+   45  git ad d.
+   46  git add .
+   47  git commit --amend
+   48  git show
+   49  cd ..
+   50  git grep xen |grep -i pref
+   51  cd conf/distro/include/
+   52  vi meta-virt-default-versions.inc 
+   53  cd ..
+   54  kgit-summary
+   55  git branch
+   56  kcd pwd
+   57  cd ..
+   58  cd build/
+   59  history
+   60  ll
+   61  git status
+   62  rm rf 
+   63  ll
+   64  rm 0001-linux-libc-headers-bump-to-v6.5.patch 
+   65  ls workspace/
+   66  ls workspace/recipes/
+   67  cd
+   68  cd git/rootlesskit/
+   69  git describe 
+   70  git whatchanged 
+   71  cd ..
+   72  cd
+   73  cd poky/meta-virtualization/
+   74  git grep packagegroup-kubernetes-node
+   75  git grep kubernetes-node
+   76  findit -i  '*group
+   77  *'
+   78  findit -i  '*group*'
+   79  vi ./recipes-core/packagegroups/packagegroup-kubernetes.bb
+   80  ll
+   81  cd recipes-core//packagegroups/
+   82  ll
+   83  vi packagegroup-kubernetes.bb 
+   84  vi packagegroup-container.bb 
+   85  vi packagegroup-kubernetes.bb 
+   86  cd ..
+   87  git grep BBMAS
+   88  cd ../meta
+   89  git grep BBMAS
+   90  cd -
+   91  git grep BLACK
+   92  git grep EXCLUDE
+   93  cd ../meta
+   94  git grep EXCLUDE |grep PN
+   95  git grep SKIP
+   96  git grep SKIP |grep -i pack
+   97  cd ../meta-virtualization/recipes-containers/
+   98  cd docker
+   99  emacs -nw docker-moby_git.bb 
+  100  git show
+  101  emacs -nw docker-moby_git.bb 
+  102  git add .
+  103  git commit --amend
+  104  git show
+  105  emacs -nw docker-moby_git.bb 
+  106  git add .
+  107  git commit --amend
+  108  git show
+  109  kcd pwd
+  110  git push origin master-next
+  111  ll
+  112  git status
+  113  cd ../containerd/
+  114  emacs -nw containerd_git.bb 
+  115  git show
+  116  git push origin master-next
+  117  cd ..
+  118  ll
+  119  cd podman
+  120  emacs -nw podman_git.bb 
+  121  git show
+  122  git push origin master-next
+  123  cd ../podman-tui/
+  124  git dhow
+  125  kcd pwd
+  126  git show
+  127  emacs -nw podman-tui_git.bb 
+  128  git add .
+  129  git commit --amend
+  130  git push origin  master-next
+  131  cd git/lopper
+  132  git pull
+  133  git branch
+  134  git branch -a
+  135  git checkout v0.2024.x
+  136  git cherry-pick master
+  137  git push origin
+  138  git checkout master
+  139  cd poky/meta-virtualization/
+  140  git status
+  141  kgit-summary
+  142  git rebase -i HEAD^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  143  kgit-summary
+  144  git revert 45a4356
+  145  kgit-summary
+  146  git rebase -i HEAD^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  147  git push -f origin master:master-next
+  148  ll
+  149  kcd pwd
+  150  git diff
+  151  git status
+  152  git add  recipes-kernel/linux/yocto-cfg-fragments.bb
+  153  git commit -s -m "cfg-fragments: update to 6.6"
+  154  git status
+  155  git reset HEAD^
+  156  git status
+  157  git diff
+  158  git add  recipes-kernel/linux/yocto-cfg-fragments.bb
+  159  git commit -s -m "cfg-fragments: update to 6.6"
+  160  git status
+  161  git rm recipes-kernel/linux/linux-yocto/*
+  162  git sttaus
+  163  git status
+  164  git add recipes-kernel/linux/linux-yocto_virtualization.inc
+  165  git commi t-s
+  166  git commit -s
+  167  git push origin master:master-next
+  168  vi conf/layer.conf 
+  169  ll
+  170  git am -s ~/incoming/0001-_meta-virtualizationPATCH_1-1_virt-manager_add_package.patch
+  171  cd recipes-extended/
+  172  ll
+  173  cd vhost-device/
+  174  ll
+  175  cd ..
+  176  ll
+  177  cd xen/
+  178  ll
+  179  vi xen_4.18.bb 
+  180  cd ..
+  181  kgit-summary
+  182  git show 628d943
+  183  vi conf/layer.conf 
+  184  cd ..
+  185  cd meta
+  186  git grep vmlinu
+  187  git grep vmlinuzx
+  188  git grep vmlinuz
+  189  git grep build_syslinux
+  190  ll
+  191  git grep syslinux
+  192  git grep WKS_fILE
+  193  git grep WKS_FILE
+  194  cd ..
+  195  cd meta-virtualization/
+  196  findit -i '
+  197  findit -i '*qemuboot*'
+  198  vi ./wic/qemuboot-xen-x86-64.wks
+  199  vi ./wic/qemuboot-xen-x86-64.cfg 
+  200  git diff
+  201  vi wic/qemuboot-xen-x86-64.cfg
+  202  ll
+  203  git diff
+  204  git grep KERNEL_IM
+  205  git grep KERNEL_IMAGETYPE
+  206  git grep KERNEL_IMAGETYPES
+  207  git diff
+  208  kgit-summary
+  209  cd recipes-containers/podman
+  210  vi podman_git.bb 
+  211  cd ..
+  212  git grep VIRTUAL-RUNTIME_container_networking
+  213  git grep cni
+  214  git grep cni |grep -i depends
+  215  git grep VIRTUAL-RUNTIME_container_networking
+  216  ll
+  217  git diff
+  218  git status
+  219  git add recipes-extended/ wic/
+  220  git status
+  221  git commit -s
+  222  git push origin master:master-next
+  223  git diff
+  224  git show
+  225  git diff
+  226  git add recipes-containers/podman/podman_git.bb
+  227  git commit -s -m "podman: add new kernel module rrecommends"
+  228  git commit --amend
+  229  vi recipes-containers/netavark/netavark_1.10.3.bb 
+  230  kcd pwd
+  231  kgit-summary
+  232  ll
+  233  cd recipes-networking/
+  234  cd
+  235  <denix> again, changing OVERRIDES list in the recipe will be local to that recipe - kernel won't see those changes
+  236  cd poky/meta-cloud-services/
+  237  cat conf/layer.conf 
+  238  cd ../meta-virtualization/
+  239  findit -i '*containerd*'
+  240  cd recipes-containers/container
+  241  cd recipes-containers/containerd
+  242  ll
+  243  git checkout master
+  244  ls
+  245  ll
+  246  kcd pwd
+  247  git checkout master-push
+  248  git am -s ~/incoming/*
+  249  git am --abort
+  250  ll
+  251  git checkout master
+  252  kcd pwd
+  253  git am -s ~/incoming/*
+  254  kgit-summary
+  255  git checkout master-push
+  256  kgit-incoming clean
+  257  history | grep skopeo
+  258  cd ..
+  259  git status
+  260  cd ..
+  261  git status
+  262  git diff
+  263  git add recipes-containers/docker/docker-moby_git.bb
+  264  git commit -s -m "RFC: not for merge: docker-moby add -native variant"
+  265  kgit-summary
+  266  git pull --rebase origin master
+  267  git checkout master-next
+  268  git pull --rebase origin master-next
+  269  git checkout master
+  270  git pull --rebase origin master-next
+  271  kgit-summary
+  272  kgit-summary master-next
+  273  git status
+  274  git diff
+  275  git status
+  276  git diff
+  277  kgit-summary
+  278  git commit -s -C 6a44ae7
+  279  git commit -s -C 6a44ae7 recipes-extended/libvirt/
+  280  kgit-incoming clean mail
+  281  git am -s ~/incoming/000*
+  282  git apply --reject .git/rebase-apply/patch
+  283  wiggr recipes-containers/podman/podman_git.bb
+  284  wig-check recipes-containers/podman/podman_git.bb
+  285  git status
+  286  git add   recipes-containers/podman/podman_git.bb
+  287  git am --resolved
+  288  kcd pwd
+  289  git push origin master-next
+  290  emacs -nw recipes-extended/xen/files/0001-arm-silence-gcc14-warning-error-on-irq-bounds-check.patch 
+  291  git add recipes-extended/xen/files/0001-arm-silence-gcc14-warning-error-on-irq-bounds-check.patch
+  292  git commit -s -m "squash"
+  293  git rebase -i HEAD^^^^^^^^^
+  294  git push -f origin master-next
+  295  cd
+  296  cd git/rootlesskit/
+  297  kcd pwd
+  298  cd
+  299  cd poky/meta-virtualization/
+  300  ll
+  301  grep scripts *
+  302  #/opt/bruce/poky/meta-virtualization/scripts/oe-go-mod-autogen.py --repo   git://github.com/rootless-containers/rootlesskit  --rev 
+  303  /opt/bruce/poky/meta-virtualization/scripts/oe-go-mod-autogen.py --repo   git://github.com/rootless-containers/rootlesskit  --rev c784875ba4ba4c5aaa256f98675fd543b087c900
+  304  /opt/bruce/poky/meta-virtualization/scripts/oe-go-mod-autogen.py --repo  https://github.com/rootless-containers/rootlesskit  --rev c784875ba4ba4c5aaa256f98675fd543b087c900
+  305  cp /opt/bruce/poky/meta-virtualization/src_uri.inc recipes-extended/rootlesskit/
+  306  cp /opt/bruce/poky/meta-virtualization/relocation.inc  recipes-extended/rootlesskit/
+  307  cp modules.txt recipes-extended/rootlesskit/
+  308  ll
+  309  cd
+  310  cd poky/build/tmp/
+  311  cd work/core2-64-poky-linux/ceph/18.2.3/
+  312  ll
+  313  cd ceph-18.2.3/
+  314  ls
+  315  git init
+  316  git add .
+  317  git commit -s -m "foo"
+  318  git status
+  319  git am -s /tmp/0001-common-dout-fix-FTBFS-on-GCC-14.patch
+  320  pwd
+  321  cd ..
+  322  ip  a s
+  323  ping zedd.org
+  324  ip  a s | grep 131
+  325  sudo su
+  326  cd poky
+  327  source oe-init-build-env 
+  328  kcd pwd
+  329  git pull --rebase origin master
+  330  bitbake core-image-minimal
+  331  bitbake -c cleanall python3-pluggy
+  332  bitbake core-image-mi
+  333  bitbake core-image-minimal
+  334  bitbake -c cleanall python3-six-native; bitbake core-image-minimal
+  335  bitbake -c cleanall python3-six; bitbake core-image-minimal
+  336  bitbake -c cleanall python3-wcwidth python3-atomicwrites; bitbake core-image-minimal
+  337  bitbake -c cleanall python3-iniparse; bitbake core-image-minimal
+  338  bitbake -c cleanall python3-importlib-metadata; bitbake core-image-minimal
+  339  bitbake -c cleanall python3-pathlib2; bitbake core-image-minimal
+  340  bitbake -c cleanall python3-dtc; bitbake core-image-minimal
+  341  bitbake -c cleanall python3-humanfriendly; bitbake core-image-minimal
+  342  bitbake -c cleanall python3-py; bitbake core-image-minimal
+  343  bitbake -c cleanall python3-dbusmock; bitbake core-image-minimal
+  344  bitbake -c cleanall python3-sortedcontainers; bitbake core-image-minimal
+  345  bitbake -c cleanall lopper; bitbake core-image-minimal
+  346  ll
+  347  bitbake libvirt
+  348  bitbake -c cleanall libvirt
+  349  bitbake libvirt
+  350  cd
+  351  tmj
+  352  tmn
+  353  tmj
+  354  ip a s
+  355  tmj
+  356  tmn
+  357  tmj
+  358  tmj
+  359  cat /etc/hosts
+  360  ssh bruce@xps
+  361  tmj
+  362  \fg
+  363  fg
+  364  ip a s
+  365  ps -ef |grep ssh
+  366  who
+  367  tmj
+  368  at 
+  369  tmj
+  370  tmj
+  371  tmj
+  372  vi .bashrc 
+  373  tmj
+  374  alias
+  375  uptime
+  376  tmj
+  377  tmn
+  378  tmj
+  379  tmj
+  380  tmj
+  381  ip  a s
+  382  tmj
+  383  reset
+  384  ssh-agent 
+  385  SSH_AUTH_SOCK=/tmp/ssh-0hVYIsH0SW8S/agent.3742; export SSH_AUTH_SOCK;
+  386  SSH_AGENT_PID=3743; export SSH_AGENT_PID;
+  387  ssh-add
+  388  tmj
+  389  tmn
+  390  tmj
+  391  sc
+  392  uptime
+  393  ll
+  394  ps -ef 
+  395  tmj
+  396  tmn
+  397  ps -ef |grep tmux
+  398  tmux a
+  399  pkill -USR1 tmux
+  400  tmj
+  401  tr -d '\r' < .container-work-1749610898/encoded_data.txt | base64 -d > test-decode.tar
+  402  echo "Exit code: $?"
+  403  history
+  404  pwd
+  405  history
+  406  ip a s
+  407  tmj
+  408  tmn
+  409  ssh-agent 
+  410  SSH_AUTH_SOCK=/tmp/ssh-sQOa0MPsIHAe/agent.4312; export SSH_AUTH_SOCK;
+  411  SSH_AGENT_PID=4313; export SSH_AGENT_PID;
+  412  ssh-add
+  413  tmj
+  414  tmn
+  415  cd git/
+  416  ll
+  417  cd aardvark-dns/
+  418  ll
+  419  kcd pwd
+  420  git pull
+  421  git whatchanged -m
+  422  git whatchanged -m 
+  423  git show v1.15.0
+  424  git whatchanged -m 
+  425  grep kgit-summary ../history*
+  426  grep kgit-summary ../history* |grep aard
+  427  cat .git/config 
+  428  cd ..
+  429  grep buildah history*
+  430  cd catatonit/
+  431  kcd pwd
+  432  git pull
+  433  git whatchanged -m
+  434  cat .git/config 
+  435  cd ../conmon/
+  436  kcd pwd
+  437  git pull
+  438  cat .git/on
+  439  cat .git/config 
+  440  grep conmon ../history*
+  441  grep conmon ../history* |grep tag
+  442  cd ../containerd
+  443  cat ./git/con
+  444  cat .git/config 
+  445  grep containerd ../history*
+  446  cd cri-o
+  447  cd ..
+  448  cd cri-o
+  449  cat .git/config 
+  450  cd ..
+  451  grep cri-o history*
+  452  cd cri-tools/
+  453  kcd pwd
+  454  gi pull
+  455  git pull
+  456  kcd pwd
+  457  cat .git/config 
+  458  cd ../criu/
+  459  cat .git/config 
+  460  cd ../crun
+  461  cat .git/config 
+  462  grep amend ../history*
+  463  grep amend ../history* |grep crun
+  464  cd ../moby/
+  465  cat .git/config 
+  466  cd ../docker-cli/
+  467  cat .git/config 
+  468  cd ..
+  469  cd libpod/
+  470  kcd pwd
+  471  git checkout main
+  472  git pull
+  473  cat .git/config 
+  474  cd ../kubernetes
+  475  cat .git/config 
+  476  cd ../lxc/
+  477  cat .git/config 
+  478  cd ../netavark/
+  479  cat .git/config 
+  480  git pull
+  481  cd ../podman-compose
+  482  cat .git/config 
+  483  git pull
+  484  cd ../
+  485  cd podman-tui/
+  486  cat .git/config 
+  487  cd ../runc/
+  488  cat .git/config 
+  489  cd ../singularity/
+  490  kcd pwd
+  491  git pull
+  492  cd ../skopeo/
+  493  cat .git/config 
+  494  cd ../umoci/
+  495  cat .git/config 
+  496  cd ../cloud-init/
+  497  cat .git/config 
+  498  cd ../libvirt/
+  499  cat .git/config 
+  500  tmj
+  501  ls
+  502  rm cni.fuckoff/
+  503  rm -rf cni.fuckoff/
+  504  ls
+  505  rm 0001-hack-fix-build-for-redhat-security.patch 
+  506  pwd
+  507  top
+  508  fg
+  509  cd poky/meta-virtualization/
+  510  git grep cgroups.scc
+  511  git grep cgroups
+  512  cd ..
+  513  git grep cgroups
+  514  git grep cgroups.scc
+  515  git grep cgroups
+  516  cd -
+  517  ll
+  518  git grep cgroups
+  519  findit -i '*linux*'
+  520  rm -rf modules/
+  521  findit -i '*linux*'
+  522  rm -rf debug_vendor/
+  523  findit -i '*linux*'
+  524  rm -rf test_fixed_vendor/
+  525  findit -i '*linux*'
+  526  cat ./recipes-kernel/linux/linux-yocto_6.12_virtualization.inc
+  527  cat ./recipes-kernel/linux/linux-yocto_virtualization.inc 
+  528  reset
+  529  tmj
+  530  cd /home/bruce/bin/
+  531  cd git/lopper
+  532  git pull --rebase origin master
+  533  ./lopper.py --help
+  534  ./lopper
+  535  find . -name 'domains.yaml'
+  536  ll
+  537  cd git/lopper
+  538  emacs -nw lopper/*.py
+  539  ll
+  540  tmj
+  541  tmn
+  542  cd /opt/bruce/poky-go-mod-update/build
+  543  ll
+  544  cd ..
+  545  cd meta-virtualization/scripts/
+  546  ll
+  547  claude
+  548  npm
+  549  sudo apt install npm
+  550  npm install -g @anthropic-ai/claude-code
+  551  sudo npm install -g @anthropic-ai/claude-code
+  552  claude 
+  553  reset
+  554  ls
+  555  claude doctor
+  556  sudo chown -R $USER:$(id -gn) $(npm -g config get prefix)
+  557  claude
+  558  ls
+  559  df -kf .
+  560  df -kh .
+  561  claude
+  562  ll
+  563  cd ..
+  564  git diff
+  565  history |grep pull
+  566  git reset --hard HEAD
+  567  kgit-summary
+  568  ./scripts/oe-go-mod-fetcher.py --use-hybrid       --git-repo https://github.com/containerd/nerdctl.git       --git-ref 832c4556e0b82789f687b70d1e394b892e035722       --recipedir ./recipes-containers/nerdctl/       --gomodcache /opt/bruce/cache/go-mod-cache
+  569  pwd
+  570  ./scripts/oe-go-mod-fetcher.py --use-hybrid       --git-repo https://github.com/containerd/nerdctl.git       --git-ref 832c4556e0b82789f687b70d1e394b892e035722       --recipedir ./recipes-containers/nerdctl/       --gomodcache /opt/bruce/cache/go-mod-cache
+  571  history |grep push
+  572  ./scripts/oe-go-mod-fetcher.py --use-hybrid       --git-repo https://github.com/containerd/nerdctl.git       --git-ref 832c4556e0b82789f687b70d1e394b892e035722       --recipedir ./recipes-containers/nerdctl/       --gomodcache /opt/bruce/cache/go-mod-cache
+  573  cd recipes-containers/nerdctl/
+  574  vi nerdctl_git.bb 
+  575  vi module_cache_task.inc 
+  576  pwd
+  577  cd ..
+  578  cd ~/git/k3s
+  579  git pull
+  580  git checkout release-1.34
+  581  git whatchanged .
+  582  history
+  583  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py  --use-hybrid     --recipedir   /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/k3s/  --gomodcache /opt/bruce/cache/go-mod-cache
+  584  cd ../compose
+  585  git pull
+  586  git whatchanged 
+  587  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py  --use-hybrid     --recipedir   /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/docker-compose/  --gomodcache /opt/bruce/cache/go-mod-cache
+  588  pwd
+  589  #cd /home/bruce/git/compose; 
+  590  #/opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py  --use-hybrid     --recipedir   /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/docker-compose/  --gomodcache /opt/bruce/cache/go-mod-cache
+  591  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py  --use-hybrid     --recipedir   /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/docker-compose/  --gomodcache /opt/bruce/cache/go-mod-cache
+  592  ps -ef |grep oe
+  593  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py  --use-hybrid     --recipedir   /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/docker-compose/  --gomodcache /opt/bruce/cache/go-mod-cache
+  594  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py  --use-hybrid     --recipedir   /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/docker-compose/  --gomodcache /opt/bruce/cache/go-mod-cache --help
+  595  cd ../nerdctl/
+  596  history | grep nerdctl
+  597  ./scripts/oe-go-mod-fetcher.py --use-hybrid       --git-repo https://github.com/containerd/nerdctl.git       --git-ref 832c4556e0b82789f687b70d1e394b892e035722       --recipedir ./recipes-containers/nerdctl/       --gomodcache /opt/bruce/cache/go-mod-cache
+  598  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py --use-hybrid       --git-repo https://github.com/containerd/nerdctl.git       --git-ref 832c4556e0b82789f687b70d1e394b892e035722       --recipedir ./recipes-containers/nerdctl/       --gomodcache /opt/bruce/cache/go-mod-cache
+  599  cd ../k3s
+  600  kcd pwd
+  601  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py --use-hybrid         --recipedir ./recipes-containers/k3s     --gomodcache /opt/bruce/cache/go-mod-cache
+  602  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py --use-hybrid         --recipedir ./recipes-containers/k3s     --gomodcache /opt/bruce/cache/go-mod-cache --srcrev
+  603  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py --use-hybrid         --recipedir ./recipes-containers/k3s     --gomodcache /opt/bruce/cache/go-mod-cache
+  604  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py --use-hybrid         --recipedir /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/k3s     --gomodcache /opt/bruce/cache/go-mod-cache
+  605  git whatchanged 
+  606  git whatchanged -m
+  607  [200~git checkout 54f28d21a6208b1f8f9c33e14cf1fc65c2030107
+  608  ~git checkout 54f28d21a6208b1f8f9c33e14cf1fc65c2030107
+  609  git checkout 54f28d21a6208b1f8f9c33e14cf1fc65c2030107
+  610  git checkout master 
+  611  git checkout main
+  612  git branch -a
+  613  git checkout release-1.34
+  614  git branch --contains54f28d21a6208b1f8f9c33e14cf1fc65c2030107
+  615  git branch --contains 54f28d21a6208b1f8f9c33e14cf1fc65c2030107
+  616  git whatchanged -m
+  617  git branch --contains 54f28d21a6208b1f8f9c33e14cf1fc65c2030107
+  618  git whatchanged -m
+  619  git checkout -f 54f28d21a6208b1f8f9c33e14cf1fc65c2030107
+  620  git checkout release-1.
+  621  git checkout release-1.34 
+  622  git reset --hard 54f28d21a6208b1f8f9c33e14cf1fc65c2030107
+  623  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py --use-hybrid         --recipedir /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/k3s     --gomodcache /opt/bruce/cache/go-mod-cache
+  624  history
+  625  pwd
+  626  kcd pwd
+  627  git whatchanged 
+  628  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py --use-hybrid         --recipedir /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/k3s     --gomodcache /opt/bruce/cache/go-mod-cache
+  629  rm -rf vendor/
+  630  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py --use-hybrid         --recipedir /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/k3s     --gomodcache /opt/bruce/cache/go-mod-cache
+  631  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py --use-hybrid --recipedir /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/k3s --gomodcache /opt/bruce/cache/go-mod-cache 2>&1 | tee /tmp/k3s-regen-with-gosum-fix.log
+  632  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py --use-hybrid --recipedir /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/k3s --gomodcache /opt/bruce/cache/go-mod-cache 2>&1 | tee /tmp/k3s-regen-vcs-fix.log
+  633  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py --use-hybrid --recipedir /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/k3s --gomodcache /opt/bruce/cache/go-mod-cache 2>&1 | tee /tmp/k3s-regen-final.log
+  634  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py --use-hybrid --recipedir /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/k3s --gomodcache /opt/bruce/cache/go-mod-cache 2>&1 | tee /tmp/k3s-regen-with-fallback.log
+  635  history >> history.txt 
+  636  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py --use-hybrid --recipedir /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/k3s --gomodcache /opt/bruce/cache/go-mod-cache 2>&1 | tee /tmp/k3s-regen-with-fallback.log
+  637  rm /tmp/k3s-regen-with-fallback.log
+  638  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py --use-hybrid --recipedir /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/k3s --gomodcache /opt/bruce/cache/go-mod-cache 2>&1 | tee /tmp/k3s-regen-with-fallback.log
+  639  vi /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py
+  640  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py --use-hybrid --recipedir /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/k3s --gomodcache /opt/bruce/cache/go-mod-cache 2>&1 | tee /tmp/k3s-regen-with-fallback.log
+  641  vi /tmp/k3s-regen-with-fallback.log 
+  642  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py --use-hybrid --recipedir /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/k3s --gomodcache /opt/bruce/cache/go-mod-cache 2>&1 | tee /tmp/k3s-regen-with-fallback.log
+  643  vi /tmp/k3s-regen-with-fallback.log 
+  644  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py --use-hybrid --recipedir /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/k3s --gomodcache /opt/bruce/cache/go-mod-cache 2>&1 | tee /tmp/k3s-regen-with-fallback.log
+  645  dmesg
+  646  sudo dmesg
+  647  df -kh
+  648  #/opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py --use-hybrid --recipedir /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/k3s --gomodcache /opt/bruce/cache/go-mod-cache 2>&1 | tee /tmp/k3s-regen-with-fallback.log
+  649  vi /tmp/k3s-regen-with-fallback.log 
+  650  ps -ef |grep oe-go
+  651  ##/opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py --use-hybrid --recipedir /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/k3s --gomodcache /opt/bruce/cache/go-mod-cache 2>&1 | tee /tmp/k3s-regen-script-v2.4.3.log
+  652  vi /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py 
+  653  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py --use-hybrid --recipedir /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/k3s --gomodcache /opt/bruce/cache/go-mod-cache 2>&1 | tee /tmp/k3s-regen-script-v2.4.3.log
+  654  #/opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py --use-hybrid --recipedir /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/k3s --gomodcache /opt/bruce/cache/go-mod-cache 2>&1 | tee /tmp/k3s-regen-script-v2.4.3.log 
+  655  /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/oe-go-mod-fetcher.py --use-hybrid --recipedir /opt/bruce/poky-go-mod-update/meta-virtualization/recipes-containers/k3s --gomodcache /opt/bruce/cache/go-mod-cache 2>&1 | tee /tmp/k3s-regen.log
+  656  history /opt/bruce/poky-go-mod-update/scripts/history-generation.txt"
+  657  history /opt/bruce/poky-go-mod-update/scripts/history-generation.txt
+  658  history > /opt/bruce/poky-go-mod-update/scripts/history-generation.txt
+  659  history > /opt/bruce/poky-go-mod-update/meta-virtualization/scripts/history-generation.txt
