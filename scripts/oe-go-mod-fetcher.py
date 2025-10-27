@@ -1,10 +1,38 @@
 #!/usr/bin/env python3
 
 """
-Go Module Git Fetcher
-Version 2.3.15 - Add extensive debugging to relocation script
+Go Module Git Fetcher - Hybrid Architecture
+Version 3.0.0 - Complete rewrite using Go download for discovery + git builds
 Author: AI Assistant
-Description: Fetch Git repositories for Go modules and checkout exact revisions
+Description: Use Go's download for discovery, build from git sources
+
+ARCHITECTURE:
+Phase 1: Discovery - Use 'go mod download' + filesystem walk to get correct module paths
+Phase 2: Recipe Generation - Generate BitBake recipe with git:// SRC_URI entries
+Phase 3: Cache Building - Build module cache from git sources during do_create_module_cache
+
+This approach eliminates:
+- Complex go list -m -json parsing
+- Manual go.sum parsing and augmentation
+- Parent module detection heuristics
+- Version path manipulation (/v2+/v3+ workarounds)
+- Module path normalization bugs
+
+Instead we:
+- Let Go download modules to temporary cache (discovery only)
+- Walk filesystem to get CORRECT module paths (no parsing!)
+- Extract VCS info from .info files
+- Fetch git repositories for each module
+- Build module cache from git during BitBake build
+
+CHANGELOG v3.0.0:
+- Complete architectural rewrite following CLAUDE.md design
+- Removed all go list and go.sum parsing logic (4000+ lines)
+- Implemented 3-phase hybrid approach
+- Discovery uses go mod download + filesystem walk
+- Module paths from filesystem, not from go list (no more /v3 stripping bugs!)
+- Builds entirely from git sources
+- Compatible with oe-core's gomod:// fetcher (same cache structure)
 """
 
 import argparse
@@ -16,6712 +44,1547 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import textwrap
-from collections import OrderedDict
-from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Set
+from typing import Dict, List, Optional, Set, Tuple
+from datetime import datetime, timedelta
 
-VERSION = "2.3.15"
+VERSION = "3.0.0"
 
-DIRHASH_REPO_URL = "https://go.googlesource.com/mod"
-DIRHASH_REPO_COMMIT = "f8a9fe217cff893cb67f4acad96a0021c13ee6e7"
-DIRHASH_HELPER_SOURCE = """package main\n\nimport (\n    \"fmt\"\n    \"os\"\n\n    \"golang.org/x/mod/sumdb/dirhash\"\n)\n\nfunc main() {\n    if len(os.Args) != 2 {\n        fmt.Fprintf(os.Stderr, \"Usage: %s <zip-file>\\n\", os.Args[0])\n        os.Exit(1)\n    }\n\n    zipPath := os.Args[1]\n    hash, err := dirhash.HashZip(zipPath, dirhash.DefaultHash)\n    if err != nil {\n        fmt.Fprintf(os.Stderr, \"Error: %v\\n\", err)\n        os.Exit(1)\n    }\n\n    fmt.Println(hash)\n}\n"""
+# =============================================================================
+# BitBake Task Templates
+# =============================================================================
 
-MODULE_CACHE_TASK_HEADER = textwrap.dedent(r'''
-python do_create_module_cache() {
-    """
-    Build Go module cache from downloaded git repositories.
-    Fast parallel processing replaces BitBake's slow sequential gomodgit.
-    """
-    import hashlib
-    import os
-    import subprocess
-    import zipfile
-    import threading
-    import re
-    from pathlib import Path
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    def create_vcs_info_file(vcs_path, repo_url):
-        """Create .info file for VCS cache entry"""
-        vcs_key = f"git3:{repo_url}"
-        with open(f"{vcs_path}.info", 'wb') as f:
-            f.write(vcs_key.encode())
-
-    def create_module_zip(module_path, version, vcs_path, subdir=None, alias_of=None):
-        """Create module zip file from git repository"""
-        # Calculate paths
-        # Use correct escaping function that matches BitBake's gomod.py
-        def escape_module_path(path):
-            """Escape capital letters using exclamation points (same as BitBake gomod.py)"""
-            import re
-            return re.sub(r'([A-Z])', lambda m: '!' + m.group(1).lower(), path)
-
-        def sanitize_module_name(name):
-            if not name:
-                return name
-            stripped = name.strip()
-            if len(stripped) >= 2 and stripped[0] == '"' and stripped[-1] == '"':
-                return stripped[1:-1]
-            return stripped
-
-        module_path = sanitize_module_name(module_path)
-        alias_of = sanitize_module_name(alias_of) if alias_of else None
-
-        escaped_module = escape_module_path(module_path)
-        escaped_version = escape_module_path(version)
-
-        alias_module = module_path
-        rewrite_to_alias = bool(alias_of)
-
-        download_dir = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_module / "@v"
-        download_dir.mkdir(parents=True, exist_ok=True)
-
-        zip_path = download_dir / f"{escaped_version}.zip"
-        mod_path = download_dir / f"{escaped_version}.mod"
-
-        module_decl_pattern = re.compile(r'(?m)^(module\s+)(\S+)(\s*)')
-
-        def make_module_directive(module_name):
-            """Create a proper go.mod module directive with newline"""
-            cleaned_module = sanitize_module_name(module_name)
-            return f"module {cleaned_module}\n"
-
-        def rewrite_module_directive(text, new_module):
-            cleaned_module = sanitize_module_name(new_module)
-            def replacer(match):
-                existing = match.group(2)
-                if existing.startswith('"') and existing.endswith('"'):
-                    return f"{match.group(1)}{cleaned_module}{match.group(3)}"
-                return f"{match.group(1)}{cleaned_module}{match.group(3)}"
-
-            new_text, count = module_decl_pattern.subn(replacer, text, count=1)
-            return new_text if count else None
-
-        # Create module zip file using git archive (much faster and avoids arg limits)
-        try:
-            import tarfile
-            import tempfile
-
-            with tempfile.TemporaryDirectory() as tmpdir:
-                # Use git archive to extract files efficiently
-                archive_cmd = ["git", "archive", "--format=tar", "HEAD"]
-                if subdir:
-                    archive_cmd.append(subdir)
-
-                tar_data = subprocess.check_output(archive_cmd, cwd=vcs_path)
-
-                # Extract tar to temp directory
-                tar_path = Path(tmpdir) / "archive.tar"
-                tar_path.write_bytes(tar_data)
-
-                with tarfile.open(tar_path, 'r') as tf:
-                    tf.extractall(tmpdir)
-
-                # Find go.mod files to determine excluded prefixes
-                expected_go_mod = f"{subdir}/go.mod" if subdir else "go.mod"
-                excluded_prefixes = []
-
-                extract_root = Path(tmpdir)
-                if subdir:
-                    extract_root = extract_root / subdir
-
-                for gomod_file in extract_root.rglob("go.mod"):
-                    rel_path = gomod_file.relative_to(Path(tmpdir))
-                    if str(rel_path) != expected_go_mod:
-                        dir_path = gomod_file.parent.relative_to(Path(tmpdir))
-                        if str(dir_path) != '.':
-                            excluded_prefixes.append(f"{dir_path}/")
-
-                # Create zip file
-                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                    module_prefix = f"{module_path}@{version}/"
-
-                    for file_path in extract_root.rglob("*"):
-                        if file_path.is_file():
-                            rel_path = file_path.relative_to(Path(tmpdir))
-                            rel_str = str(rel_path)
-
-                            # Skip excluded nested modules
-                            if any(rel_str.startswith(prefix) for prefix in excluded_prefixes):
-                                continue
-                            if rel_str.endswith('go.mod') and rel_str != expected_go_mod:
-                                continue
-
-                            # Read content
-                            content = file_path.read_bytes()
-
-                            # Rewrite go.mod if needed
-                            if rewrite_to_alias and rel_str == expected_go_mod:
-                                try:
-                                    content_text = content.decode()
-                                    rewritten = rewrite_module_directive(content_text, alias_module)
-                                    if rewritten is None:
-                                        rewritten = make_module_directive(alias_module)
-                                    content = rewritten.encode()
-                                except Exception:
-                                    content = make_module_directive(alias_module).encode()
-
-                            # Add to zip with correct path
-                            if subdir:
-                                archive_path = module_prefix + rel_str[len(subdir)+1:]
-                            else:
-                                archive_path = module_prefix + rel_str
-                            zf.writestr(archive_path, content)
-
-            bb.note(f"Created {zip_path}")
-        except Exception as e:
-            bb.warn(f"Failed to create zip for {module_path}@{version}: {e}")
-
-        # Create go.mod file
-        # For +incompatible versions, ALWAYS create minimal synthetic .mod (like proxy.golang.org)
-        # This is CRITICAL for checksum matching!
-        try:
-            if '+incompatible' in version:
-                # Synthetic minimal .mod for pre-module versions
-                mod_content = make_module_directive(alias_module).encode('utf-8')
-                bb.note(f"Creating synthetic .mod for +incompatible version: {module_path}")
-            else:
-                # For proper module versions, use repository's go.mod
-                mod_file = "go.mod"
-                if subdir:
-                    mod_file = f"{subdir}/go.mod"
-
-                try:
-                    mod_content = subprocess.check_output(
-                        ["git", "cat-file", "blob", f"HEAD:{mod_file}"],
-                        cwd=vcs_path
-                    )
-                    if rewrite_to_alias:
-                        try:
-                            mod_text = mod_content.decode()
-                            rewritten = rewrite_module_directive(mod_text, alias_module)
-                            if rewritten is None:
-                                rewritten = make_module_directive(alias_module)
-                            mod_content = rewritten.encode()
-                        except Exception:
-                            mod_content = make_module_directive(alias_module).encode()
-                except subprocess.CalledProcessError:
-                    # Synthesize go.mod if not found
-                    mod_content = make_module_directive(alias_module).encode()
-
-            with open(mod_path, 'wb') as f:
-                f.write(mod_content)
-
-            bb.note(f"Created {mod_path}")
-        except Exception as e:
-            bb.warn(f"Failed to create mod file for {module_path}@{version}: {e}")
-
-    # Module list with repository information
-    modules_data = [
-''')
-
-MODULE_CACHE_TASK_FOOTER = r'''
-
-
-    s = d.getVar('S')
-    workdir = d.getVar('WORKDIR')
-
-    repo_locks = {}
-    repo_locks_lock = threading.Lock()
-
-    def acquire_repo_lock(path):
-        key = str(path)
-        with repo_locks_lock:
-            lock = repo_locks.get(key)
-            if not lock:
-                lock = threading.Lock()
-                repo_locks[key] = lock
-            return lock
-
-    # Process modules in parallel
-    def process_module(module_data):
-        module_path = module_data['module']
-        version = module_data['version']
-        repo_url = module_data['repo_url']
-        commit = module_data['commit']
-        subdir = module_data.get('subdir')
-
-        # Calculate VCS cache path
-        vcs_key = f"git3:{repo_url}"
-        vcs_hash = hashlib.sha256(vcs_key.encode()).hexdigest()
-        # VCS cache is downloaded to ${WORKDIR}/sources/vcs_cache/ by git:// fetcher
-        workdir = d.getVar('WORKDIR')
-        vcs_cache_path = Path(workdir) / "sources" / "vcs_cache" / vcs_hash
-
-        # VCS cache should already exist from git:// download
-        if vcs_cache_path.exists():
-            lock = acquire_repo_lock(vcs_cache_path)
-            with lock:
-                bb.note(f"Processing {module_path}@{version}")
-                create_vcs_info_file(str(vcs_cache_path), repo_url)
-                try:
-                    subprocess.run(["git", "checkout", commit], cwd=vcs_cache_path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                except subprocess.CalledProcessError:
-                    subprocess.run(["git", "fetch", "--all"], cwd=vcs_cache_path, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    subprocess.run(["git", "checkout", commit], cwd=vcs_cache_path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                alias_of = module_data.get('alias_of')
-                create_module_zip(module_path, version, str(vcs_cache_path), subdir, alias_of)
-
-                # CRITICAL FIX: Extract module to pkg/mod for offline Go builds
-                # The zip contains paths like "gopkg.in/yaml.v3@v3.0.4/..." so extract to pkg/mod directly
-                try:
-                    import zipfile
-                    import os
-                    def escape_module_path_local(path):
-                        import re
-                        return re.sub(r'([A-Z])', lambda m: '!' + m.group(1).lower(), path)
-
-                    escaped_module = escape_module_path_local(module_path)
-                    escaped_version = escape_module_path_local(version)
-
-                    zip_path = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_module / "@v" / f"{escaped_version}.zip"
-                    extract_dir = Path(d.getVar('S')) / "pkg" / "mod"
-
-                    # Handle version aliases (e.g., v3.0.1 pointing to v3.0.4)
-                    is_version_alias = module_data.get('is_version_alias', False)
-                    if is_version_alias:
-                        # This is a version alias - create symlink and copy cache files
-                        orig_ver = module_data.get('original_version')
-                        if orig_ver:
-                            # Create symlink in pkg/mod: yaml.v3@v3.0.1 -> yaml.v3@v3.0.4
-                            orig_dir = extract_dir / f"{module_path}@{orig_ver}"
-                            alias_dir = extract_dir / f"{module_path}@{version}"
-                            if orig_dir.exists() and not alias_dir.exists():
-                                os.symlink(f"{module_path}@{orig_ver}", alias_dir)
-                                bb.note(f"Created symlink {module_path}@{version} -> @{orig_ver}")
-
-                            # Copy cache files (.mod, .zip) for the alias version
-                            import shutil
-                            download_dir = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_module / "@v"
-                            orig_escaped_ver = escape_module_path_local(orig_ver)
-                            for ext in ['.mod', '.zip']:
-                                src = download_dir / f"{orig_escaped_ver}{ext}"
-                                dst = download_dir / f"{escaped_version}{ext}"
-                                if src.exists() and not dst.exists():
-                                    shutil.copy2(src, dst)
-                                    bb.note(f"Copied cache file {escaped_version}{ext}")
-                    elif zip_path.exists():
-                        # Normal extraction for non-alias modules
-                        extract_dir.mkdir(parents=True, exist_ok=True)
-                        with zipfile.ZipFile(zip_path, 'r') as zf:
-                            zf.extractall(extract_dir)
-                        bb.note(f"Extracted {module_path}@{version} to pkg/mod")
-                except Exception as e:
-                    bb.debug(1, f"Module extraction skipped for {module_path}: {e}")
-        else:
-            bb.warn(f"VCS cache missing for {module_path}: {vcs_cache_path}")
-
-    # Use ThreadPoolExecutor for parallel processing
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(process_module, module) for module in modules_data]
-        for future in as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                bb.warn(f"Module processing failed: {e}")
-
-    # CRITICAL FIX: Post-process to find version mismatches from transitive dependencies
-    # Use go.sum data to find what versions are needed, create symlinks for missing versions
-    bb.note("Checking for version mismatches using go.sum data...")
-
-    import re
-    import os
-    def escape_module_path_post(path):
-        return re.sub(r'([A-Z])', lambda m: '!' + m.group(1).lower(), path)
-
-    def canonicalize_module_path(module_path):
-        """Normalize alternate module paths to canonical form (e.g., go.yaml.in -> gopkg.in)"""
-        match = re.match(r'^go\.([^\.]+)\.in/(.+)$', module_path)
-        if match:
-            name, rest = match.groups()
-            parts = rest.split('/')
-            if len(parts) >= 2:
-                module_name = parts[0] or name
-                version = parts[1]
-                remainder = '/'.join(parts[2:])
-                canonical = f"gopkg.in/{module_name}.{version}"
-                if remainder:
-                    canonical = f"{canonical}/{remainder}"
-                return canonical
-            return f"gopkg.in/{name}.{rest}"
-        return module_path
-
-    # Track what versions we have extracted
-    # Map canonical path -> {actual_path: versions}
-    extracted_modules = {}  # canonical_path -> set of versions
-    actual_paths = {}  # canonical_path -> actual_extracted_path
-    pkg_mod_dir = Path(d.getVar('S')) / "pkg" / "mod"
-
-    # Scan extracted modules to see what we have
-    if pkg_mod_dir.exists():
-        for item in pkg_mod_dir.iterdir():
-            if item.is_dir() and '@' not in str(item.name):
-                # This is a module directory (e.g., "gopkg.in", "github.com", "go.yaml.in")
-                for subitem in item.rglob("*"):
-                    if subitem.is_dir() and '@' in subitem.name:
-                        # Found a versioned module (e.g., "yaml.v3@v3.0.4" or "go.yaml.in/yaml/v3@v3.0.4")
-                        rel_path = subitem.relative_to(pkg_mod_dir)
-                        parts = str(rel_path).rsplit('@', 1)
-                        if len(parts) == 2:
-                            actual_mod_path = parts[0]
-                            version = parts[1]
-
-                            # Track by canonical path so go.sum lookups work
-                            canonical_path = canonicalize_module_path(actual_mod_path)
-                            extracted_modules.setdefault(canonical_path, set()).add(version)
-
-                            # Remember the actual extracted path for creating symlinks
-                            if canonical_path not in actual_paths:
-                                actual_paths[canonical_path] = actual_mod_path
-
-    # Find mismatches: versions in go.sum but not extracted
-    missing_versions = []
-    for mod_path, req_versions in go_sum_requirements.items():
-        extracted = extracted_modules.get(mod_path, set())
-        for req_ver in req_versions:
-            if req_ver not in extracted:
-                # Find a version we DO have for this module
-                if extracted:
-                    base_ver = sorted(extracted)[-1]  # Use highest version
-                    actual_path = actual_paths.get(mod_path, mod_path)
-                    missing_versions.append((mod_path, actual_path, req_ver, base_ver))
-                else:
-                    bb.debug(1, f"go.sum requires {mod_path}@{req_ver} but no version extracted")
-
-    # Create symlinks and cache files for missing versions
-    if missing_versions:
-        bb.note(f"Found {len(missing_versions)} version mismatches from transitive dependencies")
-        for canonical_path, actual_path, missing_ver, base_ver in missing_versions:
-            try:
-                # Create symlink using actual extracted path (e.g., go.yaml.in/yaml/v3)
-                # module@missing_ver -> module@base_ver
-                base_dir = pkg_mod_dir / f"{actual_path}@{base_ver}"
-                missing_dir = pkg_mod_dir / f"{actual_path}@{missing_ver}"
-                if base_dir.exists() and not missing_dir.exists():
-                    os.symlink(f"{actual_path}@{base_ver}", missing_dir)
-                    bb.note(f"Created symlink: {actual_path}@{missing_ver} -> @{base_ver}")
-
-                # Also create at canonical path if different (e.g., gopkg.in/yaml.v3)
-                if canonical_path != actual_path:
-                    canonical_base = pkg_mod_dir / f"{canonical_path}@{base_ver}"
-                    canonical_missing = pkg_mod_dir / f"{canonical_path}@{missing_ver}"
-                    if base_dir.exists() and not canonical_missing.exists():
-                        # Link to actual extracted location
-                        canonical_missing.parent.mkdir(parents=True, exist_ok=True)
-                        os.symlink(f"../{actual_path}@{base_ver}", canonical_missing)
-                        bb.note(f"Created canonical symlink: {canonical_path}@{missing_ver} -> {actual_path}@{base_ver}")
-
-                # Create cache files with canonical module path by rewriting zips
-                escaped_actual = escape_module_path_post(actual_path)
-                escaped_canonical = escape_module_path_post(canonical_path)
-                escaped_missing = escape_module_path_post(missing_ver)
-                escaped_base = escape_module_path_post(base_ver)
-
-                # Source cache files are at actual_path location
-                src_cache_dir = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_actual / "@v"
-                # Destination cache files need to be at canonical_path location
-                dst_cache_dir = Path(d.getVar('S')) / "pkg" / "mod" / "cache" / "download" / escaped_canonical / "@v"
-
-                if src_cache_dir.exists():
-                    dst_cache_dir.mkdir(parents=True, exist_ok=True)
-                    import shutil
-                    import zipfile
-                    import tempfile
-
-                    # Copy .mod file with rewritten module path
-                    src_mod = src_cache_dir / f"{escaped_base}.mod"
-                    dst_mod = dst_cache_dir / f"{escaped_missing}.mod"
-                    if src_mod.exists() and not dst_mod.exists():
-                        mod_content = src_mod.read_text()
-                        # Rewrite module directive to use canonical path using a replacement function
-                        import re
-                        def replace_module(match):
-                            return match.group(1) + canonical_path + match.group(3)
-
-                        mod_content = re.sub(
-                            r'^(module\s+)(' + re.escape(actual_path) + r')(\s*)',
-                            replace_module,
-                            mod_content,
-                            count=1,
-                            flags=re.MULTILINE
-                        )
-                        dst_mod.write_text(mod_content)
-                        bb.note(f"Created cache file: {canonical_path}@{missing_ver}.mod (rewritten)")
-
-                    # Create .zip file with canonical module paths
-                    src_zip = src_cache_dir / f"{escaped_base}.zip"
-                    dst_zip = dst_cache_dir / f"{escaped_missing}.zip"
-                    if src_zip.exists() and not dst_zip.exists():
-                        with tempfile.TemporaryDirectory() as tmpdir:
-                            tmppath = Path(tmpdir)
-                            # Extract source zip
-                            with zipfile.ZipFile(src_zip, 'r') as zf:
-                                zf.extractall(tmppath)
-
-                            # Find and rewrite go.mod
-                            for gomod in tmppath.rglob("go.mod"):
-                                content = gomod.read_text()
-                                def replace_in_zip(match):
-                                    return match.group(1) + canonical_path + match.group(3)
-
-                                content = re.sub(
-                                    r'^(module\s+)(' + re.escape(actual_path) + r')(\s*)',
-                                    replace_in_zip,
-                                    content,
-                                    count=1,
-                                    flags=re.MULTILINE
-                                )
-                                gomod.write_text(content)
-
-                            # Rename directory to use canonical path
-                            old_dir = tmppath / f"{actual_path}@{base_ver}"
-                            new_dir = tmppath / f"{canonical_path}@{missing_ver}"
-                            if old_dir.exists():
-                                new_dir.parent.mkdir(parents=True, exist_ok=True)
-                                shutil.move(str(old_dir), str(new_dir))
-
-                            # Create new zip with canonical path
-                            with zipfile.ZipFile(dst_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
-                                for file in new_dir.rglob("*"):
-                                    if file.is_file():
-                                        arcname = str(file.relative_to(tmppath))
-                                        zf.write(file, arcname)
-
-                        bb.note(f"Created cache file: {canonical_path}@{missing_ver}.zip (rewritten)")
-            except Exception as e:
-                bb.debug(1, f"Could not create version alias for {canonical_path}@{missing_ver}: {e}")
-
-    bb.note("Module cache creation complete")
-}
-
-# Add task after do_unpack (when git repositories are available)
-addtask create_module_cache after do_unpack before do_configure
-
-
-# ============================================================
-# do_generate_go_sum: Generate go.sum from module cache
-# ============================================================
-
-python do_generate_go_sum() {
-    """
-    Generate go.sum from the module cache artifacts.
-    - Zip checksums: Calculated from our VCS-based builds using Go helper binary
-    - go.mod checksums: Calculated locally using the Hash1(dirhash) algorithm
-
-    This matches Go's expectations while keeping the build offline.
-    """
-    import subprocess
-    import re
-    import hashlib
-    import base64
-    from pathlib import Path
-
-    s = d.getVar('S')
-    cache_dir = Path(s) / "pkg" / "mod" / "cache" / "download"
-    go_sum_path = Path(s) / "src" / "import" / "go.sum"
-    workdir = Path(d.getVar('WORKDIR'))
-    fallback_marker = workdir / ".use-gomodgit-go-sum"
-    fallback_sum = workdir / "go.sum.gomodgit"
-
-    if fallback_marker.exists() or fallback_sum.exists():
-        bb.warn("go.sum.gomodgit fallback detected - skipping helper-based go.sum generation")
-        fallback_marker.touch()
-        return
-
-    # Go helper binary for checksums
-    go_helper = Path(d.getVar('STAGING_BINDIR_NATIVE')) / "dirhash"
-
-    if not cache_dir.exists():
-        bb.fatal("Module cache not found - do_create_module_cache must run first")
-        return
-
-    if not go_helper.exists():
-        bb.fatal(f"Go checksum helper not found at {go_helper}. Ensure go-dirhash-native is in DEPENDS.")
-        return
-
-    bb.note("Generating go.sum from module cache (Hash1 for go.mod files)...")
-
-    def calculate_mod_checksum(mod_path):
-        try:
-            mod_bytes = mod_path.read_bytes()
-        except FileNotFoundError:
-            return None
-
-        file_hash = hashlib.sha256(mod_bytes).hexdigest()
-        summary = f"{file_hash}  go.mod\n".encode('ascii')
-        digest = hashlib.sha256(summary).digest()
-        return "h1:" + base64.b64encode(digest).decode('ascii')
-
-    checksums = {}
-
-    # Scan all .zip files in the module cache and calculate checksums
-    for zip_file in sorted(cache_dir.rglob("*.zip")):
-        try:
-            # Calculate zip checksum using Go helper binary
-            result = subprocess.run(
-                [str(go_helper), str(zip_file)],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-
-            if result.returncode != 0:
-                bb.warn(f"Failed to calculate zip checksum for {zip_file}: {result.stderr}")
-                continue
-
-            zip_checksum = result.stdout.strip()
-
-            # Extract and unescape module path and version
-            parts = zip_file.parts
-            v_index = parts.index('@v')
-            download_index = parts.index('download')
-
-            escaped_module_parts = parts[download_index + 1:v_index]
-            escaped_module = '/'.join(escaped_module_parts)
-            escaped_version = zip_file.stem
-
-            def unescape(s):
-                """Unescape !lowercase back to uppercase"""
-                return re.sub(r'!([a-z])', lambda m: m.group(1).upper(), s)
-
-            module_path = unescape(escaped_module)
-            version = unescape(escaped_version)
-            module_version = f"{module_path} {version}"
-
-            # Calculate go.mod checksum directly from cached .mod file.
-            mod_file = zip_file.with_suffix('.mod')
-            mod_checksum = calculate_mod_checksum(mod_file)
-
-            if module_version not in checksums:
-                checksums[module_version] = {'zip': zip_checksum, 'mod': mod_checksum}
-
-        except Exception as e:
-            bb.warn(f"Error processing {zip_file}: {e}")
-            continue
-
-    # Write go.sum with hybrid checksums
-    go_sum_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(go_sum_path, 'w') as f:
-        for module_version in sorted(checksums.keys()):
-            data = checksums[module_version]
-            f.write(f"{module_version} {data['zip']}\n")
-            if data['mod']:
-                f.write(f"{module_version}/go.mod {data['mod']}\n")
-
-    num_with_mod = sum(1 if data['mod'] else 0 for data in checksums.values())
-    bb.note(f"✅ Generated go.sum with {len(checksums)} modules")
-    bb.note(f"   🎯 Zip checksums: {len(checksums)} calculated from VCS builds")
-    bb.note(f"   📄 go.mod checksums calculated from cached .mod files ({num_with_mod} entries)")
-}
-
-# Generate go.sum from actual module cache BEFORE compile
-addtask generate_go_sum after do_create_module_cache before do_compile
-
-
-# ============================================================
-# do_compile integration helpers
-# ============================================================
-
-do_compile:prepend() {
-    # Ensure offline Go builds consume the generated module cache
-    export GOMODCACHE="${S}/pkg/mod"
-    export GOPROXY="direct"
-    export GOSUMDB="off"
-    export GONOSUMDB="*"
-    export GOPRIVATE="*"
-    export GOFLAGS="${GOFLAGS} -mod=mod -modcacherw"
-
-    fallback_sum="${WORKDIR}/go.sum.gomodgit"
-    fallback_marker="${WORKDIR}/.use-gomodgit-go-sum"
-
-    if [ -f "${fallback_sum}" ]; then
-        bbwarn "Fallback go.sum.gomodgit detected - using provided checksums"
-        install -d "${S}/src/import"
-        install -m 0644 "${fallback_sum}" "${S}/src/import/go.sum"
-        touch "${fallback_marker}"
-    else
-        rm -f "${fallback_marker}"
-    fi
-
-    bbnote "Using offline Go module cache at ${GOMODCACHE}"
-}
-'''
-
-
-class HybridModuleCacheBuilder:
-    """Generate hybrid git:// SRC_URI entries and module cache task code."""
-
-    def __init__(self, module_cache_dir: str, workdir: str, max_workers: int = 8):
-        self.module_cache_dir = Path(module_cache_dir)
-        self.workdir = Path(workdir)
-        self.max_workers = max_workers
-
-    def generate_complete_solution(self, modules_data: List[Dict], go_sum_requirements: Dict[str, Set[str]] = None) -> Tuple[List[str], str]:
-        """Return (src_uri_entries, module_cache_task_code)."""
-        src_uri_entries = self._generate_src_uri_entries(modules_data)
-        cache_task_code = self._render_module_cache_task(modules_data, go_sum_requirements)
-        return src_uri_entries, cache_task_code
-
-    def _generate_src_uri_entries(self, modules_data: List[Dict]) -> List[str]:
-        entries: "OrderedDict[Tuple[str, str], str]" = OrderedDict()
-
-        for module in modules_data:
-            if module.get('alias_of') or module.get('is_alias'):
-                continue
-            repo_url = module['repo_url']
-            commit = module['commit']
-            vcs_hash = hashlib.sha256(f"git3:{repo_url}".encode()).hexdigest()
-            fetch_name = module.get('fetch_name') or f"git_{vcs_hash[:12]}"
-            module['fetch_name'] = fetch_name
-            module['vcs_hash'] = vcs_hash
-
-            key = (repo_url, commit)
-            if key in entries:
-                continue
-
-            git_url = self._to_git_src_uri(repo_url)
-            entry = (
-                f"{git_url};protocol=https;nobranch=1;rev={commit};shallow=1;"
-                f"name={fetch_name};destsuffix=vcs_cache/{vcs_hash}"
-            )
-            entries[key] = entry
-
-        return list(entries.values())
-
-    def _to_git_src_uri(self, repo_url: str) -> str:
-        if repo_url.startswith('git://'):
-            return repo_url
-        if repo_url.startswith('https://'):
-            return 'git://' + repo_url[len('https://'):]
-        if repo_url.startswith('http://'):
-            return 'git://' + repo_url[len('http://'):]
-        return repo_url
-
-    def _render_module_cache_task(self, modules_data: List[Dict], go_sum_requirements: Dict[str, Set[str]] = None) -> str:
-        def escape(value: str) -> str:
-            return value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
-
-        lines: List[str] = []
-        for index, module in enumerate(modules_data):
-            fields = [
-                f'"module": "{escape(module["module"])}"',
-                f'"version": "{escape(module["version"])}"',
-                f'"repo_url": "{escape(module["repo_url"])}"',
-                f'"commit": "{escape(module["commit"])}"',
-                f'"subdir": "{escape(module.get("subdir") or "")}"'
-            ]
-
-            if module.get('alias_of'):
-                fields.append(f'"alias_of": "{escape(module["alias_of"])}"')
-
-            entry = '        ({' + ', '.join(fields) + '})'
-            if index < len(modules_data) - 1:
-                entry += ','
-            lines.append(entry)
-
-        modules_block = "\n".join(lines)
-        if modules_block:
-            modules_block += "\n"
-
-        # Embed go.sum requirements as Python dict literal (inserted after list closes)
-        go_sum_block = ""
-        if go_sum_requirements:
-            go_sum_lines = []
-            for mod_path, versions in sorted(go_sum_requirements.items()):
-                versions_str = ', '.join(f'"{v}"' for v in sorted(versions))
-                go_sum_lines.append(f'        "{escape(mod_path)}": {{{versions_str}}}')
-            go_sum_block = "\n    # Version requirements from go.sum (for post-processing)\n"
-            go_sum_block += "    go_sum_requirements = {\n"
-            go_sum_block += ",\n".join(go_sum_lines)
-            go_sum_block += "\n    }\n"
-        else:
-            go_sum_block = "\n    # No go.sum data available\n    go_sum_requirements = {}\n"
-
-        # Build task: header + modules list + close list + go_sum dict + footer
-        # Simple concatenation - FOOTER already has correct indentation
-        return MODULE_CACHE_TASK_HEADER + modules_block + '\n    ]\n' + go_sum_block + '\n' + MODULE_CACHE_TASK_FOOTER
-
-
-class GoModuleFetcher:
-    def __init__(self, output_dir: str = "modules", vendor_dir: Optional[str] = None, 
-                 generate_oe_files: bool = False, include_indirect: bool = False,
-                 vendor_like: bool = False, gomod_cache: Optional[str] = None,
-                 generate_gomodgit: bool = False,
-                 git_timeout: int = 120, git_retries: int = 3):
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(exist_ok=True)
-        
-        self.vendor_dir = None
-        if vendor_dir:
-            self.vendor_dir = Path(vendor_dir)
-            self.vendor_dir.mkdir(exist_ok=True)
-            
-        self.cache_root = None
-        self.gomod_cache = None
-        self.repo_cache_dir = None
-        if gomod_cache:
-            cache_root = Path(gomod_cache).expanduser().resolve()
-            cache_root.mkdir(parents=True, exist_ok=True)
-            self.cache_root = cache_root
-            self.gomod_cache = cache_root
-            self.repo_cache_dir = cache_root / 'repos'
-            self.repo_cache_dir.mkdir(parents=True, exist_ok=True)
-
-        self.generate_oe_files = generate_oe_files
-        self.generate_gomodgit = generate_gomodgit
-        self.include_indirect = include_indirect
-        self.vendor_like = vendor_like
-        self.oe_src_uris = []
-        self.oe_modules = []
-        self.temp_dir = None
-        self.dirhash_helper_tempdir = None
-        self.git_timeout = max(1, int(git_timeout))
-        self.git_retries = max(1, int(git_retries))
-        self._last_git_error = None
-        
-        # Track processed modules to avoid duplicates
-        self.processed_modules = set()
-        
-        # Store detailed go.mod parsing results
-        self.direct_deps = {}      # module_path -> version (explicit in modules.txt)
-        self.indirect_deps = {}    # module_path -> version  
-        self.replace_directives = {}  # module_path -> replacement_path
-        
-        # Performance optimization: cache package discovery results
-        self.package_cache = {}    # repo_dir -> packages
-        self.vendor_packages = {}  # module_path -> [packages] from vendor/modules.txt parsing
-        
-        # Check for rsync availability
-        self.has_rsync = self._check_rsync_available()
-
-        # Ensure repo lock directory exists for cross-process coordination
-        self.repo_lock_root = Path.home() / ".cache" / "oe-go-mod-fetcher" / "locks"
-        self.repo_lock_root.mkdir(parents=True, exist_ok=True)
-
-        # Track repositories where shallow clones missed required commits
-        self.repos_requiring_deep_fetch: Set[str] = set()
-        self.repo_full_history_marker = ".oe-requires-full-history"
-
-    def _check_rsync_available(self) -> bool:
-        """Check if rsync is available for faster copying."""
-        try:
-            subprocess.run(["rsync", "--version"], check=True, capture_output=True)
-            return True
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            return False
-
-    def _normalize_repo_identifier(self, repo_url: Optional[str]) -> str:
-        """Normalize repository URLs so shallow requirements share the same key."""
-        if not repo_url:
-            return ""
-
-        normalized = repo_url.strip().rstrip('/')
-        if normalized.endswith('.git'):
-            normalized = normalized[:-4]
-        return normalized
-
-    def _mark_repo_requires_full_history(self, repo_dir: Optional[Path], repo_key: str) -> None:
-        """Remember that this repository cannot operate with shallow clones."""
-        if not repo_key:
-            return
-
-        if repo_key not in self.repos_requiring_deep_fetch:
-            self.repos_requiring_deep_fetch.add(repo_key)
-
-        if not repo_dir:
-            return
-
-        try:
-            marker_path = Path(repo_dir) / self.repo_full_history_marker
-            marker_path.parent.mkdir(parents=True, exist_ok=True)
-            marker_path.touch(exist_ok=True)
-        except Exception as exc:  # pragma: no cover - best effort persistence
-            print(f"    ⚠️  Could not persist full-history marker for {repo_dir}: {exc}")
-
-    def _repo_requires_full_history(self, repo_dir: Optional[Path], repo_key: str) -> bool:
-        """Check if the repository needs a full clone (load persisted markers if present)."""
-        if not repo_key:
-            return False
-
-        if repo_key in self.repos_requiring_deep_fetch:
-            return True
-
-        if not repo_dir:
-            return False
-
-        marker_path = Path(repo_dir) / self.repo_full_history_marker
-        if marker_path.exists():
-            self.repos_requiring_deep_fetch.add(repo_key)
-            return True
-
-        return False
-
-    def _clear_git_index_lock(self, cwd: Optional[Path]) -> None:
-        """Remove a stale git index.lock if present."""
-        if not cwd:
-            return
-
-        try:
-            repo_path = Path(cwd)
-            lock_path = repo_path / ".git" / "index.lock"
-            if lock_path.exists():
-                lock_path.unlink()
-                print(f"    🧹 Removed stale git index.lock at {lock_path}")
-        except Exception as exc:  # pragma: no cover - best effort cleanup
-            print(f"    ⚠️  Could not remove git index.lock: {exc}")
-
-    def _ensure_clean_worktree(self, repo_dir: Path) -> bool:
-        """Reset and clean the repository so checkouts cannot fail."""
-        if not repo_dir or not repo_dir.exists():
-            return True
-
-        commands = [
-            (["git", "reset", "--hard", "HEAD"], "git reset --hard HEAD"),
-            (["git", "clean", "-fdx"], "git clean -fdx"),
-        ]
-
-        for command, description in commands:
-            result = self._run_git_command_with_retry(
-                command,
-                cwd=repo_dir,
-                description=description,
-                retries=1,
-            )
-            if result is None:
-                return False
-        return True
-
-    @contextmanager
-    def _acquire_repo_lock(self, lock_id: str):
-        """Serialize access to a cached repository across processes."""
-        lock_path = self.repo_lock_root / lock_id
-        acquired = False
-        try:
-            while not acquired:
-                try:
-                    lock_path.mkdir()
-                    acquired = True
-                except FileExistsError:
-                    try:
-                        if (time.time() - lock_path.stat().st_mtime) > 900:
-                            lock_path.rmdir()
-                            continue
-                    except FileNotFoundError:
-                        continue
-                    time.sleep(0.2)
-            yield
-        finally:
-            if acquired:
-                try:
-                    lock_path.rmdir()
-                except OSError:
-                    pass
-
-    def _run_git_command_with_retry(
-        self,
-        command: List[str],
-        cwd: Optional[Path] = None,
-        cleanup: Optional[Path] = None,
-        description: Optional[str] = None,
-        timeout: Optional[int] = None,
-        retries: Optional[int] = None,
-    ) -> Optional[subprocess.CompletedProcess]:
-        """Run a git command with timeout handling and automatic retries."""
-
-        attempts = max(1, int(retries) if retries is not None else self.git_retries)
-        timeout_sec = max(1, int(timeout) if timeout is not None else self.git_timeout)
-        self._last_git_error = None
-
-        if description:
-            friendly_desc = description
-        elif command and command[0] == "git":
-            friendly_desc = f"git {' '.join(command[1:])}".strip()
-        else:
-            friendly_desc = " ".join(command)
-
-        cleanup_path = Path(cleanup) if cleanup else None
-        last_error = ""
-
-        for attempt in range(1, attempts + 1):
-            if command and command[0] == "git":
-                self._clear_git_index_lock(cwd)
-            try:
-                result = subprocess.run(
-                    command,
-                    cwd=cwd,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout_sec,
-                )
-                if result.returncode == 0:
-                    return result
-                last_error = result.stderr.strip() or result.stdout.strip() or f"exit code {result.returncode}"
-                if "index.lock" in last_error:
-                    self._clear_git_index_lock(cwd)
-            except KeyboardInterrupt:
-                if cleanup_path and cleanup_path.exists():
-                    if cleanup_path.is_dir():
-                        shutil.rmtree(cleanup_path, ignore_errors=True)
-                    else:
-                        try:
-                            cleanup_path.unlink()
-                        except FileNotFoundError:
-                            pass
-                raise
-            except subprocess.TimeoutExpired:
-                last_error = f"timed out after {timeout_sec} seconds"
-                self._clear_git_index_lock(cwd)
-            except OSError as exc:
-                last_error = str(exc)
-
-            if cleanup_path and cleanup_path.exists():
-                if cleanup_path.is_dir():
-                    shutil.rmtree(cleanup_path, ignore_errors=True)
-                else:
-                    try:
-                        cleanup_path.unlink()
-                    except FileNotFoundError:
-                        pass
-
-            if attempt < attempts:
-                print(f"    🔁 Retrying {friendly_desc} ({attempt}/{attempts})...")
-                time.sleep(min(5, attempt * 2))
-                # Ensure stale index.lock is cleared before we retry
-                self._clear_git_index_lock(cwd)
-
-        print(f"    ⚠️  {friendly_desc} failed: {last_error}")
-        self._last_git_error = last_error
-        return None
-
-    def _go_env(self, extra_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-        """Return environment for Go commands with optional overrides."""
-        env = os.environ.copy()
-        if self.gomod_cache and not (extra_env and 'GOMODCACHE' in extra_env):
-            env['GOMODCACHE'] = str(self.gomod_cache)
-        if extra_env:
-            for key, value in extra_env.items():
-                env[key] = str(value)
-        return env
-
-    def cleanup_temp_files(self):
-        """Clean up temporary files."""
-        if self.temp_dir and self.temp_dir.exists():
-            shutil.rmtree(self.temp_dir)
-            self.temp_dir = None
-        if self.dirhash_helper_tempdir and self.dirhash_helper_tempdir.exists():
-            shutil.rmtree(self.dirhash_helper_tempdir)
-            self.dirhash_helper_tempdir = None
-
-    def get_dirhash_helper(self) -> Path:
-        """Locate the dirhash helper binary on the host."""
-        if hasattr(self, '_dirhash_helper'):
-            return self._dirhash_helper
-
-        candidates = []
-
-        helper_env = os.environ.get('DIRHASH_HELPER')
-        if helper_env:
-            candidates.append(Path(helper_env))
-
-        staging_bindir = os.environ.get('STAGING_BINDIR_NATIVE')
-        if staging_bindir:
-            candidates.append(Path(staging_bindir) / 'dirhash')
-
-        resolved = shutil.which('dirhash')
-        if resolved:
-            candidates.append(Path(resolved))
-
-        for candidate in candidates:
-            if candidate and candidate.exists():
-                self._dirhash_helper = candidate
-                return candidate
-        helper = self._build_dirhash_helper()
-        self._dirhash_helper = helper
-        return helper
-
-    def _build_dirhash_helper(self) -> Path:
-        """Compile a dirhash helper locally when none is provided."""
-        go_binary = shutil.which('go')
-        if not go_binary:
-            raise FileNotFoundError(
-                "Go toolchain not found in PATH. Install Go to build the dirhash helper or "
-                "set DIRHASH_HELPER to an existing binary."
-            )
-
-        print("    🔧 Building temporary dirhash helper (host-side)...")
-
-        temp_root = Path(tempfile.mkdtemp(prefix="dirhash-helper-"))
-        self.dirhash_helper_tempdir = temp_root
-
-        gopath = temp_root / "gopath"
-        helper_src_dir = gopath / "src" / "dirhash-helper"
-        helper_src_dir.mkdir(parents=True, exist_ok=True)
-        helper_main = helper_src_dir / "main.go"
-        helper_main.write_text(DIRHASH_HELPER_SOURCE)
-
-        mod_dest = gopath / "src" / "golang.org" / "x" / "mod"
-        mod_dest.parent.mkdir(parents=True, exist_ok=True)
-
-        clone_result = self._run_git_command_with_retry(
-            ["git", "clone", DIRHASH_REPO_URL, str(mod_dest)],
-            cleanup=mod_dest,
-            description=f"git clone {DIRHASH_REPO_URL}"
-        )
-        if not clone_result:
-            raise RuntimeError(
-                "Unable to prepare golang.org/x/mod sources for dirhash helper: "
-                f"{self._last_git_error or 'git clone failed'}"
-            )
-
-        checkout_result = self._run_git_command_with_retry(
-            ["git", "checkout", DIRHASH_REPO_COMMIT],
-            cwd=mod_dest,
-            description=f"git checkout {DIRHASH_REPO_COMMIT}",
-            retries=1
-        )
-        if not checkout_result:
-            raise RuntimeError(
-                "Unable to prepare golang.org/x/mod sources for dirhash helper: "
-                f"{self._last_git_error or 'git checkout failed'}"
-            )
-
-        env = os.environ.copy()
-        env.update({
-            "GOPATH": str(gopath),
-            "GO111MODULE": "off",
-            "GOCACHE": str(temp_root / "gocache"),
-            "GOMODCACHE": str(temp_root / "gomodcache"),
-        })
-
-        try:
-            subprocess.run(
-                [go_binary, "build", "-o", str(helper_src_dir / "dirhash"), "."],
-                cwd=helper_src_dir,
-                check=True,
-                capture_output=True,
-                text=True,
-                env=env
-            )
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError(
-                f"Failed to build dirhash helper: {exc.stderr or exc.stdout}"
-            ) from exc
-
-        helper_binary = helper_src_dir / "dirhash"
-        if not helper_binary.exists():
-            raise RuntimeError("dirhash helper build did not produce an executable")
-
-        print(f"    ✅ dirhash helper built at {helper_binary}")
-        return helper_binary
-
-    def fetch_go_mod_from_git(self, repo_url: str, ref: str, go_mod_path: str = "go.mod") -> str:
-        """Fetch go.mod file from a Git repository at a specific ref."""
-        print(f"📦 Fetching go.mod from {repo_url} at {ref}")
-        
-        # Create temporary directory for the repo
-        self.temp_dir = Path(tempfile.mkdtemp(prefix="go_mod_fetcher_"))
-        repo_dir = self.temp_dir / "source_repo"
-        
-        try:
-            if repo_dir.exists():
-                shutil.rmtree(repo_dir, ignore_errors=True)
-
-            # Clone the repository
-            print(f"    Cloning repository...")
-            # For commit hashes, we need a full clone to access arbitrary commits
-            if len(ref) == 40 and all(c in '0123456789abcdef' for c in ref.lower()):
-                clone_result = self._run_git_command_with_retry(
-                    ["git", "clone", repo_url, str(repo_dir)],
-                    cleanup=repo_dir,
-                    description=f"git clone {repo_url}"
-                )
-            else:
-                # Shallow clone for branches/tags
-                clone_result = self._run_git_command_with_retry(
-                    ["git", "clone", "--depth", "1", repo_url, str(repo_dir)],
-                    cleanup=repo_dir,
-                    description=f"git clone --depth 1 {repo_url}"
-                )
-
-            if not clone_result:
-                raise RuntimeError(f"Failed to clone repository: {self._last_git_error or 'unknown git error'}")
-
-            # Checkout the specific ref
-            print(f"    Checking out {ref}...")
-            checkout_result = self._run_git_command_with_retry(
-                ["git", "checkout", ref],
-                cwd=repo_dir,
-                description=f"git checkout {ref}",
-                retries=1
-            )
-            if not checkout_result:
-                # If checkout fails, try fetching first
-                fetch_result = self._run_git_command_with_retry(
-                    ["git", "fetch", "origin", ref],
-                    cwd=repo_dir,
-                    description=f"git fetch origin {ref}",
-                    retries=1
-                )
-                if not fetch_result:
-                    raise RuntimeError(f"Failed to fetch ref {ref}: {self._last_git_error or 'unknown git error'}")
-                checkout_result = self._run_git_command_with_retry(
-                    ["git", "checkout", ref],
-                    cwd=repo_dir,
-                    description=f"git checkout {ref}",
-                    retries=1
-                )
-                if not checkout_result:
-                    raise RuntimeError(f"Failed to checkout ref {ref}: {self._last_git_error or 'unknown git error'}")
-            
-            # Find the go.mod file
-            go_mod_file = repo_dir / go_mod_path
-            if not go_mod_file.exists():
-                # Try to find go.mod in common locations
-                possible_paths = [
-                    repo_dir / "go.mod",
-                    repo_dir / "src" / "go.mod",
-                    repo_dir / "cmd" / "go.mod",
-                ]
-                
-                # Search recursively for go.mod files
-                for go_mod in repo_dir.rglob("go.mod"):
-                    possible_paths.append(go_mod)
-                
-                # Use the first one found, preferring root directory
-                for path in possible_paths:
-                    if path.exists():
-                        go_mod_file = path
-                        break
-                
-                if not go_mod_file.exists():
-                    raise FileNotFoundError(f"No go.mod file found in repository")
-            
-            # Get commit info for reference
-            try:
-                commit_hash = subprocess.run(
-                    ["git", "rev-parse", "HEAD"],
-                    cwd=repo_dir,
-                    check=True,
-                    capture_output=True,
-                    text=True
-                ).stdout.strip()
-                
-                commit_msg = subprocess.run(
-                    ["git", "log", "-1", "--pretty=format:%s"],
-                    cwd=repo_dir,
-                    check=True,
-                    capture_output=True,
-                    text=True
-                ).stdout.strip()
-                
-                print(f"    ✅ Found go.mod at {go_mod_file.relative_to(repo_dir)}")
-                print(f"    📋 Commit: {commit_hash[:8]} - {commit_msg}")
-                
-            except subprocess.CalledProcessError:
-                print(f"    ✅ Found go.mod at {go_mod_file.relative_to(repo_dir)}")
-            
-            return str(go_mod_file)
-            
-        except RuntimeError:
-            raise
-        except Exception as e:
-            raise RuntimeError(f"Failed to fetch go.mod from Git repository: {e}")
-
-    def validate_git_ref(self, repo_url: str, ref: str) -> bool:
-        """Validate that a Git ref exists in the repository."""
-        try:
-            # For commit hashes, skip validation since ls-remote doesn't work with full hashes
-            if len(ref) == 40 and all(c in '0123456789abcdef' for c in ref.lower()):
-                return True
-            
-            # Use ls-remote to check if ref exists without cloning
-            result = subprocess.run(
-                ["git", "ls-remote", repo_url, ref],
-                check=True,
-                capture_output=True,
-                text=True
-            )
-            return len(result.stdout.strip()) > 0
-        except subprocess.CalledProcessError:
-            # If ls-remote fails, the ref might still exist (e.g., short hash)
-            # We'll let the actual clone operation handle the validation
-            return True
-
-    def parse_go_mod(self, go_mod_path: str) -> List[Tuple[str, str]]:
-        """Parse go.mod file and extract dependencies."""
-        modules = []
-        
-        try:
-            with open(go_mod_path, 'r') as f:
-                content = f.read()
-        except FileNotFoundError:
-            raise FileNotFoundError(f"go.mod file not found: {go_mod_path}")
-
-        print(f"    📋 Parsing go.mod file: {go_mod_path}")
-        print(f"    📊 File size: {len(content)} bytes")
-
-        # Find require block
-        in_require_block = False
-        for line in content.split('\n'):
-            line = line.strip()
-            
-            # Check if we're entering a require block
-            if line.startswith('require ('):
-                in_require_block = True
-                continue
-            elif line.startswith('require ') and not line.startswith('require ('):
-                # Single line require
-                parts = line.split()
-                if len(parts) >= 3:
-                    # Include indirect dependencies if requested
-                    if self.include_indirect or '// indirect' not in line:
-                        modules.append((parts[1], parts[2]))
-                continue
-            
-            # Check if we're leaving a require block
-            if in_require_block and line == ')':
-                in_require_block = False
-                continue
-            
-            # Parse modules in require block
-            if in_require_block and line and not line.startswith('//'):
-                # Remove inline comments
-                line = line.split('//')[0].strip()
-                if line:
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        # Include indirect dependencies if requested
-                        full_line_with_comment = next(
-                            (l for l in content.split('\n') if parts[0] in l and parts[1] in l), 
-                            line
-                        )
-                        if self.include_indirect or '// indirect' not in full_line_with_comment:
-                            modules.append((parts[0], parts[1]))
-
-        print(f"    📊 Found {len(modules)} modules from go.mod parsing")
+def parse_go_sum(go_sum_path: Path) -> Set[Tuple[str, str]]:
+    modules: Set[Tuple[str, str]] = set()
+    if not go_sum_path.exists():
         return modules
 
-    def use_go_list_for_dependencies(self, source_dir: Path, go_install_targets: List[str] = None) -> Dict[str, Dict[str, str]]:
-        """
-        Use 'go list' command for authoritative dependency resolution.
-        This mirrors the EXACT approach used by go-mod-update-modules.bbclass.
-
-        Returns dict with module info: {module_path: {'Version': version, 'Dir': dir, 'Module': module_info}}
-        """
-        print(f"🔍 Using 'go list' for authoritative dependency resolution (oe-core compatible)")
-
-        # Create (or re-use) a GOMODCACHE directory
-        with ExitStack() as stack:
-            if self.gomod_cache:
-                mod_cache_dir = str(self.gomod_cache)
-                env = self._go_env()
-            else:
-                mod_cache_dir = stack.enter_context(tempfile.TemporaryDirectory(prefix='go-mod-'))
-                env = self._go_env({'GOMODCACHE': mod_cache_dir})
-
-            try:
-                # Step 1: Get module path using 'go mod edit -json' (line 52 in go-mod-update-modules.bbclass)
-                print(f"    📋 Getting module path with 'go mod edit -json'")
-                go_mod_output = subprocess.check_output(
-                    ("go", "mod", "edit", "-json"),
-                    cwd=source_dir, env=env, text=True, timeout=30
-                )
-                go_mod = json.loads(go_mod_output)
-                main_module_path = go_mod['Module']['Path']
-                main_module_path = self.canonicalize_module_path(main_module_path)
-                print(f"    🎯 Module path: {main_module_path}")
-
-                # Step 2: Use exact oe-core command (line 55 in go-mod-update-modules.bbclass)
-                go_list_target = f"{main_module_path}/..."
-                print(f"    📦 Running go list with target: {go_list_target}")
-                print(f"    📁 Using GOMODCACHE: {mod_cache_dir}")
-
-                output = subprocess.check_output(
-                    ("go", "list", "-mod=mod", "-json=Dir,Module", "-deps", go_list_target),
-                    cwd=source_dir, env=env, text=True, timeout=300
-                )
-
-                print(f"    ✅ Go list completed successfully")
-
-                # Parse the JSON output - it's multiple JSON objects, not an array
-                # Convert to proper JSON array format (lines 64-68 in go-mod-update-modules.bbclass)
-                json_output = '[' + output.replace('}\n{', '},\n{') + ']'
-                pkgs = json.loads(json_output)
-
-                print(f"    📊 Found {len(pkgs)} packages from go list")
-
-                # Extract unique modules with their information
-                modules_info = {}
-                for pkg in pkgs:
-                    if 'Module' not in pkg:
-                        continue
-
-                    module_info = pkg['Module']
-                    module_path = module_info['Path']
-                    module_path = self.canonicalize_module_path(module_path)
-                    module_version = module_info.get('Version', 'v0.0.0')
-
-                    replace_info = module_info.get('Replace')
-                    if replace_info:
-                        # Ignore modules replaced by local directories (vendored via relative paths)
-                        if replace_info.get('Dir'):
-                            continue
-
-                        # Follow remote replacements so we package the actual module source
-                        module_path = replace_info.get('Path', module_path)
-                        module_version = replace_info.get('Version', module_version)
-
-                    module_path = self.canonicalize_module_path(module_path)
-
-                    if module_path not in modules_info:
-                        modules_info[module_path] = {
-                                'Version': module_version,
-                                'Dir': module_info.get('Dir', ''),
-                                'Module': module_info
-                            }
-
-                if len(modules_info) <= 1:
-                    print("    ❌ Error: 'go list -deps' only returned the main module.")
-                    print("       Go is likely operating in vendor mode or missing module metadata.")
-                    print("       Check 'go env GOPROXY GOSUMDB GOFLAGS' and ensure Go can reach the proxy.")
-                    raise RuntimeError("go list -deps returned only the main module")
-
-                print(f"    🎯 Identified {len(modules_info)} unique modules")
-                return modules_info
-
-            except subprocess.CalledProcessError as e:
-                print(f"    ❌ Go command failed: {e}")
-                print(f"    📝 Make sure go.mod and go.sum are valid in {source_dir}")
-                return {}
-            except json.JSONDecodeError as e:
-                print(f"    ❌ Failed to parse JSON output: {e}")
-                return {}
-            except Exception as e:
-                print(f"    ❌ Unexpected error in go list: {e}")
-                return {}
-
-    def parse_go_mod_detailed(self, go_mod_path: str) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
-        """
-        Parse go.mod file and extract detailed dependency information.
-        Returns: (direct_deps, indirect_deps, replace_directives)
-        """
-        direct_deps = {}      # module_path -> version
-        indirect_deps = {}    # module_path -> version  
-        replace_directives = {}  # module_path -> replacement_path
-        
-        try:
-            with open(go_mod_path, 'r') as f:
-                content = f.read()
-        except FileNotFoundError:
-            raise FileNotFoundError(f"go.mod file not found: {go_mod_path}")
-
-        print(f"    🔍 Detailed parsing of go.mod: {go_mod_path}")
-
-        in_require_block = False
-        
-        for line in content.split('\n'):
-            original_line = line
+    with go_sum_path.open() as f:
+        for line in f:
             line = line.strip()
-            
-            # Parse replace directives
-            if line.startswith('replace '):
-                parts = line.split()
-                if len(parts) >= 4 and '=>' in parts:
-                    try:
-                        arrow_idx = parts.index('=>')
-                        if arrow_idx > 1:
-                            module_path = parts[1]
-                            replacement = ' '.join(parts[arrow_idx + 1:])
-                            replace_directives[module_path] = replacement
-                            print(f"    🔄 Replace: {module_path} => {replacement}")
-                    except (ValueError, IndexError):
-                        continue
+            if not line or line.startswith('//'):
                 continue
-            
-            # Check if we're entering a require block
-            if line.startswith('require ('):
-                in_require_block = True
-                continue
-            elif line.startswith('require ') and not line.startswith('require ('):
-                # Single line require
-                parts = line.split()
-                if len(parts) >= 3:
-                    module_path, version = parts[1], parts[2]
-                    if '// indirect' in original_line:
-                        indirect_deps[module_path] = version
-                    else:
-                        direct_deps[module_path] = version
-                continue
-            
-            # Check if we're leaving a require block
-            if in_require_block and line == ')':
-                in_require_block = False
-                continue
-            
-            # Parse modules in require block
-            if in_require_block and line and not line.startswith('//'):
-                # Check if this line has indirect comment
-                is_indirect = '// indirect' in original_line
-                
-                # Remove inline comments to get clean module info
-                clean_line = line.split('//')[0].strip()
-                if clean_line:
-                    parts = clean_line.split()
-                    if len(parts) >= 2:
-                        module_path, version = parts[0], parts[1]
-                        if is_indirect:
-                            indirect_deps[module_path] = version
-                        else:
-                            direct_deps[module_path] = version
-
-        print(f"    📊 Found {len(direct_deps)} direct, {len(indirect_deps)} indirect, {len(replace_directives)} replaced")
-        return direct_deps, indirect_deps, replace_directives
-
-    def get_vendor_like_dependencies(self, go_mod_path: str) -> List[Tuple[str, str]]:
-        """Get dependencies using a hybrid approach for maximum accuracy."""
-        print("    🔍 Discovering vendor-like dependencies (hybrid approach)...")
-
-        # Get the directory containing go.mod
-        go_mod_dir = Path(go_mod_path).parent
-        print(f"    📁 Working directory: {go_mod_dir}")
-
-        self.vendor_module_info = {}
-
-        try:
-            # First, ensure dependencies are downloaded
-            print("    📥 Downloading dependencies...")
-            download_result = subprocess.run(
-                ["go", "mod", "download"],
-                cwd=go_mod_dir,
-                capture_output=True,
-                text=True,
-                timeout=300,
-                env=self._go_env()
-            )
-            
-            if download_result.returncode != 0:
-                print(f"    ⚠️  go mod download had issues: {download_result.stderr}")
-
-            # Method 3: Use go mod vendor to get authoritative dependencies
-            print("    📦 Method 3: Using 'go mod vendor' for authoritative list...")
-            modules_from_vendor = set()
-            
-            try:
-                # Create a temporary vendor directory to avoid affecting the source
-                import tempfile
-                with tempfile.TemporaryDirectory() as temp_dir:
-                    temp_go_mod_dir = Path(temp_dir) / "temp_repo"
-                    temp_go_mod_dir.mkdir()
-                    
-                    # Copy go.mod and go.sum to temp directory
-                    import shutil
-                    shutil.copy2(go_mod_dir / "go.mod", temp_go_mod_dir / "go.mod")
-                    if (go_mod_dir / "go.sum").exists():
-                        shutil.copy2(go_mod_dir / "go.sum", temp_go_mod_dir / "go.sum")
-
-                    # Handle local replace directives
-                    for module, replacement in self.replace_directives.items():
-                        parts = replacement.split()
-                        if len(parts) == 1 and parts[0].startswith('./'):
-                            local_path = parts[0]
-                            print(f"    🔄 Handling local replace: {module} => {local_path}")
-                            source_path = go_mod_dir / local_path
-                            dest_path = temp_go_mod_dir / local_path
-                            if source_path.exists() and source_path.is_dir():
-                                print(f"    📂 Copying {source_path} to {dest_path}")
-                                shutil.copytree(source_path, dest_path, dirs_exist_ok=True)
-                            else:
-                                print(f"    ⚠️  Warning: Local path for replace directive not found: {source_path}")
-
-                    # Copy source code directories needed for go mod vendor to analyze imports
-                    source_dirs = ['cmd', 'pkg', 'internal']  # Common Go source directories
-                    for source_dir_name in source_dirs:
-                        source_path = go_mod_dir / source_dir_name
-                        if source_path.exists() and source_path.is_dir():
-                            dest_path = temp_go_mod_dir / source_dir_name
-                            print(f"    📂 Copying source directory {source_path} to {dest_path}")
-                            shutil.copytree(source_path, dest_path, dirs_exist_ok=True)
-
-                    # Run go mod vendor in temp directory
-                    vendor_result = subprocess.run(
-                        ["go", "mod", "vendor"],
-                        cwd=temp_go_mod_dir,
-                        capture_output=True,
-                        text=True,
-                        timeout=300,
-                        env=self._go_env()
-                    )
-
-                    if vendor_result.returncode == 0:
-                        # Parse the generated modules.txt
-                        vendor_modules_txt = temp_go_mod_dir / "vendor" / "modules.txt"
-                        if vendor_modules_txt.exists():
-                            print( f"copying modules.txt from {temp_go_mod_dir}/vendor" )
-                            # Copy the authoritative modules.txt to the current directory
-                            current_dir_modules_txt = Path("modules.txt")
-                            print(f"    ✍️ Copying modules.txt to {current_dir_modules_txt.absolute()}")
-                            try:
-                                shutil.copy2(vendor_modules_txt, current_dir_modules_txt)
-                                print(f"    ✅ modules.txt copied successfully")
-                            except Exception as copy_error:
-                                print(f"    ❌ Failed to copy modules.txt: {copy_error}")
-                                raise RuntimeError(f"Critical: Could not copy modules.txt to working directory: {copy_error}")
-
-                            # Store vendor directory for later comparison in detect_missing_overrides
-                            # Copy the entire vendor directory to preserve it beyond the temp context
-                            if hasattr(self, 'args') and getattr(self.args, 'detect_missing_overrides', False):
-                                vendor_backup_dir = Path("vendor_reference")
-                                if vendor_backup_dir.exists():
-                                    shutil.rmtree(vendor_backup_dir)
-                                shutil.copytree(temp_go_mod_dir / "vendor", vendor_backup_dir)
-                                self.vendor_reference_dir = vendor_backup_dir
-                                print(f"    📂 Preserved vendor reference for override detection: {vendor_backup_dir}")
-
-                            # Parse vendor/modules.txt to get modules AND their packages
-                            current_module = None
-                            current_packages = []
-                            is_explicit = False
-
-                            with open(vendor_modules_txt, 'r') as f:
-                                for line in f:
-                                    line = line.strip()
-                                    if line.startswith('# ') and ' ' in line:
-                                        # Save previous module's packages
-                                        if current_module:
-                                            self.vendor_packages[current_module[0]] = current_packages
-                                            self.vendor_module_info[current_module[0]] = {'explicit': is_explicit, 'version': current_module[1]}
-
-                                        # Extract module and version from "# module version" format
-                                        parts = line[2:].split()
-                                        if len(parts) >= 2:
-                                            module_path, version = parts[0], parts[1]
-                                            current_module = (module_path, version)
-                                            current_packages = []
-                                            is_explicit = False
-                                            modules_from_vendor.add((module_path, version))
-                                    elif line.startswith('## explicit'):
-                                        is_explicit = True
-                                    elif line and not line.startswith('##') and current_module:
-                                        # This is a package line for the current module
-                                        current_packages.append(line)
-
-                                # Don't forget the last module
-                                if current_module:
-                                    self.vendor_packages[current_module[0]] = current_packages
-                                    self.vendor_module_info[current_module[0]] = {'explicit': is_explicit, 'version': current_module[1]}
-
-                        print(f"    📦 Found {len(modules_from_vendor)} modules from go mod vendor")
-                    else:
-                        print(f"    ❌ go mod vendor failed: {vendor_result.stderr}")
-                        raise RuntimeError(f"go mod vendor failed: {vendor_result.stderr}")
-
-            except Exception as e:
-                print(f"    ❌ go mod vendor method failed: {e}")
-                raise e
-
-            modules = list(modules_from_vendor)
-            
-            return modules
-
-        except Exception as e:
-            print(f"    ⚠️  Error in hybrid analysis: {e}")
-            print("    ➡️  Falling back to basic go.mod parsing...")
-            return self.parse_go_mod(go_mod_path)
-
-    def get_all_dependencies(self, go_mod_path: str) -> List[Tuple[str, str]]:
-        """Get all dependencies including transitives using go list."""
-        print("    🔍 Discovering all dependencies (including transitive)...")
-        
-        # Get the directory containing go.mod
-        go_mod_dir = Path(go_mod_path).parent
-        print(f"    📁 Working directory: {go_mod_dir}")
-        
-        # First, ensure dependencies are downloaded
-        print("    📥 Downloading dependencies...")
-        try:
-            download_result = subprocess.run(
-                ["go", "mod", "download"],
-                cwd=go_mod_dir,
-                capture_output=True,
-                text=True,
-                timeout=300,
-                env=self._go_env()
-            )
-            if download_result.returncode == 0:
-                print("    ✅ Dependencies downloaded successfully")
-            else:
-                print(f"    ⚠️  go mod download had issues: {download_result.stderr}")
-        except Exception as e:
-            print(f"    ⚠️  go mod download error: {e}")
-        
-        modules = []
-        
-        # Use go list -m all
-        try:
-            print("    📊 Using 'go list -m all'")
-            result = subprocess.run(
-                ["go", "list", "-m", "all"],
-                cwd=go_mod_dir,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=120,
-                env=self._go_env()
-            )
-            
-            for line in result.stdout.strip().split('\n'):
-                line = line.strip()
-                if line and ' ' in line:
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        module_path, version = parts[0], parts[1]
-                        # Skip the main module
-                        if version and version != '(main)' and not line.endswith('(main)'):
-                            modules.append((module_path, version))
-            
-            print(f"    📊 Found {len(modules)} modules with 'go list -m all'")
-            
-        except Exception as e:
-            print(f"    ⚠️  'go list -m all' failed: {e}")
-        
-        # Remove duplicates while preserving order
-        unique_modules = []
-        seen = set()
-        for module_path, version in modules:
-            key = (module_path, version)
-            if key not in seen:
-                seen.add(key)
-                unique_modules.append((module_path, version))
-        
-        print(f"    ✅ Final count: {len(unique_modules)} unique dependencies")
-        
-        return unique_modules
-
-    def get_module_download_info(self, module_path: str, version: str) -> Optional[Dict]:
-        """Get module download information including VCS details."""
-        module_version = f"{module_path}@{version}"
-        
-        try:
-            # First, download the module
-            subprocess.run(
-                ["go", "mod", "download", module_version],
-                check=True,
-                capture_output=True,
-                text=True,
-                env=self._go_env()
-            )
-            
-            # Get detailed module information
-            result = subprocess.run(
-                ["go", "mod", "download", "-json", module_version],
-                check=True,
-                capture_output=True,
-                text=True,
-                env=self._go_env()
-            )
-            
-            return json.loads(result.stdout)
-            
-        except subprocess.CalledProcessError as e:
-            print(f"    ❌ Error getting module info: {e}")
-            return None
-        except json.JSONDecodeError as e:
-            print(f"    ❌ Error parsing module info JSON: {e}")
-            return None
-
-    def derive_repo_url(self, module_path: str) -> Optional[str]:
-        """Derive repository URL from module path for common hosting platforms."""
-        def strip_version_suffix(path: str) -> str:
-            """Strip Go module version suffix (e.g., /v2, /v3, /v5) from module path."""
-            return re.sub(r'/v\d+$', '', path)
-
-        if module_path.startswith('github.com/'):
-            # Strip version suffix for GitHub URLs (e.g., /v2, /v3, /v5)
-            # github.com/godbus/dbus/v5 -> github.com/godbus/dbus
-            clean_path = strip_version_suffix(module_path)
-            return f"https://{clean_path}.git"
-        elif module_path.startswith('gitlab.com/'):
-            # Strip version suffix for GitLab URLs
-            clean_path = strip_version_suffix(module_path)
-            return f"https://{clean_path}.git"
-        elif module_path.startswith('bitbucket.org/'):
-            # Strip version suffix for Bitbucket URLs
-            clean_path = strip_version_suffix(module_path)
-            return f"https://{clean_path}.git"
-        elif module_path.startswith('go.googlesource.com/'):
-            return f"https://{module_path}"
-        elif module_path.startswith('golang.org/x/'):
-            # golang.org/x packages are hosted on go.googlesource.com
-            package_name = module_path.replace('golang.org/x/', '')
-            return f"https://go.googlesource.com/{package_name}"
-        elif module_path.startswith('gopkg.in/'):
-            suffix = module_path[len('gopkg.in/'):]
-            parts = suffix.split('/')
-
-            def strip_version(segment: str) -> str:
-                return re.sub(r'\.v\d+$', '', segment)
-
-            if len(parts) == 1:
-                repo = strip_version(parts[0])
-                owner = f"go-{repo}"
-            else:
-                owner = parts[0]
-                repo = strip_version(parts[1])
-
-            return f"https://github.com/{owner}/{repo}"
-        # Note: This is a fallback. The primary method uses 'go mod download' to get actual repository URLs.
-
-        # If we can't derive it, return None
-        return None
-
-    @staticmethod
-    def canonicalize_module_path(module_path: str) -> str:
-        """Normalize alternate module paths to their canonical form."""
-        match = re.match(r'^go\.([^\.]+)\.in/(.+)$', module_path)
-        if match:
-            name, rest = match.groups()
-            parts = rest.split('/')
-            if len(parts) >= 2:
-                module_name = parts[0] or name
-                version = parts[1]
-                remainder = '/'.join(parts[2:])
-                canonical = f"gopkg.in/{module_name}.{version}"
-                if remainder:
-                    canonical = f"{canonical}/{remainder}"
-                return canonical
-            return f"gopkg.in/{name}.{rest}"
-        return module_path
-
-    def _collect_modules_from_go_sum(self, go_sum_path: Path) -> List[Tuple[str, str, Optional[str]]]:
-        """
-        Parse go.sum and return (canonical_path, version, alias_path) tuples.
-        This finds ALL module versions including deep transitive dependencies.
-        """
-        results: List[Tuple[str, str, Optional[str]]] = []
-        seen: Set[Tuple[str, str]] = set()
-
-        try:
-            with open(go_sum_path, 'r') as f:
-                for raw_line in f:
-                    line = raw_line.strip()
-                    if not line or line.startswith('//'):
-                        continue
-
-                    parts = line.split()
-                    if len(parts) < 2:
-                        continue
-
-                    module_path, version = parts[0], parts[1]
-
-                    # go.sum has both "module v1.0.0" and "module v1.0.0/go.mod" entries
-                    if module_path.endswith('/go.mod'):
-                        module_path = module_path[:-7]
-
-                    canonical_path = self.canonicalize_module_path(module_path)
-
-                    # Skip standard library placeholders or synthetic package identifiers
-                    if canonical_path.startswith('std') or canonical_path in ('command-line-arguments',):
-                        continue
-
-                    key = (canonical_path, version)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-
-                    alias_path = module_path if module_path != canonical_path else None
-                    results.append((canonical_path, version, alias_path))
-        except FileNotFoundError:
-            return []
-
-        return results
-
-    def _collect_aliases_from_go_mod(self, direct: Dict[str, str], indirect: Dict[str, str]) -> Dict[str, Set[str]]:
-        """Collect module alias mappings discovered in go.mod requirements/replacements."""
-        alias_map: Dict[str, Set[str]] = {}
-
-        def record_alias(alias_path: str) -> None:
-            alias_path = alias_path.strip()
-            if not alias_path:
-                return
-            canonical = self.canonicalize_module_path(alias_path)
-            if canonical != alias_path:
-                alias_map.setdefault(canonical, set()).add(alias_path)
-
-        for module_path in list(direct.keys()) + list(indirect.keys()):
-            record_alias(module_path)
-
-        for alias_path, replacement in getattr(self, 'replace_directives', {}).items():
-            # Ignore local filesystem replacements (./, ../) which don't produce alternate modules
-            replacement = replacement.strip()
-            if not replacement or replacement.startswith('./') or replacement.startswith('../'):
-                record_alias(alias_path)
+            parts = line.split()
+            if len(parts) != 3:
                 continue
 
-            replacement_path = replacement.split()[0]
-            if replacement_path.startswith('./') or replacement_path.startswith('../'):
-                record_alias(alias_path)
-                continue
+            module_path, version, _ = parts
+            # Strip /go.mod suffix if present (we want the base version)
+            if version.endswith('/go.mod'):
+                version = version[:-7]  # Remove '/go.mod'
+            modules.add((module_path, version))
+    return modules
 
-            canonical_target = self.canonicalize_module_path(replacement_path)
-            if canonical_target:
-                record_alias(alias_path)
 
-        return alias_map
+SCRIPT_DIR = Path(__file__).resolve().parent
+LS_REMOTE_CACHE_PATH = SCRIPT_DIR / ".oe-go-mod-fetcher.ls-remote-cache.json"
 
-    def safe_module_name(self, module_path: str) -> str:
-        """Convert module path to safe directory name."""
-        return module_path.replace('/', '_').replace('\\', '_')
+LS_REMOTE_CACHE: Dict[Tuple[str, str], Optional[str]] = {}
+LS_REMOTE_CACHE_DIRTY = False
 
-    def clone_or_update_repo(self, repo_url: str, repo_dir: Path) -> bool:
-        """Clone repository or update if it already exists."""
+MODULE_METADATA_CACHE_PATH = SCRIPT_DIR / ".oe-go-mod-fetcher.module-cache.json"
+MODULE_METADATA_CACHE: Dict[Tuple[str, str], Dict[str, str]] = {}
+MODULE_METADATA_CACHE_DIRTY = False
+
+
+def _cache_key(url: str, ref: str) -> str:
+    return f"{url}|||{ref}"
+
+
+def load_ls_remote_cache() -> None:
+    if not LS_REMOTE_CACHE_PATH.exists():
+        return
+    try:
+        data = json.loads(LS_REMOTE_CACHE_PATH.read_text())
+    except Exception:
+        return
+    for key, value in data.items():
         try:
-            repo_dir.parent.mkdir(parents=True, exist_ok=True)
-            if (repo_dir / '.git').exists():
-                print("    Updating existing repository...")
-                if not self._run_git_command_with_retry(
-                    ["git", "fetch", "--all", "--tags"],
-                    cwd=repo_dir,
-                    description="git fetch --all --tags"
-                ):
-                    return False
-            else:
-                if repo_dir.exists():
-                    print("    Removing incomplete repository checkout before cloning...")
-                    shutil.rmtree(repo_dir, ignore_errors=True)
-                print(f"    Cloning from {repo_url}...")
-                # Start with a shallow clone to reduce transfer size
-                clone_result = self._run_git_command_with_retry(
-                    ["git", "clone", "--depth", "1", repo_url, str(repo_dir)],
-                    cleanup=repo_dir,
-                    description=f"git clone --depth 1 {repo_url}"
-                )
-                if not clone_result:
-                    # If shallow clone fails, fall back to a full history clone
-                    print("    Shallow clone failed, trying full history clone...")
-                    clone_result = self._run_git_command_with_retry(
-                        ["git", "clone", repo_url, str(repo_dir)],
-                        cleanup=repo_dir,
-                        description=f"git clone {repo_url}"
-                    )
-                    if not clone_result:
-                        return False
-            return True
-            
-        except subprocess.CalledProcessError as e:
-            print(f"    ❌ Git operation failed: {e}")
-            return False
-
-    def _deepen_repository(self, repo_dir: Path) -> Tuple[bool, bool]:
-        """
-        Ensure a shallow clone has enough history for the required revision.
-
-        Returns (success, was_shallow) so callers can propagate shallow restrictions.
-        """
-        was_shallow = False
-
-        try:
-            depth_check = subprocess.run(
-                ["git", "rev-parse", "--is-shallow-repository"],
-                cwd=repo_dir,
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-        except subprocess.CalledProcessError:
-            return False, False
-
-        if depth_check.stdout.strip().lower() != "true":
-            # Already have full history
-            return True, False
-
-        was_shallow = True
-        print("    Repository is shallow; fetching additional history for required revision...")
-
-        # Try to upgrade the shallow clone; fall back to a full fetch if needed
-        fetch_result = self._run_git_command_with_retry(
-            ["git", "fetch", "--unshallow", "--tags"],
-            cwd=repo_dir,
-            description="git fetch --unshallow --tags",
-        )
-
-        if not fetch_result:
-            print("    ⚠️  --unshallow failed; attempting full fetch to obtain commit history...")
-            fetch_result = self._run_git_command_with_retry(
-                ["git", "fetch", "--all", "--tags"],
-                cwd=repo_dir,
-                description="git fetch --all --tags",
-            )
-            if not fetch_result:
-                return False, True
-
-        # Confirm repository is no longer shallow
-        try:
-            depth_check = subprocess.run(
-                ["git", "rev-parse", "--is-shallow-repository"],
-                cwd=repo_dir,
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-        except subprocess.CalledProcessError:
-            # If rev-parse fails after fetching, assume success but preserve shallow flag
-            return True, True
-
-        return depth_check.stdout.strip().lower() != "true", True
-
-    def checkout_revision(self, repo_dir: Path, hash_val: str, ref: str, version: str,
-                          repo_identifier: Optional[str] = None) -> bool:
-        """Checkout specific revision in the repository."""
-        try:
-            deepened_history = False
-            repo_dir = Path(repo_dir)
-            repo_key = self._normalize_repo_identifier(repo_identifier)
-
-            # Load any persisted marker for this repository
-            if repo_key:
-                self._repo_requires_full_history(repo_dir, repo_key)
-
-            def try_checkout(target: str) -> bool:
-                try:
-                    subprocess.run(
-                        ["git", "checkout", target],
-                        cwd=repo_dir,
-                        check=True,
-                        capture_output=True
-                    )
-                    return True
-                except subprocess.CalledProcessError:
-                    return False
-
-            def ensure_deep_history() -> bool:
-                nonlocal deepened_history
-                if deepened_history:
-                    return True
-                deepened_history, was_shallow = self._deepen_repository(repo_dir)
-                if was_shallow and repo_key:
-                    print("    ℹ️  Required commit missing from shallow clone; marking repository as non-shallow")
-                    self._mark_repo_requires_full_history(repo_dir, repo_key)
-                if not deepened_history:
-                    print("    ⚠️  Failed to automatically deepen repository history")
-                    if was_shallow and repo_key:
-                        self._mark_repo_requires_full_history(repo_dir, repo_key)
-                return deepened_history
-
-            # Try hash first (most reliable)
-            if hash_val:
-                print(f"    Checking out commit {hash_val[:8]}...")
-                if try_checkout(hash_val):
-                    return True
-                if ensure_deep_history() and try_checkout(hash_val):
-                    return True
-                print("    Hash checkout failed, trying alternatives...")
-
-            # Try ref (tag or branch)
-            if ref:
-                print(f"    Checking out ref {ref}...")
-                if try_checkout(ref):
-                    return True
-                if ensure_deep_history() and try_checkout(ref):
-                    return True
-                print("    Ref checkout failed, trying version tag...")
-
-            # Try version as tag
-            if version:
-                possible_tags = [version]
-                if not version.startswith('v'):
-                    possible_tags.append(f"v{version}")
-                else:
-                    possible_tags.append(version[1:])
-
-                for tag in possible_tags:
-                    print(f"    Trying to checkout tag {tag}...")
-                    if try_checkout(tag):
-                        return True
-                    if ensure_deep_history() and try_checkout(tag):
-                        return True
-
-            # FALLBACK: Try default branch when specific revisions fail
-            print(f"    ⚠️  Could not checkout any specific revision (hash: {hash_val}, ref: {ref}, version: {version})")
-            print("    🔄 Attempting fallback to default branch...")
-
-            try:
-                # First fetch all refs to ensure we have the latest info
-                subprocess.run(
-                    ["git", "fetch", "--all", "--tags"],
-                    cwd=repo_dir,
-                    check=True,
-                    capture_output=True
-                )
-
-                # Try common default branch names
-                default_branches = ['main', 'master', 'HEAD']
-                for branch in default_branches:
-                    try:
-                        print(f"    Trying fallback to branch: {branch}")
-                        subprocess.run(
-                            ["git", "checkout", branch],
-                            cwd=repo_dir,
-                            check=True,
-                            capture_output=True
-                        )
-                        print(f"    ✅ Fallback successful: using {branch} branch")
-                        return True
-                    except subprocess.CalledProcessError:
-                        continue
-
-                # If default branches fail, just stay on whatever we have
-                print("    ⚠️  Could not checkout default branches, using current HEAD")
-                return True  # Don't fail completely - use whatever we have
-
-            except Exception as fallback_error:
-                print(f"    ❌ Fallback also failed: {fallback_error}")
-                print("    ⚠️  Using repository as-is to avoid complete failure")
-                return True  # Don't fail completely - use whatever we have
-
-        except Exception as e:
-            print(f"    ❌ Checkout failed with error: {e}")
-            return False
-
-    def should_exclude_path(self, path: Path, base_path: Path) -> bool:
-        """Determine if a path should be excluded from vendor copy (optimized)."""
-        # Cache relative path calculation
-        try:
-            relative_path = path.relative_to(base_path)
+            url, ref = key.split("|||", 1)
         except ValueError:
-            return True  # Path is outside base_path
-        
-        path_str = str(relative_path)
-        
-        # Quick checks for common exclusions (most frequent first)
-        if path.is_file():
-            name = path.name
-            # Exclude test files and common non-source files
-            if (name.endswith('_test.go') or name.endswith('.test') or 
-                name.endswith('.md') or name.endswith('.txt') or
-                name in ['go.sum', 'go.work', 'go.work.sum'] or
-                (name.startswith('.') and name not in ['.go-version'])):
-                return True
-        
-        # Check path components (use set for O(1) lookup)
-        exclude_set = {
-            '.git', '.github', '.gitignore', '.gitmodules', 'vendor', 'node_modules',
-            'testdata', 'examples', 'example', '_examples', 'docs', 'doc',
-            'test', 'tests', '.travis.yml', '.circleci', 'Makefile', 'makefile', 
-            'Dockerfile', 'docker-compose.yml', 'README.md', 'readme.md', 
-            'README.txt', 'CHANGELOG.md', 'CONTRIBUTING.md', 'LICENSE', 
-            'COPYING', 'AUTHORS', 'CONTRIBUTORS', '.editorconfig', 
-            '.golangci.yml', '.pre-commit-config.yaml'
-        }
-        
-        # Check if any part of the path matches exclude patterns
-        for part in relative_path.parts:
-            if part in exclude_set or part.endswith('_test'):
-                return True
-        
-        return False
-
-    def calculate_directory_hash(self, dir_path: Path) -> str:
-        """Calculate a hash of directory contents for change detection."""
-        hash_md5 = hashlib.md5()
-        
-        # Get all relevant files sorted for consistent hashing
-        files = []
-        for item in dir_path.rglob('*'):
-            if item.is_file() and not self.should_exclude_path(item, dir_path):
-                files.append(item)
-        
-        files.sort()
-        
-        for file_path in files:
-            try:
-                # Add file path to hash
-                hash_md5.update(str(file_path.relative_to(dir_path)).encode())
-                
-                # Add file modification time
-                hash_md5.update(str(file_path.stat().st_mtime).encode())
-                
-                # For small files, add content hash
-                if file_path.stat().st_size < 10000:  # 10KB
-                    with open(file_path, 'rb') as f:
-                        hash_md5.update(f.read())
-                        
-            except (OSError, PermissionError):
-                continue
-                
-        return hash_md5.hexdigest()
-
-    def is_copy_needed(self, source_dir: Path, dest_dir: Path, module_path: str) -> bool:
-        """Check if copy is needed by comparing hashes."""
-        if not dest_dir.exists():
-            return True
-            
-        # Check if hash file exists
-        hash_file = dest_dir / '.source_hash'
-        if not hash_file.exists():
-            return True
-            
-        try:
-            # Read stored hash
-            with open(hash_file, 'r') as f:
-                stored_hash = f.read().strip()
-                
-            # Calculate current source hash
-            current_hash = self.calculate_directory_hash(source_dir)
-            
-            if stored_hash != current_hash:
-                print(f"    📋 Source changed for {module_path} (hash mismatch)")
-                return True
-            else:
-                print(f"    ⚡ Skipping copy for {module_path} (unchanged)")
-                return False
-                
-        except (OSError, IOError):
-            return True
-
-    def copy_source_to_vendor(self, repo_dir: Path, module_path: str) -> bool:
-        """Copy source code from repository to vendor directory with optimized package mapping."""
-        if not self.vendor_dir:
-            return True  # No vendor directory specified, skip
-
-        print(f"    📦 Processing vendor copy for {module_path}...")
-
-        try:
-            # Use cached package discovery (much faster than re-scanning)
-            packages = self.discover_go_packages(repo_dir, module_path)
-            
-            if not packages:
-                print(f"    ⚠️  No Go packages found in {module_path}")
-                return True
-
-            copied_count = 0
-            skipped_count = 0
-
-            for import_path, package_dir in packages.items():
-                vendor_package_dir = self.vendor_dir / import_path
-
-                # Skip if this package already exists and is unchanged
-                if not self.is_package_copy_needed(package_dir, vendor_package_dir, import_path):
-                    skipped_count += 1
-                    continue
-
-                # Remove existing vendor directory for this package
-                if vendor_package_dir.exists():
-                    shutil.rmtree(vendor_package_dir)
-
-                # Create parent directories
-                vendor_package_dir.parent.mkdir(parents=True, exist_ok=True)
-                vendor_package_dir.mkdir(parents=True, exist_ok=True)
-
-                # Copy package files (*.go, go.mod, LICENSE, etc.)
-                self.copy_package_files(package_dir, vendor_package_dir)
-
-                # Store hash for change detection
-                source_hash = self.calculate_directory_hash(package_dir)
-                with open(vendor_package_dir / '.source_hash', 'w') as f:
-                    f.write(source_hash)
-
-                copied_count += 1
-
-            print(f"    ✅ Vendor copy: {copied_count} copied, {skipped_count} skipped")
-
-            # Create/update modules.txt with the exact version from go.mod
-            self.update_modules_txt(module_path, version)
-
-            return True
-
-        except Exception as e:
-            print(f"    ❌ Failed to copy to vendor: {e}")
-            return False
-
-    def discover_go_packages(self, repo_dir: Path, module_path: str) -> Dict[str, Path]:
-        """Discover Go packages with internal directory handling and caching."""
-        # Use cache if available
-        cache_key = str(repo_dir)
-        if cache_key in self.package_cache:
-            return self.package_cache[cache_key]
-        
-        print(f"    📂 Scanning packages in {module_path}... (caching enabled)")
-        packages = {}
-
-        for dir_path in repo_dir.rglob('*'):
-            if not dir_path.is_dir() or self.should_exclude_path(dir_path, repo_dir):
-                continue
-
-            # Check for Go files
-            go_files = list(dir_path.glob('*.go'))
-            non_test_files = [f for f in go_files if not f.name.endswith('_test.go')]
-            if not non_test_files:
-                continue
-
-            # Calculate relative path from repo root
-            rel_path = dir_path.relative_to(repo_dir)
-
-            # Handle internal directories that duplicate module path
-            if rel_path == Path('.'):
-                # Root package of the module
-                import_path = module_path
-            else:
-                # Check for internal directory duplication
-                rel_path_str = rel_path.as_posix()
-                module_parts = module_path.split('/')
-
-                # If the first directory matches the last part of the module path, skip it
-                # Example: module "example.org/project/api" with internal "/api/" dir
-                if module_parts and rel_path_str.startswith(module_parts[-1] + '/'):
-                    # Skip the duplicated internal directory
-                    adjusted_path = rel_path_str[len(module_parts[-1]) + 1:]  # +1 for the '/'
-                    if adjusted_path:
-                        import_path = f"{module_path}/{adjusted_path}"
-                    else:
-                        import_path = module_path
-                else:
-                    # Normal case: module_path + relative_path
-                    import_path = f"{module_path}/{rel_path_str}"
-
-            packages[import_path] = dir_path
-
-        # Cache the results
-        self.package_cache[cache_key] = packages
-        print(f"    📦 Found {len(packages)} packages (cached for future use)")
-        return packages
-
-    def discover_packages_for_modules_txt(self, repo_dir: Path, module_path: str) -> List[str]:
-        """
-        Discover packages for a module. If vendor_like is enabled, use the package
-        list from the main project's vendor/modules.txt, which is the most accurate method.
-        """
-        # If vendor-like analysis was done, we have the authoritative package list.
-        if self.vendor_like and hasattr(self, 'vendor_packages') and self.vendor_packages:
-            packages = self.vendor_packages.get(module_path)
-            if packages is not None:
-                print(f"    📦 Using {len(packages)} packages from 'go mod vendor' analysis for {module_path}")
-                return sorted(packages)
-            else:
-                # This can happen if a module is in go.mod but no packages from it are actually used.
-                # 'go mod vendor' omits such modules from modules.txt.
-                print(f"    ℹ️  Module {module_path} not in vendor/modules.txt; assuming no packages are needed.")
-                return []
-
-        # Fallback for non-vendor-like mode. This is less accurate and not recommended for OE builds.
-        print(f"    ⚠️  Warning: Not using --vendor-like. Falling back to 'go list' for {module_path}.")
-        print(f"    📦 Discovering packages using 'go list .'... (less accurate)")
-
-        packages = []
-        try:
-            # Run 'go list' in the module's repository directory.
-            # Using './...' should list all packages within that module.
-            result = subprocess.run(
-                ["go", "list", "./..."],
-                cwd=repo_dir,
-                capture_output=True,
-                text=True,
-                check=True,
-                env=self._go_env()
-            )
-            packages = result.stdout.strip().split('\n')
-            
-        except subprocess.CalledProcessError as e:
-            print(f"    ❌ 'go list ./...' failed for {module_path}: {e.stderr}")
-            print("    ➡️  Returning empty package list. The generated modules.txt will be incomplete.")
-            return []
-
-        if not packages:
-            print(f"    ⚠️  'go list' did not find any packages for {module_path}.")
-        
-        print(f"    ✅ Found {len(packages)} packages for {module_path} via 'go list'")
-        return sorted(packages)
-
-    def parse_imports_from_source(self, repo_dir: Path, module_path: str) -> List[str]:
-        """
-        Parse Go source files to extract import statements and determine which packages
-        from this module are actually imported. This is much more accurate than scanning
-        all directories and matches what 'go mod vendor' actually needs.
-        """
-        imported_packages = set()
-        
-        # We need to find what packages from THIS module are imported by OTHER code
-        # The tricky part is that we're analyzing the module itself to see what it provides
-        
-        # Strategy: Find all packages that actually contain importable Go code
-        # (not test files, not internal tooling, not examples)
-        
-        for go_file in repo_dir.rglob("*.go"):
-            # Skip test files, example files, and vendor directories
-            if (go_file.name.endswith("_test.go") or 
-                "vendor/" in str(go_file) or 
-                "testdata/" in str(go_file) or
-                "/examples/" in str(go_file) or
-                "/example/" in str(go_file) or
-                "_example" in str(go_file)):
-                continue
-                
-            try:
-                # Determine the import path for this Go file
-                rel_path = go_file.parent.relative_to(repo_dir)
-                if rel_path == Path("."):
-                    # Root package
-                    package_import = module_path
-                else:
-                    # Subpackage
-                    package_import = f"{module_path}/{rel_path.as_posix()}"
-                
-                # Check if this file contains actual exportable code
-                # (has package declaration and at least one exportable symbol)
-                if self.has_exportable_code(go_file):
-                    imported_packages.add(package_import)
-                    
-            except Exception as e:
-                # Skip files we can't process
-                continue
-                
-        return sorted(list(imported_packages))
-
-    def get_repository_module(self, repo_dir: Path) -> str:
-        """
-        Read the repository's go.mod file to determine its declared module path.
-        This is the authoritative source for where the repository should be placed in vendor.
-        """
-        go_mod_path = repo_dir / "go.mod"
-        if not go_mod_path.exists():
-            return None
-
-        try:
-            with open(go_mod_path, 'r', encoding='utf-8', errors='ignore') as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith('module '):
-                        # Extract module declaration such as "module example.org/project"
-                        module_path = line[7:].strip()  # Remove "module " prefix
-                        return module_path
-        except Exception as e:
-            print(f"    ⚠️  Error reading go.mod from {repo_dir}: {e}")
-
-        return None
-
-    def detect_submodule_relationships(self):
-        """
-        Generic submodule detection - analyzes all modules to find parent-child relationships
-        without any hardcoded patterns. Returns a mapping of child -> parent relationships.
-        """
-        submodule_map = {}
-        all_module_paths = [m['path'] for m in self.oe_modules if not m.get('is_stub', False)]
-
-        for module_path in all_module_paths:
-            # Find potential parent modules by checking if this module path
-            # is a subpath of any other module path
-            potential_parents = []
-
-            for other_module_path in all_module_paths:
-                if (module_path.startswith(other_module_path + '/') and
-                    module_path != other_module_path):
-                    potential_parents.append(other_module_path)
-
-            # If we found potential parents, choose the longest one (most specific)
-            if potential_parents:
-                parent_module = max(potential_parents, key=len)
-                subpath = module_path[len(parent_module + '/'):]
-                submodule_map[module_path] = {
-                    'parent': parent_module,
-                    'subpath': subpath
-                }
-                print(f"    🔍 Generic detection: {module_path} is submodule of {parent_module} (subpath: {subpath})")
-
-        return submodule_map
-
-    def load_submodule_overrides(self):
-        """
-        Load submodule override configuration from override.conf
-        Format: module_path = parent_repo,subpath
-        """
-        override_map = {}
-        override_file = Path("override.conf")
-
-        if override_file.exists():
-            print(f"    📋 Loading submodule overrides from {override_file}")
-            try:
-                with open(override_file, 'r') as f:
-                    for line_num, line in enumerate(f, 1):
-                        line = line.strip()
-                        if line and not line.startswith('#'):
-                            if '=' in line:
-                                module_path, override_spec = line.split('=', 1)
-                                module_path = module_path.strip()
-                                override_spec = override_spec.strip()
-
-                                if ',' in override_spec:
-                                    parent_repo, subpath = override_spec.split(',', 1)
-                                    override_map[module_path] = {
-                                        'parent': parent_repo.strip(),
-                                        'subpath': subpath.strip()
-                                    }
-                                    print(f"    🔧 Override: {module_path} → parent: {parent_repo.strip()}, subpath: {subpath.strip()}")
-                                else:
-                                    print(f"    ⚠️  Invalid override format at line {line_num}: {line}")
-            except Exception as e:
-                print(f"    ⚠️  Error reading override.conf: {e}")
-        else:
-            print(f"    📋 No override.conf found - using generic detection only")
-
-        return override_map
-
-    def detect_missing_overrides(self, repo_groups, combined_submodules):
-        """
-        Phase 2: Compare against 'go mod vendor' reference to detect missing overrides.
-        Identifies cases where generic detection fails and suggests override entries.
-        """
-        print("\n🔍 Phase 2: Dynamic failure detection - comparing against 'go mod vendor' reference...")
-
-        # Check if we have a preserved vendor reference to compare against
-        if not hasattr(self, 'vendor_reference_dir') or not self.vendor_reference_dir:
-            print("    ⚠️  No vendor reference directory available for comparison")
-            return
-
-        reference_vendor = self.vendor_reference_dir
-        if not reference_vendor.exists():
-            print("    ⚠️  No 'go mod vendor' reference found - cannot compare")
-            return
-
-        print(f"    📂 Using reference: {reference_vendor}")
-
-        # Parse modules.txt from go mod vendor
-        reference_modules_txt = reference_vendor / "modules.txt"
-        if not reference_modules_txt.exists():
-            print("    ⚠️  Reference modules.txt not found")
-            return
-
-        # Load reference module structure
-        reference_modules = self.parse_reference_modules_txt(reference_modules_txt)
-        print(f"    📊 Reference contains {len(reference_modules)} module entries")
-
-        # Compare our detection against reference
-        missing_modules = []
-        incorrect_structure = []
-
-        for ref_module, ref_info in reference_modules.items():
-            if ref_module not in [m['module_path'] for group in repo_groups.values() for m in group]:
-                missing_modules.append(ref_module)
-                continue
-
-            # Check if our structure matches reference
-            our_structure = self.get_our_module_structure(ref_module, repo_groups)
-            if our_structure != ref_info.get('structure', 'unknown'):
-                incorrect_structure.append({
-                    'module': ref_module,
-                    'expected': ref_info.get('structure', 'unknown'),
-                    'detected': our_structure
-                })
-
-        # Report findings
-        if missing_modules:
-            print(f"    ❌ Missing modules: {len(missing_modules)}")
-            for module in missing_modules[:5]:  # Show first 5
-                print(f"        • {module}")
-            if len(missing_modules) > 5:
-                print(f"        ... and {len(missing_modules) - 5} more")
-
-        if incorrect_structure:
-            print(f"    ❌ Incorrect structure detection: {len(incorrect_structure)}")
-            suggested_overrides = []
-            for issue in incorrect_structure[:3]:  # Show first 3
-                module = issue['module']
-                expected = issue['expected']
-                print(f"        • {module}: expected {expected}, got {issue['detected']}")
-
-                # Try to suggest override entry
-                suggestion = self.suggest_override_entry(module, expected, reference_modules)
-                if suggestion:
-                    suggested_overrides.append(suggestion)
-
-            # Generate suggested override entries
-            if suggested_overrides:
-                print("\n    💡 Suggested override.conf entries:")
-                for suggestion in suggested_overrides:
-                    print(f"        {suggestion}")
-
-        if not missing_modules and not incorrect_structure:
-            print("    ✅ Structure detection matches 'go mod vendor' reference perfectly!")
-
-    def parse_reference_modules_txt(self, modules_txt_path):
-        """Parse the reference modules.txt from 'go mod vendor'."""
-        modules = {}
-        try:
-            with open(modules_txt_path, 'r') as f:
-                current_module = None
-                for line in f:
-                    line = line.strip()
-                    if line.startswith('# '):
-                        # Module declaration: "# github.com/example/module v1.0.0"
-                        parts = line[2:].split()
-                        if len(parts) >= 2:
-                            current_module = parts[0]
-                            version = parts[1]
-                            modules[current_module] = {
-                                'version': version,
-                                'packages': [],
-                                'structure': 'standalone'  # Default
-                            }
-                    elif line and not line.startswith('#') and current_module:
-                        # Package path
-                        modules[current_module]['packages'].append(line)
-
-                        # Detect if this is a submodule based on package structure
-                        if '/' in line and current_module in line:
-                            # This package suggests a submodule relationship
-                            modules[current_module]['structure'] = 'submodule'
-
-        except Exception as e:
-            print(f"    ⚠️  Error parsing reference modules.txt: {e}")
-
-        return modules
-
-    def get_our_module_structure(self, module_path, repo_groups):
-        """Get our detected structure for a module."""
-        for group_modules in repo_groups.values():
-            for module_info in group_modules:
-                if module_info['module_path'] == module_path:
-                    if module_info['is_submodule']:
-                        return 'submodule'
-                    else:
-                        return 'standalone'
-        return 'unknown'
-
-    def suggest_override_entry(self, module_path, expected_structure, reference_modules):
-        """Suggest an override.conf entry for a failed detection."""
-        if expected_structure != 'submodule':
-            return None
-
-        # Try to infer parent module and subpath
-        # Look for modules that could be the parent
-        potential_parents = []
-        for ref_module in reference_modules.keys():
-            if module_path.startswith(ref_module + '/') and ref_module != module_path:
-                potential_parents.append(ref_module)
-
-        if potential_parents:
-            # Use the longest matching parent
-            parent = max(potential_parents, key=len)
-            subpath = module_path[len(parent + '/'):]
-            return f"{module_path} = {parent},{subpath}"
-
-        return None
-
-    def analyze_vendor_reference_structure(self):
-        """
-        Analyze vendor reference structure comprehensively to determine ALL subdirectory mappings.
-        Compare ALL packages in vendor reference with fetched modules to generate complete mappings.
-        """
-        print("\n🔍 Analyzing vendor reference structure for comprehensive subdirectory mappings...")
-
-        vendor_mappings = {}
-
-        # Look for reference vendor directory (created by go mod vendor)
-        reference_vendor = Path("vendor_reference")
-        if not reference_vendor.exists():
-            print("    ⚠️  No vendor reference found - will use override.conf only")
-            return vendor_mappings
-
-        print(f"    📂 Found vendor reference at: {reference_vendor}")
-
-        # COMPREHENSIVE APPROACH: Analyze ALL packages in vendor reference
-        # Find all package directories in vendor reference
-        all_vendor_packages = []
-        for go_file in reference_vendor.rglob("*.go"):
-            package_dir = go_file.parent
-            package_path = str(package_dir.relative_to(reference_vendor))
-            if package_path not in all_vendor_packages:
-                all_vendor_packages.append(package_path)
-
-        print(f"    📦 Found {len(all_vendor_packages)} packages in vendor reference")
-
-        # Create mapping from fetched modules for quick lookup
-        fetched_modules = {}
-        for module_info in self.oe_modules:
-            if not module_info.get('is_stub', False):
-                fetched_modules[module_info['path']] = module_info['safe_name']
-
-        # Analyze each vendor package to determine mapping requirements
-        detected_mappings = {}
-
-        for package_path in all_vendor_packages:
-            # Find which module should provide this package
-            providing_module = None
-
-            # Look for exact module match first
-            if package_path in fetched_modules:
-                providing_module = package_path
-            else:
-                # Look for parent module that could provide this package
-                package_parts = package_path.split('/')
-                for i in range(len(package_parts), 0, -1):
-                    candidate_module = '/'.join(package_parts[:i])
-                    if candidate_module in fetched_modules:
-                        providing_module = candidate_module
-                        break
-
-            if providing_module:
-                # Check if this package needs a subdirectory mapping
-                fetched_module_dir = Path("modules") / fetched_modules[providing_module]
-
-                if providing_module != package_path:
-                    # This is a subpackage - determine the subdirectory needed
-                    subdir_path = package_path.replace(providing_module + '/', '', 1) if providing_module + '/' in package_path else package_path
-
-                    # Check if the subdirectory exists in the fetched module
-                    expected_subdir = fetched_module_dir / subdir_path
-                    if not expected_subdir.exists():
-                        # Look for alternative subdirectory structures
-                        subdir_alternatives = self._find_subdir_alternatives(fetched_module_dir, subdir_path, package_path)
-                        if subdir_alternatives:
-                            subdir_path = subdir_alternatives
-
-                    # CRITICAL FIX: Only create subdirectory mappings when subdirectory is missing or needs special handling
-                    # Standard modules like golang.org/x/sys should be copied in their entirety without specific mappings
-                    if subdir_path and subdir_path != package_path and not expected_subdir.exists():
-                        key = f"{providing_module}:{subdir_path}"
-                        if key not in detected_mappings:
-                            detected_mappings[key] = {
-                                'providing_module': providing_module,
-                                'source_subdir': subdir_path,
-                                'packages_served': [package_path],
-                                'reason': f'Package {package_path} needs {subdir_path}/ subdirectory from {providing_module}'
-                            }
-                        else:
-                            detected_mappings[key]['packages_served'].append(package_path)
-
-        # Convert to final mappings format and add specific pattern detection
-        for mapping_key, mapping_info in detected_mappings.items():
-            providing_module = mapping_info['providing_module']
-            source_subdir = mapping_info['source_subdir']
-
-            # Add to vendor_mappings with enhanced detection
-            vendor_mappings[providing_module] = {
-                'source_subdir': source_subdir,
-                'reason': mapping_info['reason'],
-                'packages_count': len(mapping_info['packages_served']),
-                'sample_packages': mapping_info['packages_served'][:3]  # First 3 as examples
-            }
-
-
-        print(f"    📋 Detected {len(vendor_mappings)} comprehensive vendor structure mappings")
-        for module, mapping in vendor_mappings.items():
-            print(f"      📦 {module} -> {mapping['source_subdir']}/ ({mapping['packages_count']} packages)")
-
-        return vendor_mappings
-
-    def _find_subdir_alternatives(self, fetched_module_dir, original_subdir, package_path):
-        """Find a best-effort alternative subdirectory inside a fetched module."""
-        if not original_subdir:
-            return None
-
-        # Return original path when it already exists on disk
-        candidate = fetched_module_dir / original_subdir
-        if candidate.exists():
-            return original_subdir
-
-        # Walk back through the requested path to find the deepest existing prefix
-        segments = [segment for segment in original_subdir.split('/') if segment]
-        for length in range(len(segments), 0, -1):
-            prefix = fetched_module_dir.joinpath(*segments[:length])
-            if prefix.exists():
-                return '/'.join(segments[:length])
-
-        # As a last resort, match any top-level directory name that appears in the request
-        try:
-            for child in fetched_module_dir.iterdir():
-                if child.is_dir() and child.name in segments:
-                    return child.name
-        except FileNotFoundError:
-            return None
-
-        return None
-
-    def analyze_repository_structure(self):
-        """
-        Analyze all downloaded modules to determine repository-based relocation strategy.
-        Groups modules by their repository's declared module path.
-        """
-        repo_groups = {}  # module_path -> [list of modules]
-
-        # First pass: detect submodule relationships using generic algorithm + overrides
-        generic_submodules = self.detect_submodule_relationships()
-        override_submodules = self.load_submodule_overrides()
-
-        # Merge overrides with generic detection (overrides take precedence)
-        combined_submodules = {**generic_submodules, **override_submodules}
-
-        for module_info in self.oe_modules:
-            module_path = module_info['path']
-            safe_name = module_info['safe_name']
-            is_stub = module_info.get('is_stub', False)
-
-            if is_stub:
-                # Stub modules don't have repositories to analyze
-                continue
-
-            repo_dir = self.output_dir / safe_name
-            if not repo_dir.exists():
-                print(f"    ⚠️  Repository directory not found for {module_path}: {repo_dir}")
-                continue
-
-            # Get the repository's declared module path
-            repo_module = self.get_repository_module(repo_dir)
-            if repo_module:
-                print(f"    📂 Repository analysis: {module_path} → repo declares {repo_module}")
-
-                # Use the repository's declared module as the grouping key
-                grouping_key = repo_module
-            else:
-                print(f"    ⚠️  Could not determine repository module for {module_path}")
-                # Fallback: treat as individual module
-                grouping_key = module_path
-
-            if grouping_key not in repo_groups:
-                repo_groups[grouping_key] = []
-
-            # Check if this module is a submodule using combined detection (generic + overrides)
-            is_submodule = module_path in combined_submodules
-            subpath = None
-            if is_submodule:
-                submodule_info = combined_submodules[module_path]
-                subpath = submodule_info['subpath']
-                source_type = "override" if module_path in override_submodules else "generic"
-                print(f"    📁 {source_type.title()} submodule: {module_path} → subpath '{subpath}'")
-
-            repo_groups[grouping_key].append({
-                'module_path': module_path,
-                'safe_name': safe_name,
-                'repo_dir': repo_dir,
-                'is_submodule': is_submodule,
-                'subpath': subpath,
-                'repo_module': repo_module  # Store for debugging
-            })
-
-        # Phase 2: Dynamic failure detection
-        if hasattr(self, 'args') and getattr(self.args, 'detect_missing_overrides', False):
-            self.detect_missing_overrides(repo_groups, combined_submodules)
-
-        return repo_groups
-
-    def generate_dynamic_relocation_data(self, repo_groups):
-        """Generate dynamic relocation data structure for runtime provides calculation."""
-        relocation_data = {}
-
-        for repo_module, modules in repo_groups.items():
-            if len(modules) > 1:
-                # This repository provides multiple modules
-                module_list = [m['module_path'] for m in modules]
-                relocation_data[repo_module] = module_list
-                print(f"    📂 Repository {repo_module} provides: {' '.join(module_list)}")
-            else:
-                # Single module repository
-                module_path = modules[0]['module_path']
-                relocation_data[repo_module] = [module_path]
-
-        return relocation_data
-
-    def has_exportable_code(self, go_file: Path) -> bool:
-        """
-        Check if a Go file contains exportable code (functions, types, vars, consts
-        that start with capital letters). This helps us determine if the package
-        is actually useful for importing.
-        """
-        try:
-            with open(go_file, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-                
-            # Quick checks for exportable symbols
-            lines = content.split('\n')
-            for line in lines:
-                line = line.strip()
-                
-                # Skip comments and empty lines
-                if line.startswith('//') or line.startswith('/*') or not line:
-                    continue
-                    
-                # Look for exportable declarations
-                if (line.startswith('func ') or 
-                    line.startswith('type ') or
-                    line.startswith('var ') or
-                    line.startswith('const ')):
-                    
-                    # Extract the symbol name and check if it's exported (starts with capital)
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        symbol_name = parts[1].split('(')[0].split()[0]  # Handle "func Name(" or "func Name "
-                        if symbol_name and symbol_name[0].isupper():
-                            return True
-                            
-            return False  # No exportable symbols found
-            
-        except Exception:
-            # If we can't read/parse the file, assume it might have exportable code
-            return True
-
-    def is_package_copy_needed(self, source_dir: Path, dest_dir: Path, import_path: str) -> bool:
-        """Check if package copy is needed by comparing hashes."""
-        if not dest_dir.exists():
-            return True
-
-        # Check if hash file exists
-        hash_file = dest_dir / '.source_hash'
-        if not hash_file.exists():
-            return True
-
-        try:
-            # Read stored hash
-            with open(hash_file, 'r') as f:
-                stored_hash = f.read().strip()
-
-            # Calculate current source hash
-            current_hash = self.calculate_directory_hash(source_dir)
-
-            if stored_hash != current_hash:
-                print(f"    📋 Package changed: {import_path}")
-                return True
-            else:
-                print(f"    ⚡ Package unchanged: {import_path}")
-                return False
-
-        except (OSError, IOError):
-            return True
-
-    def copy_package_files(self, source_dir: Path, dest_dir: Path):
-        """Copy essential package files to vendor directory."""
-
-        # Copy .go files (excluding tests)
-        for go_file in source_dir.glob('*.go'):
-            if not go_file.name.endswith('_test.go'):
-                shutil.copy2(go_file, dest_dir / go_file.name)
-
-        # Copy module files if they exist
-        for module_file in ['go.mod', 'go.sum']:
-            module_path = source_dir / module_file
-            if module_path.exists():
-                shutil.copy2(module_path, dest_dir / module_file)
-
-        # Copy license files
-        for license_pattern in ['LICENSE*', 'COPYING*', 'COPYRIGHT*']:
-            for license_file in source_dir.glob(license_pattern):
-                if license_file.is_file():
-                    shutil.copy2(license_file, dest_dir / license_file.name)
-
-    def update_modules_txt(self, module_path: str, version: str):
-        """Update vendor/modules.txt file with proper go mod vendor format using exact go.mod version."""
-        if not self.vendor_dir:
-            return
-            
-        modules_txt = self.vendor_dir / "modules.txt"
-        
-        # Read existing content
-        existing_content = []
-        if modules_txt.exists():
-            with open(modules_txt, 'r') as f:
-                existing_content = f.read().strip().split('\n')
-        
-        # Find module info
-        module_info = None
-        for info in getattr(self, 'vendor_modules', []):
-            if info['path'] == module_path:
-                module_info = info
-                break
-        
-        if not module_info:
-            # Fallback if no module info available
-            new_entries = [
-                f"# {module_path}",
-                "## explicit", 
-                module_path
-            ]
-        else:
-            # Generate proper entries using the exact version from go.mod
-            # Don't override the version parameter with module_info version
-            repo_dir = self.output_dir / module_info.get('safe_name', self.safe_module_name(module_path))
-            
-            if repo_dir.exists():
-                new_entries = self.generate_modules_txt_content(repo_dir, module_path, version)
-            else:
-                new_entries = [
-                    f"# {module_path} {version}",
-                    "## explicit",
-                    module_path
-                ]
-        
-        # Add new entries to existing content
-        if existing_content and existing_content != ['']:
-            existing_content.extend([''] + new_entries)
-        else:
-            existing_content = new_entries
-        
-        # Write back
-        with open(modules_txt, 'w') as f:
-            f.write('\n'.join(existing_content) + '\n')
-
-    def generate_modules_txt_content(self, repo_dir: Path, module_path: str, version: str) -> List[str]:
-        """Generate proper modules.txt entries for a module by scanning its packages."""
-        entries = []
-        
-        try:
-            # Add module header with explicit version from go.mod parsing
-            entries.append(f"# {module_path} {version}")
-            entries.append("## explicit")
-            
-            # Find all Go packages in the module
-            packages = self.discover_packages_for_modules_txt(repo_dir, module_path)
-            
-            # Sort packages and add to entries
-            if packages:
-                for package in sorted(packages):
-                    entries.append(package)
-            else:
-                # Fallback to just the module path if no packages found
-                entries.append(module_path)
-                
-        except Exception as e:
-            # Fallback to just the module path if scanning fails
-            print(f"    ⚠️  Could not scan packages for {module_path}, using fallback: {e}")
-            entries = [
-                f"# {module_path} {version}",
-                "## explicit",
-                module_path
-            ]
-        
-        return entries
-
-    def generate_complete_modules_txt_for_oe(self):
-        """
-        Generate a complete modules.txt file with proper explicit/replaced markers.
-        Uses cached package discovery for better performance.
-        """
-        if not self.generate_oe_files:
-            return None
-        
-        modules_txt_path = Path("modules.txt")
-        print("\n📄 Generating modules.txt with proper explicit/replaced markers...")
-        
-        entries = []
-        package_count = 0
-        explicit_count = 0
-        replaced_count = 0
-        
-        for module_info in self.oe_modules:
-            module_path = module_info['path']
-            version = module_info['version']
-            safe_name = module_info['safe_name']
-            repo_dir = self.output_dir / safe_name
-            
-            # Determine the correct marker based on go.mod parsing
-            # Use direct_deps, parsed directly from go.mod, as the source of truth.
-            is_explicit = module_path in self.direct_deps
-            is_replaced = module_path in self.replace_directives
-            
-            # Handle modules that are both explicit and replaced (like tigron)
-            if is_replaced and is_explicit:
-                replacement_path = self.replace_directives[module_path]
-                marker = f"## explicit; go 1.19\n## replaced({replacement_path})"
-                replaced_count += 1
-                explicit_count += 1
-            elif is_replaced:
-                replacement_path = self.replace_directives[module_path]
-                marker = f"## replaced({replacement_path})"
-                replaced_count += 1
-            elif is_explicit:
-                marker = "## explicit"
-                explicit_count += 1
-            else:
-                # This is an indirect/transitive dependency
-                marker = ""  # Indirect dependencies have no marker
-                
-            print(f"    📦 {module_path}: {marker}")
-            
-            # Add module header with version
-            if is_replaced and '=>' not in version:
-                # Add replacement info to header for replaced modules
-                replacement_path = self.replace_directives[module_path]
-                entries.append(f"# {module_path} {version} => {replacement_path}")
-            else:
-                entries.append(f"# {module_path} {version}")
-            
-            if marker:
-                entries.append(marker)
-            
-            # Discover and add all packages in the module (using cache)
-            if repo_dir.exists():
-                packages = self.discover_packages_for_modules_txt(repo_dir, module_path)
-                
-                if packages:
-                    for package in sorted(packages):
-                        entries.append(package)
-                        package_count += 1
-                else:
-                    # Fallback to just module path if no packages found
-                    entries.append(module_path)
-                    package_count += 1
-            else:
-                print(f"    ⚠️  Repository not found for {module_path}, using module path only")
-                entries.append(module_path)
-                package_count += 1
-            
-            entries.append("")  # Empty line between modules
-        
-        # Write the modules.txt file
-        with open(modules_txt_path, 'w') as f:
-            f.write('\n'.join(entries))
-        
-        print(f"    ✅ Generated modules.txt with {len(self.oe_modules)} modules and {package_count} packages")
-        print(f"    📊 {explicit_count} explicit, {replaced_count} replaced")
-        print(f"    📄 File saved as: modules.txt")
-        
-        return modules_txt_path
-
-    
-
-    def get_commit_hash_from_repo(self, repo_dir: Path, hash_val: str, ref: str, version: str) -> Optional[str]:
-        """Get the actual commit hash from the checked out repository."""
-        try:
-            # Get the current HEAD commit hash
-            result = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=repo_dir,
-                check=True,
-                capture_output=True,
-                text=True
-            )
-            return result.stdout.strip()
-        except subprocess.CalledProcessError as e:
-            print(f"    ⚠️  Failed to get commit hash from repo: {e}")
-            # Fallback to the hash from go mod download if available
-            return hash_val if hash_val else None
-
-    def get_default_branch(self, repo_dir: Path) -> str:
-        """Get the default branch name for the repository."""
-        try:
-            # Try to get the default branch from remote
-            result = subprocess.run(
-                ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
-                cwd=repo_dir,
-                check=True,
-                capture_output=True,
-                text=True
-            )
-            # Extract branch name from refs/remotes/origin/branch_name
-            default_branch = result.stdout.strip().split('/')[-1]
-            return default_branch
-        except subprocess.CalledProcessError:
-            # Try common default branch names
-            for branch in ['main', 'master', 'develop']:
-                try:
-                    subprocess.run(
-                        ["git", "show-ref", "--verify", f"refs/remotes/origin/{branch}"],
-                        cwd=repo_dir,
-                        check=True,
-                        capture_output=True
-                    )
-                    return branch
-                except subprocess.CalledProcessError:
-                    continue
-            # Fallback to master
-            return 'master'
-
-    def get_branch_containing_commit(self, repo_dir: Path, commit_hash: str) -> str:
-        """Find which branch contains the specific commit."""
-        if not commit_hash:
-            return self.get_default_branch(repo_dir)
-            
-        try:
-            # First, try to find which remote branches contain this commit
-            result = subprocess.run(
-                ["git", "branch", "-r", "--contains", commit_hash],
-                cwd=repo_dir,
-                check=True,
-                capture_output=True,
-                text=True
-            )
-            
-            branches = []
-            for line in result.stdout.strip().split('\n'):
-                line = line.strip()
-                if line and not line.startswith('origin/HEAD'):
-                    # Extract branch name (remove 'origin/' prefix)
-                    if line.startswith('origin/'):
-                        branch = line[7:]  # Remove 'origin/' prefix
-                        branches.append(branch)
-            
-            if branches:
-                # Prefer main/master branches
-                for preferred in ['main', 'master']:
-                    if preferred in branches:
-                        print(f"    📁 Commit {commit_hash[:8]} found in preferred branch: {preferred}")
-                        return preferred
-                
-                # Use the first available branch
-                selected_branch = branches[0]
-                print(f"    📁 Commit {commit_hash[:8]} found in branch: {selected_branch}")
-                return selected_branch
-            
-            # If no branches contain the commit, it might be a tag
-            try:
-                result = subprocess.run(
-                    ["git", "tag", "--contains", commit_hash],
-                    cwd=repo_dir,
-                    check=True,
-                    capture_output=True,
-                    text=True
-                )
-                
-                tags = [tag.strip() for tag in result.stdout.strip().split('\n') if tag.strip()]
-                if tags:
-                    # The commit is reachable from tags, try to find the branch it was merged into
-                    print(f"    📁 Commit {commit_hash[:8]} found in tags: {tags[:3]}...")
-                    
-                    # Try common branch names that might contain the commit
-                    for branch in ['main', 'master', 'develop', 'release']:
-                        try:
-                            subprocess.run(
-                                ["git", "merge-base", "--is-ancestor", commit_hash, f"origin/{branch}"],
-                                cwd=repo_dir,
-                                check=True,
-                                capture_output=True
-                            )
-                            print(f"    📁 Commit {commit_hash[:8]} is ancestor of {branch}")
-                            return branch
-                        except subprocess.CalledProcessError:
-                            continue
-                            
-            except subprocess.CalledProcessError:
-                pass
-            
-            # Last resort: use default branch and hope for the best
-            default_branch = self.get_default_branch(repo_dir)
-            print(f"    ⚠️  Could not find branch containing {commit_hash[:8]}, using default: {default_branch}")
-            return default_branch
-            
-        except subprocess.CalledProcessError as e:
-            print(f"    ⚠️  Error finding branch for commit {commit_hash[:8]}: {e}")
-            return self.get_default_branch(repo_dir)
-
-    def generate_oe_src_uri(self, module_path: str, repo_url: str, repo_dir: Path) -> Optional[str]:
-        """Generate OpenEmbedded SRC_URI entry for a module using actual commit hash."""
-        safe_name = self.safe_module_name(module_path)
-        
-        # Get the actual commit hash from the checked out repository
-        commit_hash = self.get_commit_hash_from_repo(repo_dir, "", "", "")
-        if not commit_hash:
-            print(f"    ❌ Could not determine commit hash for {module_path}")
-            return None
-        
-        # Convert to proper git:// fetcher format with protocol=https
-        clean_url = repo_url.replace("https://", "").replace("http://", "")
-        
-        # For Go modules, use nobranch=1 for more reliable fetching by commit hash
-        # This avoids branch detection issues common with Go module repositories
-        src_uri = f'git://{clean_url};protocol=https'
-        src_uri += f';nobranch=1;rev={commit_hash}'
-
-        repo_key = self._normalize_repo_identifier(repo_url)
-        requires_full = self._repo_requires_full_history(repo_dir, repo_key)
-
-        if requires_full:
-            print(f"    📁 Generated SRC_URI with commit {commit_hash[:8]} (full history required)")
-        else:
-            src_uri += ';shallow=1'
-            print(f"    📁 Generated SRC_URI with commit {commit_hash[:8]} (nobranch, shallow)")
-
-        src_uri += f';destsuffix=${{GO_SRCURI_DESTSUFFIX}}/modules/{safe_name}'
-        return src_uri
-
-    def generate_gomodgit_src_uri(self, module_path: str, version: str, repo_url: str, commit_hash: str, subdir: str = None) -> str:
-        """
-        Generate gomodgit:// SRC_URI entry using BitBake's Go module infrastructure.
-        Returns src_uri with embedded SRCREV.
-        """
-        print(f"    🔗 Generating gomodgit:// entry for {module_path}")
-
-        # Clean the repo URL for gomodgit format
-        clean_url = repo_url.replace("https://", "").replace("http://", "")
-
-        # Generate gomodgit:// entry (VCS-based with SRCREV)
-        src_uri = f'gomodgit://{module_path};version={version}'
-
-        # Add repo parameter if different from module path
-        expected_repo_url = f"https://{module_path}"
-        if repo_url != expected_repo_url:
-            # Extract repo part (e.g., "go.googlesource.com/net" from full URL)
-            repo_part = clean_url.split('/')[0] + "/" + "/".join(clean_url.split('/')[1:])
-            src_uri += f';repo={repo_part}'
-            print(f"      📍 Using custom repo: {repo_part}")
-
-        # Add subdir parameter if module not at repo root
-        if subdir and subdir != ".":
-            src_uri += f';subdir={subdir}'
-            print(f"      📁 Using subdir: {subdir}")
-
-        # Add srcrev parameter
-        src_uri += f';srcrev={commit_hash}'
-
-        repo_key = self._normalize_repo_identifier(repo_url)
-        if repo_key in self.repos_requiring_deep_fetch:
-            print(f"    ✅ Generated gomodgit entry with embedded SRCREV {commit_hash[:8]} (full history required)")
-        else:
-            # Add shallow=1 to force shallow clones (performance optimization)
-            src_uri += ';shallow=1'
-            print(f"    ✅ Generated gomodgit entry with embedded SRCREV {commit_hash[:8]} (shallow)")
-
-        return src_uri
-
-    def check_gomodgit_compatibility(self, repo_dir: Path, commit_hash: str) -> bool:
-        """
-        Check if a commit is compatible with BitBake's gomodgit fetcher.
-        BitBake has bugs with:
-        1. Files with spaces in names (splits on whitespace)
-        2. Git submodules (tries to read commits as blobs)
-        """
-        try:
-            # Get list of all files in the commit with detailed info
-            result = subprocess.run(
-                ["git", "ls-tree", "-r", commit_hash],
-                cwd=repo_dir, capture_output=True, text=True, check=True
-            )
-            tree_lines = result.stdout.strip().split('\n')
-
-            # Parse ls-tree output: mode type hash<tab>name
-            problematic_files = []
-            submodules = []
-
-            for line in tree_lines:
-                if not line.strip():
-                    continue
-                parts = line.split('\t', 1)
-                if len(parts) != 2:
-                    continue
-                mode_type_hash, filename = parts
-                mode, obj_type, _ = mode_type_hash.split()
-
-                # Check for submodules (mode 160000)
-                if mode == '160000':
-                    submodules.append(filename)
-                # Check for filenames with spaces
-                elif ' ' in filename:
-                    problematic_files.append(filename)
-
-            # Report issues
-            if submodules:
-                print(f"    ⚠️  BitBake incompatible submodules found:")
-                for sm in submodules[:3]:  # Show first 3 examples
-                    print(f"        • {sm} (Git submodule)")
-                if len(submodules) > 3:
-                    print(f"        ... and {len(submodules) - 3} more submodules")
-
-            if problematic_files:
-                print(f"    ⚠️  BitBake incompatible files found (spaces in names):")
-                for pf in problematic_files[:3]:  # Show first 3 examples
-                    print(f"        • {pf}")
-                if len(problematic_files) > 3:
-                    print(f"        ... and {len(problematic_files) - 3} more")
-
-            return len(submodules) == 0 and len(problematic_files) == 0
-        except subprocess.CalledProcessError:
-            print(f"    ❌ Failed to check file compatibility for {commit_hash[:8]}")
-            return False
-
-    def generate_srcrev_inc(self, srcrev_variables: Dict[str, str], output_dir: Path = None):
-        """Generate srcrev.inc file with SRCREV variables for BitBake gomodgit infrastructure."""
-        if output_dir is None:
-            output_dir = Path(".")
-
-        srcrev_file = output_dir / "srcrev.inc"
-
-        print(f"📝 Generating {srcrev_file} with {len(srcrev_variables)} SRCREV variables")
-
-        with open(srcrev_file, 'w') as f:
-            f.write(f"# Generated by go_mod_fetcher.py v{VERSION}\n")
-            f.write("# SRCREV variables for gomodgit:// fetcher infrastructure\n")
-            f.write("# This file provides commit hashes for each module version\n\n")
-
-            for var_name, commit_hash in sorted(srcrev_variables.items()):
-                f.write(f'{var_name} = "{commit_hash}"\n')
-
-        print(f"    ✅ Generated {len(srcrev_variables)} SRCREV variables in {srcrev_file}")
-
-    def bootstrap_gomodgit_infrastructure(self, source_dir: Path, go_install_targets: List[str] = None, output_dir: Path = None):
-        """
-        Bootstrap creation of .inc files using BitBake's gomodgit infrastructure.
-        Uses 'go list' for authoritative dependency resolution.
-        """
-        if output_dir is None:
-            output_dir = Path(".")
-
-        output_dir = output_dir.resolve()
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        print(f"\n🚀 Bootstrapping gomodgit:// infrastructure files")
-        print(f"    📁 Output directory: {output_dir}")
-
-        if self.repo_cache_dir:
-            print(f"    💾 Reusing git cache at {self.repo_cache_dir}")
-
-        # Use go list for authoritative dependency resolution
-        modules_info = self.use_go_list_for_dependencies(source_dir, go_install_targets)
-
-        if not modules_info:
-            print("    ❌ No module information available from go list")
-            return
-
-        alias_map: Dict[str, Set[str]] = {}
-        go_mod_path = source_dir / "go.mod"
-        if go_mod_path.exists():
-            try:
-                direct, indirect, replaces = self.parse_go_mod_detailed(str(go_mod_path))
-                self.direct_deps = direct
-                self.indirect_deps = indirect
-                self.replace_directives = replaces
-                alias_map = self._collect_aliases_from_go_mod(direct, indirect)
-            except Exception as e:
-                print(f"    ⚠️  Warning: Failed to parse go.mod for alias detection: {e}")
-        else:
-            print("    ⚠️  go.mod not found alongside source directory; skipping alias detection")
-
-        module_items = list(modules_info.items())
-        total_modules = len(module_items)
-
-        print(f"    🎯 Processing {total_modules} modules from go list")
-
-        gomodgit_src_uris = []
-
-        # Process each module identified by go list
-        for index, (module_path, module_info) in enumerate(module_items, start=1):
-            version = module_info['Version']
-
-            print(f"\n  📦 [{index}/{total_modules}] Processing module: {module_path} @ {version}")
-
-            # Skip the main module (the current project)
-            if version == "" or version == "v0.0.0":
-                print(f"    ⏭️  Skipping main module: {module_path}")
-                continue
-
-            # Determine repository URL from module path
-            repo_url = self.derive_repo_url(module_path)
-            if not repo_url:
-                print(f"    ❌ Could not derive repository URL for {module_path}")
-                continue
-
-            safe_repo_name = self.safe_module_name(module_path)
-            if self.repo_cache_dir:
-                repo_work_dir = self.repo_cache_dir / safe_repo_name
-            else:
-                if not self.temp_dir:
-                    self.temp_dir = Path(tempfile.mkdtemp(prefix="go_mod_fetcher_"))
-                repo_work_dir = self.temp_dir / f"repo_{module_path.replace('/', '_').replace('.', '_')}"
-
-            try:
-                # Clone repository to get commit hash
-                if not self.clone_or_update_repo(repo_url, repo_work_dir):
-                    print(f"    ❌ Failed to clone repository for {module_path}")
-                    continue
-
-                # Get commit hash for the specific version tag
-                try:
-                    # First try to get the commit for the exact version tag
-                    commit_result = subprocess.run([
-                        "git", "rev-list", "-n", "1", version
-                    ], cwd=repo_work_dir, capture_output=True, text=True, check=True)
-                    commit_hash = commit_result.stdout.strip()
-                    print(f"    ✅ Found tag object {commit_hash} for tag {version}")
-                except subprocess.CalledProcessError:
-                    print(f"    ⚠️  Tag {version} not found, trying remote fetch...")
-                    try:
-                        # Try fetching the tag from remote
-                        subprocess.run([
-                            "git", "fetch", "origin", f"refs/tags/{version}:refs/tags/{version}"
-                        ], cwd=repo_work_dir, capture_output=True, text=True, check=True)
-
-                        # Now try to get the commit for the tag
-                        commit_result = subprocess.run([
-                            "git", "rev-list", "-n", "1", version
-                        ], cwd=repo_work_dir, capture_output=True, text=True, check=True)
-                        commit_hash = commit_result.stdout.strip()
-                        print(f"    ✅ Found tag object {commit_hash} for tag {version} (after fetch)")
-                    except subprocess.CalledProcessError:
-                        print(f"    ❌ Failed to resolve tag {version} for {module_path}, falling back to HEAD")
-                        try:
-                            commit_result = subprocess.run([
-                                "git", "rev-parse", "HEAD"
-                            ], cwd=repo_work_dir, capture_output=True, text=True, check=True)
-                            commit_hash = commit_result.stdout.strip()
-                            print(f"    ⚠️  Using HEAD commit {commit_hash} as fallback")
-                        except subprocess.CalledProcessError:
-                            print(f"    ❌ Failed to get any commit hash for {module_path}")
-                            continue
-
-                # Determine if module is in subdirectory
-                subdir = self.detect_module_subdir(module_path, repo_work_dir)
-
-                # Check BitBake gomodgit compatibility
-                if not self.check_gomodgit_compatibility(repo_work_dir, commit_hash):
-                    print(f"    ⚠️  Skipping {module_path} due to BitBake gomodgit incompatibility")
-                    print(f"        (BitBake fetcher cannot handle submodules or files with spaces)")
-                    continue
-
-                # Generate gomodgit:// SRC_URI entry
-                src_uri = self.generate_gomodgit_src_uri(
-                    module_path, version, repo_url, commit_hash, subdir
-                )
-
-                gomodgit_src_uris.append(src_uri)
-
-                print(f"    ✅ Generated gomodgit entry for {module_path} @ {commit_hash[:8]}")
-
-            except Exception as e:
-                print(f"    ❌ Error processing {module_path}: {e}")
-                continue
-            finally:
-                # Clean up temporary repository
-                if not self.repo_cache_dir and repo_work_dir and repo_work_dir.exists():
-                    shutil.rmtree(repo_work_dir, ignore_errors=True)
-
-        # Generate output files
-        self.write_gomodgit_src_uri_inc(gomodgit_src_uris, output_dir)
-
-        print(f"\n🎉 Successfully bootstrapped gomodgit infrastructure:")
-        print(f"    📄 {output_dir}/src_uri.inc - {len(gomodgit_src_uris)} gomodgit:// entries")
-        print(f"    ℹ️  No srcrev.inc needed - SRCREV embedded in gomodgit:// entries")
-
-    def bootstrap_hybrid_infrastructure(self, source_dir: Path, go_install_targets: List[str] = None, output_dir: Path = None):
-        """
-        Bootstrap creation of hybrid git:// + custom module cache infrastructure.
-        Fast parallel downloads with custom module cache generation.
-        """
-        if output_dir is None:
-            output_dir = Path(".")
-
-        output_dir = output_dir.resolve()
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        print(f"\n🚀 Bootstrapping hybrid git:// + custom module cache infrastructure")
-        print(f"    📁 Output directory: {output_dir}")
-        print(f"    ⚡ Performance: Fast parallel downloads + custom cache generation")
-
-        if self.repo_cache_dir:
-            print(f"    💾 Reusing git cache at {self.repo_cache_dir}")
-
-        # Use go list for authoritative dependency resolution
-        modules_info = self.use_go_list_for_dependencies(source_dir, go_install_targets)
-
-        if not modules_info:
-            print("    ❌ No module information available from go list")
-            return
-
-        alias_map: Dict[str, Set[str]] = {}
-        non_canonical_modules = []
-
-        # Detect non-canonical module paths generically
-        go_mod_path = source_dir / "go.mod"
-        if go_mod_path.exists():
-            try:
-                content = go_mod_path.read_text()
-                import re
-                # Find all go.*.in patterns that might be non-canonical
-                non_canonical_patterns = re.findall(r'(go\.[a-z]+\.in/[^\s)"\']+)', content)
-                if non_canonical_patterns:
-                    print(f"    🔍 Detected potentially non-canonical module paths in go.mod:")
-                    for suspect_path in set(non_canonical_patterns):
-                        canonical_path = self.canonicalize_module_path(suspect_path)
-                        if suspect_path != canonical_path:
-                            print(f"       {suspect_path} → {canonical_path}")
-                            non_canonical_modules.append((suspect_path, canonical_path))
-                    print(f"    📝 These will be handled as aliases to ensure offline builds work")
-            except Exception as e:
-                print(f"    ⚠️  Warning: Could not scan go.mod for non-canonical paths: {e}")
-            try:
-                direct, indirect, replaces = self.parse_go_mod_detailed(str(go_mod_path))
-                self.direct_deps = direct
-                self.indirect_deps = indirect
-                self.replace_directives = replaces
-                alias_map = self._collect_aliases_from_go_mod(direct, indirect)
-            except Exception as e:
-                print(f"    ⚠️  Warning: Failed to parse go.mod for alias detection: {e}")
-        else:
-            print("    ⚠️  go.mod not found alongside source directory; skipping alias detection")
-
-        # Parse go.sum to find ALL version requirements (including deep transitive deps)
-        go_sum_path = source_dir / "go.sum"
-        go_sum_requirements: Dict[str, Set[str]] = {}  # canonical_path -> set of versions
-        if go_sum_path.exists():
-            try:
-                go_sum_modules = self._collect_modules_from_go_sum(go_sum_path)
-                print(f"    📋 Parsed go.sum: found {len(go_sum_modules)} module@version entries")
-                for canonical_path, version, alias_path in go_sum_modules:
-                    go_sum_requirements.setdefault(canonical_path, set()).add(version)
-                    if alias_path:
-                        alias_map.setdefault(canonical_path, set()).add(alias_path)
-                print(f"    🔍 Tracking {len(go_sum_requirements)} unique modules from go.sum for version mismatch detection")
-            except Exception as e:
-                print(f"    ⚠️  Warning: Failed to parse go.sum: {e}")
-        else:
-            print("    ⚠️  go.sum not found; version mismatch detection may be incomplete")
-
-        module_items = list(modules_info.items())
-        total_modules = len(module_items)
-
-        print(f"    🎯 Processing {total_modules} modules from go list")
-
-        # Track version requirements from go list (will be augmented with go.sum data in post-processing)
-        version_requirements: Dict[str, Set[str]] = {}
-
-        # Prepare modules list for hybrid approach
-        modules_data = []
-        failed_modules = []
-
-        # Process each module identified by go list
-        for index, (module_path, module_info) in enumerate(module_items, start=1):
-            version = module_info['Version']
-
-            print(f"\n  📦 [{index}/{total_modules}] Processing module: {module_path} @ {version}")
-
-            download_info = self.get_module_download_info(module_path, version)
-            origin = download_info.get('Origin', {}) if download_info else {}
-
-            repo_url = origin.get('URL') if origin.get('URL') else self.derive_repo_url(module_path)
-            if not repo_url:
-                print(f"    ❌ Could not derive repository URL for {module_path}")
-                failed_modules.append(module_path)
-                continue
-
-            commit_hash = origin.get('Hash') if origin.get('Hash') else None
-            repo_key = self._normalize_repo_identifier(repo_url)
-
-            safe_repo_name = self.safe_module_name(module_path)
-            if self.repo_cache_dir:
-                repo_work_dir = self.repo_cache_dir / safe_repo_name
-            else:
-                if not self.temp_dir:
-                    self.temp_dir = Path(tempfile.mkdtemp(prefix="go_mod_fetcher_"))
-                repo_work_dir = self.temp_dir / f"repo_{module_path.replace('/', '_').replace('.', '_')}"
-
-            try:
-                # Clone repository to get commit hash and subdir
-                if not self.clone_or_update_repo(repo_url, repo_work_dir):
-                    print(f"    ❌ Failed to clone repository for {module_path}")
-                    failed_modules.append(module_path)
-                    continue
-
-                if repo_key:
-                    self._repo_requires_full_history(repo_work_dir, repo_key)
-
-                hash_val = commit_hash if commit_hash else ""
-                ref_val = origin.get('Ref', '') if origin else ''
-
-                if not self.checkout_revision(repo_work_dir, hash_val, ref_val, version, repo_url):
-                    failed_modules.append(module_path)
-                    continue
-
-                commit_hash = self.get_commit_hash_from_repo(repo_work_dir, hash_val, ref_val, version)
-
-                # Ensure the final commit matches the version we're packaging.
-                expected_commit = self.resolve_commit_from_version(repo_work_dir, module_path, version)
-                if expected_commit and commit_hash != expected_commit:
-                    print(
-                        f"    🔁 Aligning commit {commit_hash[:8] if commit_hash else '????'} to version-derived commit {expected_commit[:8]}"
-                    )
-                    if not self.checkout_revision(repo_work_dir, expected_commit, ref_val, version, repo_url):
-                        failed_modules.append(module_path)
-                        continue
-                    commit_hash = self.get_commit_hash_from_repo(repo_work_dir, expected_commit, ref_val, version)
-
-                if not commit_hash:
-                    print(f"    ❌ Could not determine commit hash for {module_path}@{version}")
-                    failed_modules.append(module_path)
-                    continue
-
-                # Detect subdir if module is not at repository root
-                subdir = self.detect_module_subdir(module_path, repo_work_dir)
-
-            except Exception as e:
-                print(f"    ❌ Error processing {module_path}: {e}")
-                failed_modules.append(module_path)
-                continue
-
-            repo_key = self._normalize_repo_identifier(repo_url)
-            requires_full = self._repo_requires_full_history(repo_work_dir, repo_key)
-            module_data = {
-                'module': module_path,
-                'version': version,
-                'repo_url': repo_url,
-                'commit': commit_hash,
-                'subdir': subdir if subdir else ""
-            }
-            try:
-                vcs_hash = hashlib.sha256(f"git3:{repo_url}".encode()).hexdigest()
-                module_data['vcs_hash'] = vcs_hash
-                module_data['fetch_name'] = f"git_{vcs_hash[:12]}"
-            except Exception:
-                # Fallback to a sanitized module-based fetch name if hashing fails
-                module_data['fetch_name'] = self.safe_module_name(module_path)
-            if requires_full:
-                module_data['requires_full_history'] = True
-            modules_data.append(module_data)
-
-            # Track version requirements for mismatch detection
-            canonical_path = self.canonicalize_module_path(module_path)
-            version_requirements.setdefault(canonical_path, set()).add(version)
-
-            # Preserve non-canonical module aliases (e.g. go.yaml.in/yaml/v3) so the
-            # module cache task creates zip/mod artifacts for both the canonical and
-            # aliased import paths. This keeps offline builds from trying to download
-            # the alias even though we already have the canonical module cached.
-            original_module_info = module_info.get('Module') if isinstance(module_info, dict) else None
-            if original_module_info and isinstance(original_module_info, dict):
-                original_path = original_module_info.get('Path')
-                if original_path:
-                    original_path = original_path.strip()
-                if original_path and original_path != module_path:
-                    if self.canonicalize_module_path(original_path) != original_path:
-                        alias_data = module_data.copy()
-                        alias_data['module'] = original_path
-                        alias_data['alias_of'] = module_data['module']
-                        alias_data['is_alias'] = True
-                        modules_data.append(alias_data)
-
-            print(f"    ✅ {module_path} @ {version} (commit: {commit_hash[:8]})")
-            if subdir:
-                print(f"       📂 Subdir: {subdir}")
-
-        if alias_map:
-            module_lookup = {entry['module']: entry for entry in modules_data}
-            existing_paths = set(module_lookup.keys())
-            alias_entries = []
-
-            for canonical, aliases in alias_map.items():
-                base_entry = module_lookup.get(canonical)
-                if not base_entry:
-                    for entry in modules_data:
-                        if self.canonicalize_module_path(entry.get('module', '')) == canonical:
-                            base_entry = entry
-                            break
-                if not base_entry:
-                    continue
-
-                for alias in aliases:
-                    if alias in existing_paths:
-                        existing_entry = module_lookup.get(alias)
-                        if existing_entry and not existing_entry.get('alias_of'):
-                            existing_entry['alias_of'] = base_entry['module']
-                            existing_entry['is_alias'] = True
-                        continue
-                    alias_entry = base_entry.copy()
-                    alias_entry['module'] = alias
-                    alias_entry['alias_of'] = base_entry['module']
-                    alias_entry['is_alias'] = True
-                    alias_entries.append(alias_entry)
-                    existing_paths.add(alias)
-
-            if alias_entries:
-                modules_data.extend(alias_entries)
-                print(f"    🔁 Added {len(alias_entries)} alias module entries from go.mod (e.g., go.yaml.in ➜ gopkg.in)")
-
-        # Detect and handle version mismatches generically
-        version_alias_modules = []
-        for canonical_path, versions in version_requirements.items():
-            if len(versions) > 1:
-                print(f"    🔍 Version mismatch detected for {canonical_path}:")
-                print(f"       Required versions: {', '.join(sorted(versions))}")
-                # Find the module entry we have (usually the highest version)
-                base_entry = None
-                base_ver = None
-                for md in modules_data:
-                    if self.canonicalize_module_path(md['module']) == canonical_path:
-                        if not md.get('is_alias'):
-                            base_entry = md
-                            base_ver = md['version']
-                            break
-                if base_entry:
-                    for req_ver in versions:
-                        if req_ver != base_ver:
-                            exists = any(
-                                self.canonicalize_module_path(m['module']) == canonical_path
-                                and m['version'] == req_ver
-                                for m in modules_data
-                            )
-                            if not exists:
-                                ver_alias = base_entry.copy()
-                                ver_alias['version'] = req_ver
-                                ver_alias['is_version_alias'] = True
-                                ver_alias['original_version'] = base_ver
-                                ver_alias['alias_of'] = base_entry['module']
-                                version_alias_modules.append(ver_alias)
-                                print(f"       📦 Creating cache for {canonical_path}@{req_ver} (based on @{base_ver})")
-        if version_alias_modules:
-            modules_data.extend(version_alias_modules)
-            print(f"    🔁 Added {len(version_alias_modules)} version alias entries")
-
-        # Store processed modules for checksum generation
-        self.processed_modules = []
-        for module_data in modules_data:
-            processed_module = {
-                'module_path': module_data['module'],
-                'version': module_data['version'],
-                'repo_url': module_data['repo_url'],
-                'commit': module_data['commit'],
-                'subdir': module_data['subdir']
-            }
-            self.processed_modules.append(processed_module)
-
-        # Generate hybrid module cache artifacts
-        cache_builder = HybridModuleCacheBuilder(
-            module_cache_dir=str(output_dir / "pkg" / "mod"),
-            workdir=str(output_dir / "workdir"),
-            max_workers=8
-        )
-
-        src_uri_entries, cache_builder_task = cache_builder.generate_complete_solution(modules_data, go_sum_requirements)
-        src_uri_entries = self._apply_shallow_overrides(modules_data, src_uri_entries)
-
-        # Write src_uri.inc with git:// entries
-        self.write_hybrid_src_uri_inc(src_uri_entries, modules_data, output_dir)
-
-        # Write module cache builder task to separate file
-        self.write_hybrid_cache_task(cache_builder_task, modules_data, output_dir)
-
-        print(f"\n🎉 Successfully bootstrapped hybrid infrastructure:")
-        print(f"    📄 {output_dir}/src_uri.inc - {len(src_uri_entries)} git:// entries (fast parallel)")
-        print(f"    📄 {output_dir}/module_cache_task.inc - Custom module cache builder")
-        print(f"    ⚡ Expected performance: ~2-3 minutes vs 20+ minutes (10x faster)")
-        print(f"    🔧 Integration: Include module_cache_task.inc in your BitBake recipe")
-
-        if self.generate_gomodgit:
-            # Generate go.sum.gomodgit with hybrid-compatible checksums when requested
-            print(f"\n📝 Generating go.sum.gomodgit with hybrid-compatible checksums...")
-            original_cwd = os.getcwd()
-            try:
-                # Change to output directory so go.sum.gomodgit is created there
-                os.chdir(output_dir)
-                # Pass the source directory explicitly since the hybrid path uses a different temp structure
-                self.generate_gomodgit_go_sum_for_hybrid(source_dir)
-            finally:
-                os.chdir(original_cwd)
-        else:
-            print("\n⏭️  Skipping go.sum.gomodgit generation (use --generate-gomodgit to enable)")
-
-        if failed_modules:
-            print(f"\n⚠️  {len(failed_modules)} modules could not be processed:")
-            for module in failed_modules[:5]:  # Show first 5
-                print(f"    • {module}")
-            if len(failed_modules) > 5:
-                print(f"    • ... and {len(failed_modules) - 5} more")
-
-    def write_gomodgit_src_uri_inc(self, gomodgit_src_uris: List[str], output_dir: Path = None):
-        """Write src_uri.inc with gomodgit:// entries."""
-        if output_dir is None:
-            output_dir = Path(".")
-
-        src_uri_file = output_dir / "src_uri.inc"
-
-        print(f"📝 Writing {src_uri_file} with {len(gomodgit_src_uris)} gomodgit:// entries")
-
-        with open(src_uri_file, 'w') as f:
-            f.write(f"# Generated by go_mod_fetcher.py v{VERSION}\n")
-            f.write("# OpenEmbedded SRC_URI entries using gomodgit:// fetcher\n")
-            f.write("# This leverages BitBake's built-in Go module infrastructure\n\n")
-
-            f.write("SRC_URI += \"\\\n")
-            for src_uri in sorted(gomodgit_src_uris):
-                f.write(f"    {src_uri} \\\n")
-            f.write("\"\n")
-
-        print(f"    ✅ Generated {len(gomodgit_src_uris)} gomodgit:// entries")
-
-    def write_hybrid_src_uri_inc(self, src_uri_entries: List[str], modules_data: List[Dict], output_dir: Path = None):
-        """Write src_uri.inc with git:// entries for hybrid approach."""
-        if output_dir is None:
-            output_dir = Path(".")
-
-        src_uri_file = output_dir / "src_uri.inc"
-
-        with open(src_uri_file, 'w') as f:
-            f.write("# Generated by oe-go-mod-fetcher.py --use-hybrid\n")
-            f.write("# Fast parallel git:// downloads for Go module dependencies\n")
-            f.write("# Include module_cache_task.inc in your BitBake recipe for custom cache generation\n\n")
-            f.write("SRC_URI += \"\\\n")
-
-            for i, src_uri in enumerate(src_uri_entries):
-                if i == len(src_uri_entries) - 1:
-                    f.write(f"    {src_uri} \\\n")
-                else:
-                    f.write(f"    {src_uri} \\\n")
-
-            f.write("\"\n")
-
-            # Emit shallow depth overrides for repositories requiring full history
-            full_history_names: Dict[str, str] = {}
-            for module in modules_data:
-                fetch_name = module.get('fetch_name')
-                if not fetch_name:
-                    continue
-                if module.get('requires_full_history'):
-                    full_history_names.setdefault(fetch_name, module['module'])
-
-            if full_history_names:
-                f.write("\n# Ensure specific repositories perform full-depth clones\n")
-                for name, module_path in sorted(full_history_names.items()):
-                    f.write(f"# {module_path}\n")
-                    f.write(f"BB_GIT_SHALLOW_DEPTH_{name} = \"0\"\n")
-                f.write("\n")
-
-        print(f"    ✅ Generated {len(src_uri_entries)} git:// entries (hybrid approach)")
-
-    def write_hybrid_cache_task(self, cache_task_code: str, modules_data: List[Dict], output_dir: Path = None):
-        """Write module cache builder task to separate include file."""
-        if output_dir is None:
-            output_dir = Path(".")
-
-        task_file = output_dir / "module_cache_task.inc"
-
-        # Generate the do_generate_go_sum task code
-        go_sum_task_code = self.generate_do_generate_go_sum_task()
-
-        compile_env_block = self.generate_compile_env_prepend_block()
-
-        cache_task_code = self._align_cache_task_module_paths(cache_task_code, modules_data)
-
-        with open(task_file, 'w') as f:
-            f.write("# Generated by oe-go-mod-fetcher.py --use-hybrid\n")
-            f.write("# Custom module cache builder for fast parallel processing\n")
-            f.write("# This replaces BitBake's slow sequential gomodgit processing\n\n")
-            f.write("DEPENDS += \" go-dirhash-native\"\n\n")
-            f.write("# Ensure Go module cache objects remain writable\n")
-            f.write("GOBUILDFLAGS:append = \" -modcacherw\"\n\n")
-            f.write("# Set up Go module cache directory (matches our hybrid module cache location)\n")
-            f.write("GOMODCACHE = \"${S}/pkg/mod\"\n")
-            f.write("GO_MOD_CACHE_DIR = \"${@os.path.relpath(d.getVar('GOMODCACHE'), d.getVar('UNPACKDIR'))}\"\n")
-            f.write("do_unpack[cleandirs] += \"${GOMODCACHE}\"\n\n")
-            f.write("# Uncomment this line to force rebuilding the module cache from scratch always\n")
-            f.write("#do_create_module_cache[cleandirs] += \"${GOMODCACHE}/cache/download\"\n\n")
-            f.write(cache_task_code)
-            f.write("\n\n")
-            f.write("# ============================================================\n")
-            f.write("# do_generate_go_sum: Generate go.sum from module cache\n")
-            f.write("# ============================================================\n\n")
-            f.write(go_sum_task_code)
-            f.write("\n\n")
-            f.write("# ============================================================\n")
-            f.write("# do_compile integration helpers\n")
-            f.write("# ============================================================\n\n")
-            f.write(compile_env_block)
-
-        print(f"    ✅ Generated module cache builder task")
-        print(f"    ✅ Generated do_generate_go_sum task (calculates zip + go.mod Hash1 checksums)")
-
-    def _align_cache_task_module_paths(self, cache_task_code: str, modules_data: List[Dict]) -> str:
-        """Ensure the rendered module list retains canonical module paths."""
-        if not cache_task_code or not modules_data:
-            return cache_task_code
-
-        try:
-            import ast
-            import re
-        except ImportError:
-            return cache_task_code
-
-        pattern = r"modules_data = \[(.*?)\]\n\s*#"
-        match = re.search(pattern, cache_task_code, re.S)
-        if not match:
-            return cache_task_code
-
-        literal_block = match.group(1)
-
-        try:
-            parsed_modules = ast.literal_eval('[' + literal_block + ']')
-        except Exception:
-            return cache_task_code
-
-        def module_key(entry: Dict[str, str]) -> tuple:
-            return (
-                entry.get('repo_url'),
-                entry.get('commit'),
-                entry.get('version'),
-                entry.get('subdir') or ''
-            )
-
-        lookup = {module_key(entry): entry for entry in modules_data}
-
-        replacements: List[tuple] = []
-        for parsed_entry in parsed_modules:
-            original = lookup.get(module_key(parsed_entry))
-            if not original:
-                continue
-            parsed_module = parsed_entry.get('module')
-            actual_module = original.get('module')
-            if parsed_module and actual_module and parsed_module != actual_module:
-                replacements.append((parsed_module, actual_module))
-
-        for current_module, desired_module in replacements:
-            cache_task_code = cache_task_code.replace(
-                f'"module": "{current_module}"',
-                f'"module": "{desired_module}"'
-            )
-
-        return cache_task_code
-
-    def _apply_shallow_overrides(self, modules_data: List[Dict], src_uri_entries: List[str]) -> List[str]:
-        """Remove shallow clone hints for repositories that required deep history."""
-        if not src_uri_entries:
-            return src_uri_entries
-
-        adjusted_entries = []
-        seen_repo_keys: Set[str] = set()
-
-        # Track commit diversity per repository so we can spot repos that can never work with depth=1
-        repo_commit_map: Dict[str, Set[str]] = {}
-        for module in modules_data:
-            repo_key = self._normalize_repo_identifier(module.get('repo_url'))
-            if not repo_key:
-                continue
-            commit = module.get('commit') or ''
-            if not commit:
-                continue
-            repo_commit_map.setdefault(repo_key, set()).add(commit)
-
-        for module, entry in zip(modules_data, src_uri_entries):
-            repo_key = self._normalize_repo_identifier(module.get('repo_url'))
-            requires_full = bool(module.get('requires_full_history'))
-            if not requires_full and repo_key:
-                requires_full = repo_key in self.repos_requiring_deep_fetch
-
-            multi_commit_repo = False
-            if repo_key:
-                commit_set = repo_commit_map.get(repo_key)
-                if commit_set and len(commit_set) > 1:
-                    multi_commit_repo = True
-                    requires_full = True
-
-            fetch_name = module.get('fetch_name')
-            if fetch_name and ';name=' not in entry:
-                entry = entry.replace(';destsuffix=', f';name={fetch_name};destsuffix=')
-                module['fetch_name'] = fetch_name
-
-            if requires_full and ';shallow=1' in entry:
-                # Cleanly remove the shallow flag regardless of position
-                updated_entry = entry.replace(';shallow=1;', ';')
-                if updated_entry.endswith(';shallow=1'):
-                    updated_entry = updated_entry[:-len(';shallow=1')]
-                updated_entry = updated_entry.replace(';shallow=1', '')
-                updated_entry = updated_entry.replace(';;', ';')
-                entry = updated_entry
-
-                if repo_key and repo_key not in seen_repo_keys:
-                    if multi_commit_repo and not module.get('requires_full_history'):
-                        print(f"    ⚠️  {module['module']} needs deep history (multiple commits for repository); removed shallow clone flag")
-                    else:
-                        print(f"    ⚠️  {module['module']} requires deep history; removed shallow clone flag")
-                    seen_repo_keys.add(repo_key)
-
-            if requires_full:
-                module['requires_full_history'] = True
-
-            adjusted_entries.append(entry)
-
-        return adjusted_entries
-
-    def generate_do_generate_go_sum_task(self) -> str:
-        """Generate the BitBake task code for do_generate_go_sum.
-
-        This task:
-        1. Calculates .zip checksums from actual VCS-based module cache using Go helper binary
-        2. Calculates go.mod checksums locally using the Hash1(dirhash) algorithm
-        3. Combines both into final go.sum file
-        """
-        return '''python do_generate_go_sum() {
-    """
-    Generate go.sum from the module cache artifacts.
-    - Zip checksums: Calculated from our VCS-based builds using Go helper binary
-    - go.mod checksums: Calculated locally using the Hash1(dirhash) algorithm
-
-    This matches Go's expectations while keeping the build offline.
-    """
-    import subprocess
-    import re
-    import hashlib
-    import base64
-    from pathlib import Path
-
-    s = d.getVar('S')
-    cache_dir = Path(s) / "pkg" / "mod" / "cache" / "download"
-    go_sum_path = Path(s) / "src" / "import" / "go.sum"
-    workdir = Path(d.getVar('WORKDIR'))
-    fallback_marker = workdir / ".use-gomodgit-go-sum"
-    fallback_sum = workdir / "go.sum.gomodgit"
-
-    if fallback_marker.exists() or fallback_sum.exists():
-        bb.warn("go.sum.gomodgit fallback detected - skipping helper-based go.sum generation")
-        fallback_marker.touch()
-        return
-
-    # Go helper binary for checksums
-    go_helper = Path(d.getVar('STAGING_BINDIR_NATIVE')) / "dirhash"
-
-    if not cache_dir.exists():
-        bb.fatal("Module cache not found - do_create_module_cache must run first")
-        return
-
-    if not go_helper.exists():
-        bb.fatal(f"Go checksum helper not found at {go_helper}. Ensure go-dirhash-native is in DEPENDS.")
-        return
-
-    bb.note("Generating go.sum from module cache (Hash1 for go.mod files)...")
-
-    def calculate_mod_checksum(mod_path):
-        try:
-            mod_bytes = mod_path.read_bytes()
-        except FileNotFoundError:
-            return None
-
-        file_hash = hashlib.sha256(mod_bytes).hexdigest()
-        summary = f"{file_hash}  go.mod\\n".encode('ascii')
-        digest = hashlib.sha256(summary).digest()
-        return "h1:" + base64.b64encode(digest).decode('ascii')
-
-    checksums = {}
-
-    # Scan all .zip files in the module cache and calculate checksums
-    for zip_file in sorted(cache_dir.rglob("*.zip")):
-        try:
-            # Calculate zip checksum using Go helper binary
-            result = subprocess.run(
-                [str(go_helper), str(zip_file)],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-
-            if result.returncode != 0:
-                bb.warn(f"Failed to calculate zip checksum for {zip_file}: {result.stderr}")
-                continue
-
-            zip_checksum = result.stdout.strip()
-
-            # Extract and unescape module path and version
-            parts = zip_file.parts
-            v_index = parts.index('@v')
-            download_index = parts.index('download')
-
-            escaped_module_parts = parts[download_index + 1:v_index]
-            escaped_module = '/'.join(escaped_module_parts)
-            escaped_version = zip_file.stem
-
-            def unescape(s):
-                """Unescape !lowercase back to uppercase"""
-                return re.sub(r'!([a-z])', lambda m: m.group(1).upper(), s)
-
-            module_path = unescape(escaped_module)
-            version = unescape(escaped_version)
-            module_version = f"{module_path} {version}"
-
-            # Calculate go.mod checksum directly from cached .mod file.
-            mod_file = zip_file.with_suffix('.mod')
-            mod_checksum = calculate_mod_checksum(mod_file)
-
-            if module_version not in checksums:
-                checksums[module_version] = {'zip': zip_checksum, 'mod': mod_checksum}
-
-        except Exception as e:
-            bb.warn(f"Error processing {zip_file}: {e}")
             continue
+        LS_REMOTE_CACHE[(url, ref)] = value
 
-    # Write go.sum with hybrid checksums
-    go_sum_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(go_sum_path, 'w') as f:
-        for module_version in sorted(checksums.keys()):
-            data = checksums[module_version]
-            f.write(f"{module_version} {data['zip']}\\n")
-            if data['mod']:
-                f.write(f"{module_version}/go.mod {data['mod']}\\n")
-
-    num_with_mod = sum(1 if data['mod'] else 0 for data in checksums.values())
-    bb.note(f"✅ Generated go.sum with {len(checksums)} modules")
-    bb.note(f"   🎯 Zip checksums: {len(checksums)} calculated from VCS builds")
-    bb.note(f"   📄 go.mod checksums calculated from cached .mod files ({num_with_mod} entries)")
-}
-
-# Generate go.sum from actual module cache BEFORE compile
-addtask generate_go_sum after do_create_module_cache before do_compile
-'''
-
-    def generate_compile_env_prepend_block(self) -> str:
-        """Emit a BitBake shell snippet that forces Go to use the generated module cache."""
-        return '''do_compile:prepend() {
-    # Ensure offline Go builds consume the generated module cache
-    export GOMODCACHE="${S}/pkg/mod"
-    export GOPROXY="direct"
-    export GOSUMDB="off"
-    export GONOSUMDB="*"
-    export GOPRIVATE="*"
-    export GOFLAGS="${GOFLAGS} -mod=mod -modcacherw"
-
-    fallback_sum="${WORKDIR}/go.sum.gomodgit"
-    fallback_marker="${WORKDIR}/.use-gomodgit-go-sum"
-
-    if [ -f "${fallback_sum}" ]; then
-        bbwarn "Fallback go.sum.gomodgit detected - using provided checksums"
-        install -d "${S}/src/import"
-        install -m 0644 "${fallback_sum}" "${S}/src/import/go.sum"
-        touch "${fallback_marker}"
-    else
-        rm -f "${fallback_marker}"
-    fi
-
-    bbnote "Using offline Go module cache at ${GOMODCACHE}"
-}
-'''
-
-    def generate_gomodgit_go_sum_for_hybrid(self, source_dir: Path):
-        """Generate go.sum.gomodgit by creating temporary zips and calculating checksums.
-
-        This is a simplified wrapper that delegates to the full implementation below.
-        """
-        # Delegate to the full implementation at line 3356
-        # (This duplicate definition at line 2663 is kept for compatibility)
+def save_ls_remote_cache() -> None:
+    if not LS_REMOTE_CACHE_DIRTY:
+        return
+    try:
+        payload = {
+            _cache_key(url, ref): value
+            for (url, ref), value in LS_REMOTE_CACHE.items()
+        }
+        LS_REMOTE_CACHE_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    except Exception:
         pass
 
-    def detect_module_subdir(self, module_path: str, repo_dir: Path) -> Optional[str]:
-        """Detect if module is located in a subdirectory of the repository."""
-        def read_module_name(go_mod_path: Path) -> Optional[str]:
-            try:
-                with open(go_mod_path, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        line = line.strip()
-                        if line.startswith('module '):
-                            parts = line.split()
-                            if len(parts) >= 2:
-                                return parts[1]
-                            break
-            except (OSError, UnicodeDecodeError):
-                return None
-            return None
 
-        expected_module = module_path
-
-        try:
-            go_mod_candidates = [p for p in repo_dir.rglob('go.mod') if '.git' not in p.parts]
-        except OSError:
-            go_mod_candidates = []
-
-        for go_mod_path in go_mod_candidates:
-            module_name = read_module_name(go_mod_path)
-            if not module_name:
-                continue
-
-            if module_name == expected_module:
-                try:
-                    rel_path = go_mod_path.parent.relative_to(repo_dir)
-                except ValueError:
-                    continue
-
-                rel_str = str(rel_path).replace('\\', '/')
-                return None if rel_str in ('', '.') else rel_str
-
-        # If no matching go.mod found, assume root
-        return None
-
-    def resolve_commit_from_version(self, repo_dir: Path, module_path: str, version: str) -> Optional[str]:
-        """Resolve the authoritative commit hash for a module version."""
-        import re
-        import subprocess
-
-        pseudo_version_match = re.match(r'v[0-9]+\.[0-9]+\.[0-9]+-[0-9]{14}-([0-9a-f]{12})', version)
-
-        if pseudo_version_match:
-            short_hash = pseudo_version_match.group(1)
-            try:
-                commit_result = subprocess.run(
-                    ["git", "rev-parse", short_hash],
-                    cwd=repo_dir,
-                    capture_output=True,
-                    text=True,
-                    check=True
-                )
-                return commit_result.stdout.strip()
-            except subprocess.CalledProcessError:
-                try:
-                    subprocess.run(
-                        ["git", "fetch", "--all"],
-                        cwd=repo_dir,
-                        capture_output=True,
-                        text=True,
-                        check=True
-                    )
-                    commit_result = subprocess.run(
-                        ["git", "rev-parse", short_hash],
-                        cwd=repo_dir,
-                        capture_output=True,
-                        text=True,
-                        check=True
-                    )
-                    return commit_result.stdout.strip()
-                except subprocess.CalledProcessError:
-                    return None
-
-        tag_candidates: List[str] = []
-        module_parts = module_path.split('/')
-        subpath_parts = module_parts[3:] if len(module_parts) > 3 else []
-
-        base_versions: List[str] = [version]
-        if '+incompatible' in version:
-            stripped_version = version.split('+', 1)[0]
-            if stripped_version and stripped_version not in base_versions:
-                base_versions.append(stripped_version)
-
-        for base_version in base_versions:
-            if subpath_parts:
-                candidate = f"{'/'.join(subpath_parts)}/{base_version}"
-                if candidate not in tag_candidates:
-                    tag_candidates.append(candidate)
-            if base_version not in tag_candidates:
-                tag_candidates.append(base_version)
-
-        for candidate in tag_candidates:
-            for attempt in range(2):
-                try:
-                    commit_result = subprocess.run(
-                        ["git", "rev-list", "-n", "1", candidate],
-                        cwd=repo_dir,
-                        capture_output=True,
-                        text=True,
-                        check=True
-                    )
-                    return commit_result.stdout.strip()
-                except subprocess.CalledProcessError:
-                    if attempt == 0:
-                        try:
-                            subprocess.run(
-                                ["git", "fetch", "--tags"],
-                                cwd=repo_dir,
-                                capture_output=True,
-                                text=True,
-                                check=True
-                            )
-                        except subprocess.CalledProcessError:
-                            break
-
-        return None
-
-    def fetch_main_repo(self, git_repo: str, git_ref: str) -> Optional[Path]:
-        """Fetch the main repository for gomodgit infrastructure bootstrap."""
-        print(f"📦 Fetching main repository: {git_repo} @ {git_ref}")
-
-        # Ensure temp dir is initialized
-        if not self.temp_dir:
-            self.temp_dir = Path(tempfile.mkdtemp(prefix="go_mod_fetcher_"))
-
-        # Use temporary directory for main repo
-        temp_dir = self.temp_dir / "main_repo"
-
-        try:
-            # Clone the repository
-            subprocess.run([
-                "git", "clone", "--depth=1", "--branch", git_ref, git_repo, str(temp_dir)
-            ], check=True, capture_output=True)
-
-            print(f"    ✅ Successfully fetched main repository to {temp_dir}")
-            return temp_dir
-
-        except subprocess.CalledProcessError as e:
-            # Try without --branch (for commit hashes)
-            try:
-                subprocess.run([
-                    "git", "clone", git_repo, str(temp_dir)
-                ], check=True, capture_output=True)
-
-                subprocess.run([
-                    "git", "checkout", git_ref
-                ], cwd=temp_dir, check=True, capture_output=True)
-
-                print(f"    ✅ Successfully fetched main repository to {temp_dir}")
-                return temp_dir
-
-            except subprocess.CalledProcessError as e2:
-                print(f"    ❌ Failed to fetch repository: {e2}")
-                return None
-
-    def extract_module_path_from_src_uri(self, src_uri: str) -> Optional[str]:
-        """Extract module path from SRC_URI string for duplicate detection."""
-        try:
-            # Extract the destsuffix part which contains the module path
-            if 'destsuffix=' in src_uri:
-                suffix_part = src_uri.split('destsuffix=')[1]
-                # Remove any trailing content after the suffix
-                if ';' in suffix_part:
-                    suffix_part = suffix_part.split(';')[0]
-                if '"' in suffix_part:
-                    suffix_part = suffix_part.split('"')[0]
-                # Extract the module part after the last slash
-                if '/modules/' in suffix_part:
-                    module_part = suffix_part.split('/modules/')[1]
-                    # Convert safe name back to module path
-                    return module_part.replace('_', '/')
-            return None
-        except Exception:
-            return None
-
-    def extract_repo_url_from_src_uri(self, src_uri: str) -> Optional[str]:
-        """Extract repository URL from SRC_URI string for duplicate detection."""
-        try:
-            # Extract the git:// URL part
-            if 'git://' in src_uri:
-                url_part = src_uri.split('git://')[1]
-                # Get everything before the first semicolon
-                if ';' in url_part:
-                    url_part = url_part.split(';')[0]
-                return f"git://{url_part}"
-            return None
-        except Exception:
-            return None
-
-    def write_oe_files(self):
-        """Write OpenEmbedded files (src_uri.inc and relocation.inc)."""
-        if not self.generate_oe_files:
-            return
-
-        # modules.txt is now authoritative, copied from `go mod vendor`.
-        # This function now only generates src_uri.inc and relocation.inc.
-        print("\n📄 Generating OpenEmbedded include files...")
-
-        # Analyze repository structure for relocation logic (will be used later)
-        repo_groups = self.analyze_repository_structure()
-
-        # Analyze vendor reference structure to detect subdirectory mappings
-        vendor_mappings = self.analyze_vendor_reference_structure()
-
-        # Write src_uri.inc with original approach but detect repository duplicates
-        src_uri_file = Path("src_uri.inc")
-        with open(src_uri_file, 'w') as f:
-            f.write(f"# Generated by go_mod_fetcher.py v{VERSION}\n")
-            f.write("# OpenEmbedded SRC_URI entries for Go module dependencies\n\n")
-
-            # Track which module paths we've already processed to avoid true duplicates
-            # Use module path instead of repository URL to allow multiple modules from same repo
-            processed_modules = set()
-
-            for src_uri in self.oe_src_uris:
-                # Extract module path from destsuffix to detect true duplicates
-                module_path = self.extract_module_path_from_src_uri(src_uri)
-                if module_path and module_path not in processed_modules:
-                    f.write(f"SRC_URI += \"{src_uri}\"\n")
-                    processed_modules.add(module_path)
-                    print(f"    📁 Added SRC_URI for module: {module_path}")
-                elif module_path in processed_modules:
-                    print(f"    ⚠️  Skipped duplicate module: {module_path}")
-                else:
-                    # Fallback: include entries without detectable module paths
-                    f.write(f"SRC_URI += \"{src_uri}\"\n")
-
-            # Generate SRC_URI entries for analysis_only modules that were missing
-            analysis_only_modules = [m for m in self.oe_modules if m.get('analysis_only', False)]
-            if analysis_only_modules:
-                print(f"    🔧 Generating SRC_URI entries for {len(analysis_only_modules)} analysis-only modules...")
-                for module_info in analysis_only_modules:
-                    module_path = module_info['path']
-                    if module_path not in processed_modules:
-                        # Generate SRC_URI entry for missing module
-                        src_uri = self.generate_fallback_src_uri(module_path, module_info['safe_name'])
-                        if src_uri:
-                            f.write(f"SRC_URI += \"{src_uri}\"\n")
-                            processed_modules.add(module_path)
-                            print(f"    📁 Added fallback SRC_URI for analysis-only module: {module_path}")
-
-
-        # Write relocation.inc
-        relocation_file = Path("relocation.inc")
-        with open(relocation_file, 'w') as f:
-            f.write(f"# Generated by go_mod_fetcher.py v{VERSION}\n")
-            f.write("# Commands to relocate Go modules into vendor structure\n")
-            f.write("# Use in do_compile_prepend() functions\n\n")
-
-            # Write efficient relocation function (emergency simple approach)
-            f.write("# Fast relocation function using simple copy\n")
-            f.write("relocate_go_module() {\n")
-            f.write("    local src_dir=\"$1\"\n")
-            f.write("    local dest_path=\"$2\"\n")
-            f.write("    local safe_name=\"$3\"\n")
-            f.write("    local module_path=\"$4\"\n")
-            f.write("    local dest_dir=\"${S}/src/import/vendor/${dest_path}\"\n")
-            f.write("    local parent_dir\n")
-            f.write("    parent_dir=$(dirname \"${dest_dir}\")\n")
-            f.write("\n")
-            f.write("    echo \"[DEBUG] Relocating ${dest_path}\"\n")
-            f.write("    echo \"[DEBUG] Source: ${src_dir}\"\n")
-            f.write("    echo \"[DEBUG] Dest: ${dest_dir}\"\n")
-            f.write("    echo \"[DEBUG] Parent Dest: ${parent_dir}\"\n")
-            f.write("\n")
-            f.write("    # Check if source directory exists\n")
-            f.write("    if [ ! -d \"${src_dir}\" ]; then\n")
-            f.write("        echo \"ERROR: Source directory ${src_dir} not found!\"\n")
-            f.write("        return 1\n")
-            f.write("    fi\n")
-            f.write("\n")
-            f.write("    # Check if source has any files\n")
-            f.write("    local file_count\n")
-            f.write("    file_count=$(find \"${src_dir}\" -type f | wc -l)\n")
-            f.write("    echo \"[DEBUG] Source contains ${file_count} files\"\n")
-            f.write("    if [ \"$file_count\" -eq 0 ]; then\n")
-            f.write("        echo \"ERROR: Source directory ${src_dir} is empty!\"\n")
-            f.write("        return 1\n")
-            f.write("    fi\n")
-            f.write("\n")
-            f.write("    # Create parent directory\n")
-            f.write("    mkdir -p \"${parent_dir}\"\n")
-            f.write("    if [ ! -d \"${parent_dir}\" ]; then\n")
-            f.write("        echo \"CRITICAL ERROR: Failed to create parent directory ${parent_dir}\"\n")
-            f.write("        return 1\n")
-            f.write("    fi\n")
-            f.write("    echo \"[DEBUG] Parent destination directory created successfully.\"\n")
-            f.write("    echo \"[DEBUG] Listing parent directory contents:\"\n")
-            f.write("    ls -la \"${parent_dir}\"\n")
-            f.write("\n")
-            f.write("    # Remove existing destination and create fresh directory\n")
-            f.write("    rm -rf \"${dest_dir}\"\n")
-            f.write("    mkdir -p \"${dest_dir}\"\n")
-            f.write("    if [ ! -d \"${dest_dir}\" ]; then\n")
-            f.write("        echo \"CRITICAL ERROR: Failed to create destination directory ${dest_dir}\"\n")
-            f.write("        return 1\n")
-            f.write("    fi\n")
-            f.write("    echo \"[DEBUG] Destination directory created successfully.\"\n")
-            f.write("    echo \"[DEBUG] Listing destination directory contents:\"\n")
-            f.write("    ls -la \"${dest_dir}\"\n")
-            f.write("\n")
-            f.write("    # Determine source path - handle submodule paths intelligently\n")
-            f.write("    local effective_src_dir=\"${src_dir}\"\n")
-            f.write("\n")
-            f.write("    # GENERALIZED SUBMODULE DETECTION\n")
-            f.write("    # Parse modules.txt to detect parent-child module relationships dynamically\n")
-            f.write("    local repo_base=\"\"\n")
-            f.write("    local subpath=\"\"\n")
-            f.write("\n")
-            f.write("    # Check if this module is a submodule by finding parent modules\n")
-            f.write("    # Try multiple locations for modules.txt\n")
-            f.write("    local modules_txt=\"${UNPACKDIR}/modules.txt\"\n")
-            f.write("    if [ ! -f \"${modules_txt}\" ]; then\n")
-            f.write("        modules_txt=\"${S}/../modules.txt\"\n")
-            f.write("    fi\n")
-            f.write("    if [ ! -f \"${modules_txt}\" ]; then\n")
-            f.write("        modules_txt=\"${S}/src/import/vendor/modules.txt\"\n")
-            f.write("    fi\n")
-            f.write("    if [ -f \"${modules_txt}\" ]; then\n")
-            f.write("        # Extract all module declarations from modules.txt\n")
-            f.write("        local all_modules\n")
-            f.write("        all_modules=$(grep '^# ' \"${modules_txt}\" | sed 's/^# //' | cut -d' ' -f1)\n")
-            f.write("        \n")
-            f.write("        # Find the shortest base module path that is a prefix of current module\n")
-            f.write("        # This helps find the repository root rather than intermediate modules\n")
-            f.write("        local shortest_parent=\"\"\n")
-            f.write("        local shortest_length=999999\n")
-            f.write("        \n")
-            f.write("        for potential_parent in $all_modules; do\n")
-            f.write("            # Skip if potential parent is same as current module\n")
-            f.write("            if [ \"$potential_parent\" = \"${module_path}\" ]; then\n")
-            f.write("                continue\n")
-            f.write("            fi\n")
-            f.write("            \n")
-            f.write("            # Check if potential_parent is a prefix of module_path\n")
-            f.write("            if echo \"${module_path}\" | grep -q \"^${potential_parent}/\"; then\n")
-            f.write("                parent_length=$(echo \"$potential_parent\" | wc -c)\n")
-            f.write("                # Find the shortest (most base) parent, not the longest\n")
-            f.write("                if [ $parent_length -lt $shortest_length ]; then\n")
-            f.write("                    shortest_parent=\"$potential_parent\"\n")
-            f.write("                    shortest_length=$parent_length\n")
-            f.write("                fi\n")
-            f.write("            fi\n")
-            f.write("        done\n")
-            f.write("        \n")
-            f.write("        # If we found a parent module, extract the subpath\n")
-            f.write("        if [ -n \"$shortest_parent\" ]; then\n")
-            f.write("            repo_base=\"$shortest_parent\"\n")
-            f.write("            subpath=$(echo \"${module_path}\" | sed \"s|^${shortest_parent}/||\")\n")
-            f.write("            echo \"[DEBUG] DYNAMIC: Detected submodule relationship: parent=${repo_base}, subpath=${subpath}\"\n")
-            f.write("            \n")
-            f.write("            # Check if the subpath exists in the source directory\n")
-            f.write("            if [ -n \"${subpath}\" ] && [ -d \"${src_dir}/${subpath}\" ]; then\n")
-            f.write("                effective_src_dir=\"${src_dir}/${subpath}\"\n")
-            f.write("                echo \"[DEBUG] DYNAMIC: Using subpath source: ${effective_src_dir}\"\n")
-            f.write("            else\n")
-            f.write("                echo \"[DEBUG] DYNAMIC: Subpath ${subpath} not found in ${src_dir}, using full source\"\n")
-            f.write("            fi\n")
-            f.write("        else\n")
-            f.write("            echo \"[DEBUG] DYNAMIC: No parent module found for ${module_path}, using full source\"\n")
-            f.write("        fi\n")
-            f.write("    else\n")
-            f.write("        echo \"[DEBUG] DYNAMIC: modules.txt not found, using full source\"\n")
-            f.write("    fi\n")
-            f.write("\n")
-            f.write("    # VENDOR REFERENCE STRUCTURE MAPPINGS\n")
-            f.write("    # Generated from analysis of vendor reference structure\n")
-
-            # Generate the vendor mappings code dynamically
-            if vendor_mappings:
-                f.write(f"    echo \"[DEBUG] Checking vendor structure mappings for ${{module_path}}...\"\n")
-                for module_path, mapping_info in vendor_mappings.items():
-                    subdir = mapping_info['source_subdir']
-                    reason = mapping_info['reason']
-                    f.write(f"\n")
-                    f.write(f"    # {reason}\n")
-                    f.write(f"    if [ \"${{module_path}}\" = \"{module_path}\" ]; then\n")
-                    f.write(f"        if [ -d \"${{src_dir}}/{subdir}\" ]; then\n")
-                    f.write(f"            effective_src_dir=\"${{src_dir}}/{subdir}\"\n")
-                    f.write(f"            echo \"[DEBUG] VENDOR MAPPING: Using {subdir}/ subdir for ${{module_path}}\"\n")
-                    f.write(f"        else\n")
-                    f.write(f"            echo \"[DEBUG] VENDOR MAPPING: {subdir}/ subdir not found for ${{module_path}}\"\n")
-                    f.write(f"        fi\n")
-                    f.write(f"    fi\n")
-
-            f.write("\n")
-            f.write("    # End of generalized submodule detection\n")
-            f.write("\n")
-            f.write("    echo \"[DEBUG] Final source directory: ${effective_src_dir}\"\n")
-            f.write("\n")
-            f.write("    # Verify source directory exists\n")
-            f.write("    if [ ! -d \"${effective_src_dir}\" ]; then\n")
-            f.write("        echo \"ERROR: Effective source directory ${effective_src_dir} not found!\"\n")
-            f.write("        echo \"[DEBUG] Available directories in ${src_dir}:\"\n")
-            f.write("        ls -la \"${src_dir}\" | head -10\n")
-            f.write("        return 1\n")
-            f.write("    fi\n")
-            f.write("\n")
-            f.write("    # Copy using tar for better reliability with complex structures\n")
-            f.write("    echo \"[DEBUG] Copying files using tar from ${effective_src_dir}...\"\n")
-            f.write("    echo \"[DEBUG] Source contents before copy:\"\n")
-            f.write("    find \"${effective_src_dir}\" -type f -name '*.go' | head -10\n")
-            f.write("    # Use more robust copy with explicit error checking\n")
-            f.write("    echo \"[DEBUG] Starting tar copy process...\"\n")
-            f.write("    echo \"[DEBUG] Source dir exists: $([ -d \"${effective_src_dir}\" ] && echo YES || echo NO)\"\n")
-            f.write("    echo \"[DEBUG] Dest dir exists: $([ -d \"${dest_dir}\" ] && echo YES || echo NO)\"\n")
-            f.write("    \n")
-            f.write("    # Test cd commands separately first\n")
-            f.write("    if ! cd \"${effective_src_dir}\"; then\n")
-            f.write("        echo \"ERROR: Cannot cd to source directory ${effective_src_dir}\"\n")
-            f.write("        return 1\n")
-            f.write("    fi\n")
-            f.write("    if ! cd \"${dest_dir}\"; then\n")
-            f.write("        echo \"ERROR: Cannot cd to destination directory ${dest_dir}\"\n")
-            f.write("        return 1\n")
-            f.write("    fi\n")
-            f.write("    \n")
-            f.write("    # Now do the actual copy with better error detection\n")
-            f.write("    if tar cf - -C \"${effective_src_dir}\" . | tar xf - -C \"${dest_dir}\"; then\n")
-            f.write("        echo \"[DEBUG] Tar copy completed, verifying immediately...\"\n")
-            f.write("        \n")
-            f.write("        # Immediate verification that destination still exists and has content\n")
-            f.write("        if [ ! -d \"${dest_dir}\" ]; then\n")
-            f.write("            echo \"ERROR: Destination directory disappeared immediately after tar copy!\"\n")
-            f.write("            echo \"[DEBUG] This suggests build system interference or race condition\"\n")
-            f.write("            return 1\n")
-            f.write("        fi\n")
-            f.write("        \n")
-            f.write("        # Count files to ensure copy actually worked\n")
-            f.write("        local copied_files\n")
-            f.write("        copied_files=$(find \"${dest_dir}\" -type f | wc -l)\n")
-            f.write("        echo \"[DEBUG] Copied ${copied_files} files to destination\"\n")
-            f.write("        \n")
-            f.write("        if [ \"$copied_files\" -eq 0 ]; then\n")
-            f.write("            echo \"ERROR: No files were actually copied despite successful tar!\"\n")
-            f.write("            echo \"[DEBUG] Source file count was: ${file_count}\"\n")
-            f.write("            echo \"[DEBUG] This indicates a tar extraction issue\"\n")
-            f.write("            return 1\n")
-            f.write("        fi\n")
-            f.write("        \n")
-            f.write("        echo \"[DEBUG] Verifying critical paths exist in destination:\"\n")
-            f.write("        # Check for common package structure patterns\n")
-            f.write("        if echo \"${module_path}\" | grep -q \"github.com/docker/docker\"; then\n")
-            f.write("            for subpath in api/types pkg opts; do\n")
-            f.write("                if [ -d \"${dest_dir}/${subpath}\" ]; then\n")
-            f.write("                    echo \"[DEBUG] ✅ Found ${subpath}/ in destination\"\n")
-            f.write("                else\n")
-            f.write("                    echo \"[DEBUG] ❌ Missing ${subpath}/ in destination\"\n")
-            f.write("                fi\n")
-            f.write("            done\n")
-            f.write("        fi\n")
-            f.write("        \n")
-            f.write("        echo \"[DEBUG] Tar copy successful - ${copied_files} files copied\"\n")
-            f.write("    else\n")
-            f.write("        echo \"ERROR: Tar copy failed from ${effective_src_dir} to ${dest_dir}\"\n")
-            f.write("        echo \"[DEBUG] Trying to copy with cp -r\"\n")
-            f.write("        cp -r \"${effective_src_dir}/.\" \"${dest_dir}/\"\n")
-            f.write("        if [ $? -ne 0 ]; then\n")
-            f.write("            echo \"ERROR: cp -r also failed\"\n")
-            f.write("            return 1\n")
-            f.write("        fi\n")
-            f.write("    fi\n")
-            f.write("\n")
-            f.write("    # Verify directory existence immediately after copy\n")
-            f.write("    if [ ! -d \"${dest_dir}\" ]; then\n")
-            f.write("        echo \"CRITICAL ERROR: Destination directory ${dest_dir} disappeared after tar copy!\"\n")
-            f.write("        return 1\n")
-            f.write("    fi\n")
-            f.write("    echo \"[DEBUG] Destination directory still exists after copy.\"\n")
-            f.write("    echo \"[DEBUG] Listing destination directory contents after copy:\"\n")
-            f.write("    ls -la \"${dest_dir}\"\n")
-            f.write("    \n")
-            f.write("    # TEMPORARILY DISABLED: Clean up unwanted files (post-copy cleanup)\n")
-            f.write("    # This cleanup might be causing the directory deletion issue\n")
-            f.write("    echo \"[DEBUG] Skipping cleanup to avoid accidental file deletion\"\n")
-            f.write("    # find \"${dest_dir}\" -name '*_test.go' -delete 2>/dev/null || true\n")
-            f.write("    # find \"${dest_dir}\" -name 'testdata' -type d -exec rm -rf {} + 2>/dev/null || true\n")
-            f.write("    # find \"${dest_dir}\" -name 'example*' -type d -exec rm -rf {} + 2>/dev/null || true\n")
-            f.write("    # find \"${dest_dir}\" -name 'doc*' -type d -exec rm -rf {} + 2>/dev/null || true\n")
-            f.write("    # find \"${dest_dir}\" -name '*.md' -delete 2>/dev/null || true\n")
-            f.write("    # find \"${dest_dir}\" -name 'Makefile*' -delete 2>/dev/null || true\n")
-            f.write("    # find \"${dest_dir}\" -name 'Dockerfile*' -delete 2>/dev/null || true\n")
-            f.write("    # find \"${dest_dir}\" -name '.git*' -exec rm -rf {} + 2>/dev/null || true\n")
-            f.write("    \n")
-            f.write("    # Verify we actually copied Go files\n")
-            f.write("    local go_count\n")
-            f.write("    go_count=$(find \"${dest_dir}\" -name '*.go' | wc -l)\n")
-            f.write("    echo \"[DEBUG] Destination contains ${go_count} Go files after copy\"\n")
-            f.write("    if [ \"$go_count\" -eq 0 ]; then\n")
-            f.write("        echo \"ERROR: No Go files found in ${dest_dir} after copy!\"\n")
-            f.write("        echo \"[DEBUG] Listing what we did copy:\"\n")
-            f.write("        find \"${dest_dir}\" -type f | head -10\n")
-            f.write("        return 1\n")
-            f.write("    fi\n")
-            f.write("    \n")
-            f.write("    echo \"SUCCESS: Relocated ${dest_path} (${go_count} Go files)\"\n")
-            f.write("    return 0\n")
-            f.write("}\n\n")
-
-            f.write("do_install_go_vendor() {\n")
-            f.write("    # Create Go vendor directory structure in standard Go source layout\n")
-            f.write("    mkdir -p ${S}/src/import/vendor\n")
-            f.write("    \n")
-            f.write("    echo \"Starting Go module relocation (repository-based approach)...\"\n")
-            f.write("    local relocated_count=0\n\n")
-
-            # Generate dynamic repository data parsing function
-            print("🔍 Generating dynamic repository data parsing...")
-            # Reuse the repository groups analysis from src_uri.inc generation
-            relocation_data = self.generate_dynamic_relocation_data(repo_groups)
-
-            f.write("    # Dynamic repository data generation from src_uri.inc\n")
-            f.write("    parse_src_uri_and_generate_repo_data() {\n")
-            f.write("        local src_uri_file=\"${THISDIR}/src_uri.inc\"\n")
-            # Generate dynamic provides lookup function from the repository analysis
-            f.write("        \n")
-            f.write("        # Dynamic provides calculation - embedded repository analysis\n")
-            f.write("        get_provides_for_module() {\n")
-            f.write("            local module_path=\"$1\"\n")
-            f.write("            \n")
-
-            # Embed the relocation data as case statements (exact matches first)
-            f.write("            case \"$module_path\" in\n")
-            for repo_module, provided_modules in relocation_data.items():
-                if len(provided_modules) > 1:
-                    provides_list = ' '.join(provided_modules)
-                    f.write(f"                {repo_module})\n")
-                    f.write(f"                    echo \"{provides_list}\"\n")
-                    f.write("                    ;;\n")
-            f.write("                *)\n")
-
-            # Add dynamic parent detection for submodules
-            f.write("                    # Try to find parent module for submodules\n")
-            for repo_module, provided_modules in relocation_data.items():
-                if len(provided_modules) > 1:
-                    provides_list = ' '.join(provided_modules)
-                    f.write(f"                    if echo \"$module_path\" | grep -q \"^{repo_module}/\"; then\n")
-                    f.write(f"                        echo \"{provides_list}\"\n")
-                    f.write("                        return\n")
-                    f.write("                    fi\n")
-            f.write("                    # Default: module provides itself\n")
-            f.write("                    echo \"$module_path\"\n")
-            f.write("                    ;;\n")
-            f.write("            esac\n")
-            f.write("        }\n")
-            f.write("        \n")
-            f.write("        local repo_count=0\n")
-            f.write("\n")
-            f.write("        echo \"[DEBUG] Using SRC_URI variable approach for repository data...\"\n")
-            f.write("        echo \"[DEBUG] SRC_URI variable is set: $([ -n \"${SRC_URI}\" ] && echo YES || echo NO)\"\n")
-            f.write("        \n")
-            f.write("        # Process SRC_URI variable - group entries by repository URL to avoid duplicates\n")
-            f.write("        local temp_file=\"/tmp/src_uri_$$.tmp\"\n")
-            f.write("        local temp_repos=\"/tmp/repos_$$.tmp\"\n")
-            f.write("        echo \"${SRC_URI}\" > \"$temp_file\"\n")
-            f.write("        \n")
-            f.write("        # First pass: extract all git repositories and their modules\n")
-            f.write("        while IFS=' ' read -r line || [ -n \"$line\" ]; do\n")
-            f.write("            for uri_part in $line; do\n")
-            f.write("                [ -z \"$uri_part\" ] && continue\n")
-            f.write("\n")
-            f.write("                if echo \"$uri_part\" | grep -q \"destsuffix=\\${GO_SRCURI_DESTSUFFIX}/modules/\"; then\n")
-            f.write("                    # Extract repository URL (everything before the semicolon)\n")
-            f.write("                    local repo_url\n")
-            f.write("                    repo_url=$(echo \"$uri_part\" | sed 's/;.*//')\n")
-            f.write("                    local module_source\n")
-            f.write("                    module_source=$(echo \"$uri_part\" | sed 's/.*\\/modules\\/\\([^;\" ]*\\).*/\\1/')\n")
-            f.write("                    local module_path\n")
-            f.write("                    module_path=$(echo \"$module_source\" | tr '_' '/')\n")
-            f.write("                    \n")
-            f.write("                    # Store repo_url:module_path:module_source for grouping\n")
-            f.write("                    echo \"$repo_url|$module_path|$module_source\" >> \"$temp_repos\"\n")
-            f.write("                fi\n")
-            f.write("            done\n")
-            f.write("        done < \"$temp_file\"\n")
-            f.write("        \n")
-            f.write("        # Process each module individually like the static version\n")
-            f.write("        while IFS='|' read -r repo_url module_path module_source || [ -n \"$repo_url\" ]; do\n")
-            f.write("            [ -z \"$repo_url\" ] && continue\n")
-            f.write("            \n")
-            f.write("            # Get provides list dynamically\n")
-            f.write("            local provides\n")
-            f.write("            provides=$(get_provides_for_module \"$module_path\")\n")
-            f.write("            \n")
-            f.write("            eval \"repo_${repo_count}_module='$module_path'\"\n")
-            f.write("            eval \"repo_${repo_count}_source='$module_source'\"\n")
-            f.write("            eval \"repo_${repo_count}_provides='$provides'\"\n")
-            f.write("\n")
-            f.write("            echo \"[DEBUG] repo_${repo_count}: module=$module_path source=$module_source provides=$provides\"\n")
-            f.write("            repo_count=`expr $repo_count + 1`\n")
-            f.write("        done < \"$temp_repos\"\n")
-            f.write("        \n")
-            f.write("        # Clean up temp files\n")
-            f.write("        rm -f \"$temp_file\" \"$temp_repos\"\n")
-            f.write("        \n")
-            f.write("        total_repos=$repo_count\n")
-            f.write("        echo \"[DEBUG] Parsed $total_repos repositories from SRC_URI variable\"\n")
-            f.write("    }\n")
-            f.write("    \n")
-            f.write("    # Parse repository data dynamically\n")
-            f.write("    parse_src_uri_and_generate_repo_data\n")
-            f.write(f"\n")
-
-            # Generate the repository-based processing loop
-            f.write("    # Process repositories to copy each repository once to its declared module location\n")
-            f.write("    local i=0\n")
-            f.write("    while [ $i -lt $total_repos ]; do\n")
-            f.write("        # Get repository data using indirect variable expansion\n")
-            f.write("        eval \"local repo_module=\\$repo_${i}_module\"\n")
-            f.write("        eval \"local repo_source=\\$repo_${i}_source\"\n")
-            f.write("        eval \"local repo_provides=\\$repo_${i}_provides\"\n")
-            f.write("        \n")
-            f.write("        echo \"[$(expr $i + 1)/$total_repos] Repository: $repo_module\"\n")
-            f.write("        echo \"[DEBUG] Source: $repo_source\"\n")
-            f.write("        echo \"[DEBUG] Provides modules: $repo_provides\"\n")
-            f.write("        \n")
-            f.write("        # Process each module provided by this repository entry\n")
-            f.write("        local provided_modules=\"$repo_provides\"\n")
-            f.write("        for provided_module in $provided_modules; do\n")
-            f.write("            echo \"[DEBUG] Relocating ${provided_module}\"\n")
-            f.write("            \n")
-            f.write("            # CRITICAL FIX: Check if this is a submodule that needs subpath extraction\n")
-            f.write("            local effective_source_dir=\"${S}/src/import/modules/${repo_source}\"\n")
-            f.write("            \n")
-
-            # Generate submodule detection logic using the repository analysis data
-            f.write("            # Submodule path detection - generated from repository analysis\n")
-            for repo_module, modules in repo_groups.items():
-                for module_info in modules:
-                    if module_info['is_submodule']:
-                        module_path = module_info['module_path']
-                        actual_repo_module = module_info['repo_module']
-
-                        # Use the pre-computed subpath from combined detection (generic + overrides)
-                        subpath = module_info.get('subpath')
-                        if not subpath:
-                            print(f"    ⚠️  WARNING: No subpath found for submodule {module_path}, skipping")
-                            continue
-
-                        safe_name = module_info['safe_name']
-                        f.write(f"            if [ \"$provided_module\" = \"{module_path}\" ]; then\n")
-                        f.write(f"                # Submodule {module_path} -> use subpath '{subpath}'\n")
-                        f.write(f"                if [ -d \"${{S}}/src/import/modules/{safe_name}/{subpath}\" ]; then\n")
-                        f.write(f"                    effective_source_dir=\"${{S}}/src/import/modules/{safe_name}/{subpath}\"\n")
-                        f.write(f"                    echo \"[DEBUG] SUBMODULE FIX: Using subpath source: $effective_source_dir\"\n")
-                        f.write("                else\n")
-                        f.write(f"                    echo \"[DEBUG] SUBMODULE: Subpath {subpath} not found, using full repository\"\n")
-                        f.write("                fi\n")
-                        f.write("            fi\n")
-
-            f.write("            \n")
-            f.write("            if relocate_go_module \"$effective_source_dir\" \"$provided_module\" \"$repo_source\" \"$provided_module\"; then\n")
-            f.write("                echo \"SUCCESS: Module $provided_module relocated\"\n")
-            f.write("            else\n")
-            f.write("                echo \"ERROR: Failed to relocate module $provided_module\"\n")
-            f.write("            fi\n")
-            f.write("        done\n")
-            f.write("        relocated_count=`expr $relocated_count + 1`\n")
-            f.write("        \n")
-            f.write("        i=`expr $i + 1`\n")
-            f.write("    done\n\n")
-
-            # Handle stub modules separately
-            f.write("    # Handle stub modules (local replaces, etc.)\n")
-            for module_info in self.oe_modules:
-                if module_info.get('is_stub', False):
-                    module_path = module_info['path']
-                    if 'tigron' in module_path:
-                        f.write("    # Special handling for tigron - it's a local replace that needs relocation\n")
-                        f.write(f"    echo \"Special handling for local replace module: {module_path}\"\n")
-                        f.write("    local tigron_src=\"${S}/src/import/mod/tigron\"\n")
-                        f.write(f"    local tigron_dest=\"${{S}}/src/import/vendor/{module_path}\"\n\n")
-                        f.write("    if [ -d \"$tigron_src\" ]; then\n")
-                        f.write("        echo \"[DEBUG] Copying tigron from local source: $tigron_src -> $tigron_dest\"\n")
-                        f.write("        mkdir -p \"$(dirname \"$tigron_dest\")\"\n")
-                        f.write("        rm -rf \"$tigron_dest\"\n")
-                        f.write("        cp -r \"$tigron_src\" \"$tigron_dest\"\n")
-                        f.write("        if [ -d \"$tigron_dest\" ]; then\n")
-                        f.write("            echo \"SUCCESS: Relocated tigron module from local source\"\n")
-                        f.write("            relocated_count=`expr $relocated_count + 1`\n")
-                        f.write("        else\n")
-                        f.write("            echo \"ERROR: Failed to copy tigron from local source\"\n")
-                        f.write("        fi\n")
-                        f.write("    else\n")
-                        f.write("        echo \"ERROR: Tigron source directory not found: $tigron_src\"\n")
-                        f.write("    fi\n\n")
-
-            f.write("    echo \"Module relocation complete: relocated $relocated_count modules\"\n\n")
-
-            # Copy the generated modules.txt with proper markers
-            f.write("    # Copy the generated modules.txt with proper explicit/replaced markers\n")
-            f.write("    if [ -f \"${UNPACKDIR}/modules.txt\" ]; then\n")
-            f.write("        cp \"${UNPACKDIR}/modules.txt\" \"${S}/src/import/vendor/modules.txt\"\n")
-            f.write("        echo \"Copied modules.txt with proper explicit/replaced markers\"\n")
-            f.write("    else\n")
-            f.write("        echo \"Warning: modules.txt not found in UNPACKDIR, vendor may be incomplete\"\n")
-            f.write("    fi\n")
-            f.write("}\n\n")
-
-            f.write("# Add to your recipe:\n")
-            f.write("# inherit go\n")
-            f.write("# SRC_URI += \"file://src_uri.inc file://relocation.inc file://modules.txt\"\n")
-            f.write("# include src_uri.inc\n")
-            f.write("# include relocation.inc\n")
-            f.write("# do_compile_prepend() {\n")
-            f.write("#     do_install_go_vendor\n")
-            f.write("# }\n")
-            f.write("#\n")
-            f.write("# Benefits:\n")
-            f.write("# - Generated modules.txt with proper explicit/replaced markers from go.mod parsing\n")
-            f.write("# - Extensive debugging output to diagnose relocation issues\n")
-            f.write("# - Multiple copy methods (cp + tar fallback) for reliability\n")
-            f.write("# - BitBake compatible shell syntax (no $((...))\n")
-            f.write("# - Loop-based approach eliminates code repetition\n")
-            f.write("# - Comprehensive error handling and verification\n")
-
-        # Vendor directory no longer needed for final output (removed vendor tarball approach)
-
-        # Generate corrected go.sum for gomodgit compatibility when requested
-        if self.generate_gomodgit:
-            self.generate_gomodgit_go_sum()
-        else:
-            print("\n⏭️  Skipping go.sum.gomodgit generation (use --generate-gomodgit to enable)")
-
-        print(f"\n✅ OpenEmbedded files generated:")
-        print(f"   📄 modules.txt - Copied from 'go mod vendor' output.")
-        print(f"   📄 src_uri.inc - Generated with SRC_URI entries for each module.")
-        print(f"   📄 relocation.inc - Generated with individual module relocation commands.")
-        if self.generate_gomodgit:
-            print(f"   📄 go.sum.gomodgit - Corrected checksums for gomodgit compatibility.")
-        else:
-            print(f"   ⏭️  go.sum.gomodgit not generated (use --generate-gomodgit if needed).")
-        print(f"\n💡 Add these files to your recipe with:")
-        if self.generate_gomodgit:
-            print(f"   SRC_URI += \"file://modules.txt file://src_uri.inc file://relocation.inc file://go.sum.gomodgit\"")
-        else:
-            print(f"   SRC_URI += \"file://modules.txt file://src_uri.inc file://relocation.inc\"")
-
-    def calculate_zip_checksum_using_go(self, zip_path):
-        """
-        Calculate checksum for a zip file using Go's ACTUAL dirhash implementation.
-
-        This calls Go's golang.org/x/mod/sumdb/dirhash.HashZip via a compiled helper binary
-        instead of trying to replicate the algorithm in Python (which produces wrong results).
-
-        Returns: Checksum in format "h1:base64(sha256)"
-        """
-        import subprocess
-        from pathlib import Path
-
-        try:
-            go_helper = self.get_dirhash_helper()
-        except FileNotFoundError as exc:
-            raise FileNotFoundError(str(exc))
-
-        try:
-            result = subprocess.run(
-                [str(go_helper), str(zip_path)],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-
-            if result.returncode != 0:
-                raise RuntimeError(f"Go dirhash failed: {result.stderr}")
-
-            checksum = result.stdout.strip()
-            if not checksum.startswith("h1:"):
-                raise ValueError(f"Invalid checksum format: {checksum}")
-
-            return checksum
-
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(f"Timeout calculating checksum for {zip_path}")
-        except Exception as e:
-            raise RuntimeError(f"Error calculating checksum for {zip_path}: {e}")
-
-    def generate_gomodgit_go_sum_for_hybrid(self, source_dir: Path):
-        """Generate go.sum.gomodgit with HYBRID approach: VCS zips + sum.golang.org .mod checksums.
-
-        This version:
-        1. Creates temporary hybrid-style zips (same as module_cache_task.inc)
-        2. Calculates .zip checksums using Go's dirhash implementation (from OUR VCS builds)
-        3. Fetches .mod checksums from sum.golang.org (uses unknown algorithm we can't replicate)
-        4. Network is AVAILABLE here (during script execution), unlike during BitBake build
-        """
-        print("    📂 Creating hybrid-style module cache and calculating checksums...")
-
-        import tempfile
-        import hashlib
-        import base64
-        import re
-        import urllib.request
-        import urllib.error
-        from pathlib import Path
-
-        try:
-            # Check if we have module information
-            if not hasattr(self, 'processed_modules') or not self.processed_modules:
-                print("    ❌ No processed modules available for checksum generation")
-                self.fallback_go_sum_generation()
-                return
-
-            print(f"    📂 Processing {len(self.processed_modules)} modules...")
-
-            # Create temporary directory for module cache
-            with tempfile.TemporaryDirectory(prefix='hybrid-cache-') as temp_cache_root:
-                cache_dir = Path(temp_cache_root) / "pkg" / "mod" / "cache"
-                cache_dir.mkdir(parents=True, exist_ok=True)
-
-                # Create zip files using the EXACT same method as module_cache_task.inc
-                print(f"    🔧 Creating hybrid-style zip files...")
-
-                success_count = 0
-                for module_info in self.processed_modules:
-                    if self.create_hybrid_style_zip(module_info, cache_dir):
-                        success_count += 1
-
-                print(f"    ✅ Created {success_count} hybrid-style zip files")
-
-                if success_count == 0:
-                    print("    ❌ No zip files created - using fallback")
-                    self.fallback_go_sum_generation()
-                    return
-
-                # Now calculate checksums using HYBRID approach
-                print(f"    🔢 Calculating checksums using HYBRID approach...")
-                print(f"       • .zip checksums: Go's dirhash (from OUR VCS builds)")
-                print(f"       • .mod checksums: sum.golang.org (uses unknown algorithm)")
-
-                checksums = {}
-                download_dir = cache_dir / "download"
-
-                for zip_file in download_dir.rglob("*.zip"):
-                    try:
-                        # Calculate zip checksum using Go's ACTUAL dirhash implementation
-                        zip_checksum = self.calculate_zip_checksum_using_go(zip_file)
-
-                        # Extract module path and version from file path FIRST
-                        # Path: cache/download/escaped_module/@v/escaped_version.zip
-                        parts = zip_file.parts
-                        v_index = parts.index('@v')
-                        download_index = parts.index('download')
-
-                        escaped_module_parts = parts[download_index + 1:v_index]
-                        escaped_module = '/'.join(escaped_module_parts)
-                        escaped_version = zip_file.stem
-
-                        # Unescape module path and version
-                        def unescape(s):
-                            return re.sub(r'!([a-z])', lambda m: m.group(1).upper(), s)
-
-                        module_path = unescape(escaped_module)
-                        version = unescape(escaped_version)
-
-                        # Fetch .mod checksum from sum.golang.org (network IS available here)
-                        mod_checksum = None
-                        try:
-                            lookup_url = f"https://sum.golang.org/lookup/{module_path}@{version}"
-                            response = urllib.request.urlopen(lookup_url, timeout=10)
-                            content = response.read().decode('utf-8')
-
-                            # Parse sum.golang.org response for .mod checksum
-                            # Format: "module_path version/go.mod h1:xxxxx"
-                            for line in content.strip().split('\n'):
-                                if line.startswith(f"{module_path} {version}/go.mod h1:"):
-                                    mod_checksum = line.split(' ', 2)[2]
-                                    break
-
-                            if mod_checksum:
-                                print(f"      ✓ {module_path}@{version} (fetched .mod from sum.golang.org)")
-                            else:
-                                print(f"      ⚠️  {module_path}@{version} (.mod not in sum.golang.org)")
-
-                        except urllib.error.HTTPError as e:
-                            if e.code == 410:
-                                print(f"      ⚠️  {module_path}@{version} (.mod not found in sum.golang.org - 410 Gone)")
-                            else:
-                                print(f"      ⚠️  {module_path}@{version} (HTTP {e.code} from sum.golang.org)")
-                        except Exception as e:
-                            print(f"      ⚠️  {module_path}@{version} (error fetching .mod: {e})")
-
-                        module_version = f"{module_path} {version}"
-
-                        if module_version not in checksums:
-                            checksums[module_version] = {'zip': zip_checksum, 'mod': mod_checksum}
-
-                    except Exception as e:
-                        print(f"      ⚠️  Error processing {zip_file}: {e}")
-                        continue
-
-                # Write go.sum.gomodgit with HYBRID checksums
-                output_path = Path("go.sum.gomodgit")
-                with open(output_path, 'w') as f:
-                    for module_version in sorted(checksums.keys()):
-                        data = checksums[module_version]
-                        f.write(f"{module_version} {data['zip']}\n")
-                        if data['mod']:
-                            f.write(f"{module_version}/go.mod {data['mod']}\n")
-
-                num_entries = sum(2 if data['mod'] else 1 for data in checksums.values())
-                num_with_mod = sum(1 if data['mod'] else 0 for data in checksums.values())
-                print(f"    ✅ Generated {output_path} with {len(checksums)} modules ({num_entries} entries)")
-                print(f"    🎯 Zip checksums: Go dirhash (from OUR VCS builds)")
-                print(f"    🌐 Mod checksums: {num_with_mod} fetched from sum.golang.org")
-                print(f"    📊 These checksums should match what Go expects during build validation")
-
-                return
-
-        except Exception as e:
-            print(f"    ❌ Error generating hybrid checksums: {e}")
-            import traceback
-            traceback.print_exc()
-            self.fallback_go_sum_generation()
-
-    def generate_gomodgit_go_sum(self):
-        """Generate go.sum.gomodgit with checksums that match the hybrid module cache.
-
-        This simulates the EXACT same zip creation process as module_cache_task.inc
-        to ensure checksums match what the build environment will calculate.
-        """
-        print("\n📝 Generating go.sum.gomodgit with hybrid-compatible checksums...")
-
-        import tempfile
-        import subprocess
-        import shutil
-        import zipfile
-        import re
-        import os
-        from pathlib import Path
-
-        try:
-            # Check if we have module information
-            if not hasattr(self, 'processed_modules') or not self.processed_modules:
-                print("    ❌ No processed modules available for checksum generation")
-                self.fallback_go_sum_generation()
-                return
-
-            # Use the same source we cloned for analysis
-            if not self.temp_dir or not Path(self.temp_dir).exists():
-                print("    ❌ No source directory available for checksum generation")
-                self.fallback_go_sum_generation()
-                return
-
-            source_dir = Path(self.temp_dir)
-            # Delegate to the hybrid version
-            self.generate_gomodgit_go_sum_for_hybrid(source_dir)
-
-        except Exception as e:
-            print(f"    ❌ Error generating hybrid checksums: {e}")
-            self.fallback_go_sum_generation()
-
-    def create_hybrid_style_zip(self, module_info, cache_dir):
-        """Create a zip file using the exact same method as module_cache_task.inc"""
-        import tempfile
-        import subprocess
-        import zipfile
-        import re
-        from pathlib import Path
-
-        try:
-            module_path = module_info.get('module_path', '')
-            version = module_info.get('version', '')
-            repo_url = module_info.get('repo_url', '')
-            commit = module_info.get('commit', '')
-            subdir = module_info.get('subdir', '')
-
-            if not all([module_path, version, repo_url, commit]):
-                return False
-
-            # Use correct escaping function that matches BitBake's gomod.py
-            def escape_module_path(path):
-                """Escape capital letters using exclamation points (same as BitBake gomod.py)"""
-                return re.sub(r'([A-Z])', lambda m: '!' + m.group(1).lower(), path)
-
-            escaped_module = escape_module_path(module_path)
-            escaped_version = escape_module_path(version)
-
-            download_dir = cache_dir / "download" / escaped_module / "@v"
-            download_dir.mkdir(parents=True, exist_ok=True)
-
-            zip_path = download_dir / f"{escaped_version}.zip"
-            mod_path = download_dir / f"{escaped_version}.mod"
-
-            # Persistent cache location for generated module artifacts
-            if self.gomod_cache:
-                persistent_base = Path(self.gomod_cache) / "cache" / "download" / escaped_module / "@v"
-            else:
-                persistent_base = Path.home() / ".cache" / "oe-go-mod-fetcher" / "downloads" / escaped_module / "@v"
-            persistent_base.mkdir(parents=True, exist_ok=True)
-
-            persistent_zip = persistent_base / f"{escaped_version}.zip"
-            persistent_mod = persistent_base / f"{escaped_version}.mod"
-            persistent_commit = persistent_base / f"{escaped_version}.commit"
-
-            # Reuse cached artifacts when the commit matches
-            if persistent_zip.exists() and persistent_mod.exists():
-                cached_commit = None
-                if persistent_commit.exists():
-                    try:
-                        cached_commit = persistent_commit.read_text().strip()
-                    except OSError:
-                        cached_commit = None
-                if cached_commit == commit:
-                    print(f"    📦 Using cached module archive for {module_path}@{version}")
-                    if not zip_path.exists():
-                        shutil.copy2(persistent_zip, zip_path)
-                    if not mod_path.exists():
-                        shutil.copy2(persistent_mod, mod_path)
-                    return True
-                elif cached_commit and cached_commit != commit:
-                    display_cached = cached_commit[:8] if len(cached_commit) >= 8 else cached_commit
-                    display_target = commit[:8] if len(commit) >= 8 else commit
-                    print(f"    ♻️  Cached archive for {module_path}@{version} targets {display_cached}, regenerating for {display_target}")
-
-            # Use persistent cache directory for repositories
-            repo_cache_dir = Path.home() / ".cache" / "oe-go-mod-fetcher" / "repos"
-            repo_cache_dir.mkdir(parents=True, exist_ok=True)
-
-            # Create a safe directory name from repo_url
-            import hashlib
-            repo_hash = hashlib.md5(repo_url.encode()).hexdigest()[:8]
-            safe_repo_name = module_path.replace('/', '_').replace('.', '_')
-            repo_dir = repo_cache_dir / f"{safe_repo_name}_{repo_hash}"
-            lock_id = f"{safe_repo_name}_{repo_hash}"
-
-            with self._acquire_repo_lock(lock_id):
-                # Remove incomplete caches that lack a .git directory
-                if repo_dir.exists() and not (repo_dir / ".git").exists():
-                    print(f"    ♻️  Removing incomplete repository cache for {module_path}")
-                    shutil.rmtree(repo_dir, ignore_errors=True)
-
-                # Clone repository if not already cached
-                if not repo_dir.exists():
-                    print(f"    📥 Cloning {repo_url} (first time)...")
-                    if not self._run_git_command_with_retry(
-                        ["git", "clone", repo_url, str(repo_dir)],
-                        cleanup=repo_dir,
-                        description=f"git clone {repo_url}"
-                    ):
-                        return False
-                else:
-                    print(f"    ♻️  Using cached repository for {module_path}")
-                    if not self._ensure_clean_worktree(repo_dir):
-                        print(f"    ♻️  Repository cache for {module_path} is dirty or locked; re-cloning...")
-                        shutil.rmtree(repo_dir, ignore_errors=True)
-                        if not self._run_git_command_with_retry(
-                            ["git", "clone", repo_url, str(repo_dir)],
-                            cleanup=repo_dir,
-                            description=f"git clone {repo_url}"
-                        ):
-                            return False
-
-                # Checkout specific commit with retries and fetch fallbacks
-                checkout_result = self._run_git_command_with_retry(
-                    ["git", "checkout", "--force", commit],
-                    cwd=repo_dir,
-                    description=f"git checkout {commit}",
-                    retries=1
-                )
-                if not checkout_result:
-                    fallback_commands = [
-                        ["git", "fetch", "--all"],
-                        ["git", "fetch", "origin", commit],
-                        ["git", "fetch", "--tags", "--force"],
-                    ]
-                    for fallback_cmd in fallback_commands:
-                        fetch_result = self._run_git_command_with_retry(
-                            fallback_cmd,
-                            cwd=repo_dir,
-                            description=" ".join(fallback_cmd),
-                            retries=1
-                        )
-                        if not fetch_result:
-                            continue
-                        checkout_result = self._run_git_command_with_retry(
-                            ["git", "checkout", "--force", commit],
-                            cwd=repo_dir,
-                            description=f"git checkout {commit}",
-                            retries=1
-                        )
-                        if checkout_result:
-                            break
-
-                if not checkout_result:
-                    print(f"    ♻️  Re-cloning repository for {module_path} due to persistent checkout failures")
-                    shutil.rmtree(repo_dir, ignore_errors=True)
-                    if not self._run_git_command_with_retry(
-                        ["git", "clone", repo_url, str(repo_dir)],
-                        cleanup=repo_dir,
-                        description=f"git clone {repo_url}"
-                    ):
-                        return False
-                    checkout_result = self._run_git_command_with_retry(
-                        ["git", "checkout", "--force", commit],
-                        cwd=repo_dir,
-                        description=f"git checkout {commit}",
-                        retries=1
-                    )
-                    if not checkout_result:
-                        print(f"    ⚠️  Failed to checkout commit {commit} in {repo_url}")
-                        return False
-
-            # Get file list from git repository (EXACT same method as module_cache_task.inc)
-            work_path = repo_dir
-            if subdir:
-                work_path = repo_dir / subdir
-
-            cmd = ["git", "ls-tree", "-r", "--name-only", "HEAD"]
-            if subdir:
-                cmd.append(subdir)
-
-            try:
-                files = subprocess.check_output(cmd, cwd=repo_dir, text=True).strip().split('\n')
-                files = [f for f in files if f.strip()]
-            except subprocess.CalledProcessError:
-                print(f"    ⚠️  Could not list files for {module_path}@{version}")
-                return False
-
-            # Create module zip file (EXACT same method as module_cache_task.inc)
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                module_prefix = f"{module_path}@{version}/"
-                expected_go_mod = f"{subdir}/go.mod" if subdir else "go.mod"
-
-                excluded_prefixes: List[str] = []
-                for file_path in files:
-                    if file_path.endswith('go.mod') and file_path != expected_go_mod:
-                        dir_path = os.path.dirname(file_path)
-                        if dir_path:
-                            excluded_prefixes.append(f"{dir_path}/")
-
-                for file_path in files:
-                    if subdir and not file_path.startswith(subdir):
-                        continue
-                    if any(file_path.startswith(excluded_prefix) for excluded_prefix in excluded_prefixes):
-                        continue
-                    if file_path.endswith('go.mod') and file_path != expected_go_mod:
-                        # Skip nested module go.mod files to match Go's module zip layout
-                        continue
-                    try:
-                        content = subprocess.check_output(
-                            ["git", "cat-file", "blob", f"HEAD:{file_path}"],
-                            cwd=repo_dir
-                        )
-                        archive_path = module_prefix + (file_path[len(subdir)+1:] if subdir else file_path)
-                        zf.writestr(archive_path, content)
-                    except subprocess.CalledProcessError:
-                        continue
-
-            # Create go.mod file
-            # For +incompatible versions, ALWAYS create minimal synthetic .mod (like proxy.golang.org)
-            # This is CRITICAL for checksum matching!
-            if '+incompatible' in version:
-                # Synthetic minimal .mod for pre-module versions
-                mod_content = f"module {module_path}\n".encode()
-                print(f"    📝 Creating synthetic .mod for +incompatible version: {module_path}")
-            else:
-                # For proper module versions, use repository's go.mod
-                mod_file = "go.mod"
-                if subdir:
-                    mod_file = f"{subdir}/go.mod"
-
-                try:
-                    mod_content = subprocess.check_output(
-                        ["git", "cat-file", "blob", f"HEAD:{mod_file}"],
-                        cwd=repo_dir
-                    )
-                except subprocess.CalledProcessError:
-                    # Synthesize go.mod if not found
-                    mod_content = f"module {module_path}\n".encode()
-
-            with open(mod_path, 'wb') as f:
-                f.write(mod_content)
-
-            # Persist generated artifacts for future runs
-            try:
-                if zip_path.exists():
-                    shutil.copy2(zip_path, persistent_zip)
-                if mod_path.exists():
-                    shutil.copy2(mod_path, persistent_mod)
-                persistent_commit.write_text(str(commit))
-            except OSError as cache_error:
-                print(f"    ⚠️  Unable to update cache for {module_path}@{version}: {cache_error}")
-
-            return True
-
-        except Exception as e:
-            print(f"    ⚠️  Failed to create hybrid zip for {module_path}: {e}")
-            return False
-
-    def create_hybrid_zip_for_module(self, module_info, cache_dir, temp_path):
-        """Create a zip file for a module using hybrid approach logic (same as module_cache_task.inc)."""
-        module_path = module_info.get('module_path', '')
-        version = module_info.get('version', '')
-        repo_url = module_info.get('repo_url', '')
-        commit = module_info.get('commit', '')
-        subdir = module_info.get('subdir', '')
-
-        if not all([module_path, version, repo_url, commit]):
-            print(f"    ⚠️  Skipping {module_path} - missing required info")
-            return False
-
-        try:
-            # Clone repository
-            repo_dir = temp_path / "repos" / module_path.replace("/", "_")
-            repo_dir.mkdir(parents=True, exist_ok=True)
-
-            # Clone and checkout
-            subprocess.run([
-                "git", "clone", "--quiet", repo_url, str(repo_dir)
-            ], check=True, capture_output=True)
-
-            subprocess.run([
-                "git", "checkout", "--quiet", commit
-            ], cwd=repo_dir, check=True, capture_output=True)
-
-            # Create module cache structure (same escaping as module_cache_task.inc)
-            def escape_module_path(path):
-                import re
-                return re.sub(r'([A-Z])', lambda m: '!' + m.group(1).lower(), path)
-
-            escaped_module = escape_module_path(module_path)
-            escaped_version = escape_module_path(version)
-
-            download_dir = cache_dir / "download" / escaped_module / "@v"
-            download_dir.mkdir(parents=True, exist_ok=True)
-
-            zip_path = download_dir / f"{escaped_version}.zip"
-            mod_path = download_dir / f"{escaped_version}.mod"
-
-            # Get file list from git (same as module_cache_task.inc)
-            cmd = ["git", "ls-tree", "-r", "--name-only", "HEAD"]
-            if subdir:
-                cmd.append(subdir)
-
-            files = subprocess.check_output(cmd, cwd=repo_dir, text=True).strip().split('\n')
-            files = [f for f in files if f.strip()]
-
-            # Create zip file with same logic as module_cache_task.inc
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-                module_prefix = f"{module_path}@{version}/"
-                expected_go_mod = f"{subdir}/go.mod" if subdir else "go.mod"
-
-                excluded_prefixes: List[str] = []
-                for file_path in files:
-                    if file_path.endswith('go.mod') and file_path != expected_go_mod:
-                        dir_path = os.path.dirname(file_path)
-                        if dir_path:
-                            excluded_prefixes.append(f"{dir_path}/")
-
-                for file_path in files:
-                    if subdir and not file_path.startswith(subdir):
-                        continue
-                    if any(file_path.startswith(excluded_prefix) for excluded_prefix in excluded_prefixes):
-                        continue
-                    if file_path.endswith('go.mod') and file_path != expected_go_mod:
-                        continue
-
-                    try:
-                        content = subprocess.check_output(
-                            ["git", "cat-file", "blob", f"HEAD:{file_path}"],
-                            cwd=repo_dir
-                        )
-                        archive_path = module_prefix + (file_path[len(subdir)+1:] if subdir else file_path)
-                        zf.writestr(archive_path, content)
-                    except subprocess.CalledProcessError:
-                        continue
-
-            # Create go.mod file
-            mod_file = "go.mod"
-            if subdir:
-                mod_file = f"{subdir}/go.mod"
-
-            try:
-                mod_content = subprocess.check_output(
-                    ["git", "cat-file", "blob", f"HEAD:{mod_file}"],
-                    cwd=repo_dir
-                )
-            except subprocess.CalledProcessError:
-                mod_content = f"module {module_path}\n".encode()
-
-            with open(mod_path, 'wb') as f:
-                f.write(mod_content)
-
-            return True
-
-        except Exception as e:
-            print(f"    ❌ Failed to create zip for {module_path}@{version}: {e}")
-            return False
-
-    def fallback_go_sum_generation(self):
-        """Fallback to creating synthetic go.sum.gomodgit with placeholder checksums."""
-        print("    🔄 Using fallback: creating synthetic go.sum.gomodgit...")
-
-        output_path = Path("go.sum.gomodgit")
-
-        # Look for original go.sum first
-        original_sum = None
-        temp_go_mod_dir = Path(self.temp_dir) if self.temp_dir else None
-        main_repo_dir = None
-
-        if temp_go_mod_dir:
-            # Check main repo first
-            main_repo_path = temp_go_mod_dir / "main_repo"
-            if main_repo_path.exists() and (main_repo_path / "go.sum").exists():
-                original_sum = main_repo_path / "go.sum"
-                main_repo_dir = main_repo_path
-            elif (temp_go_mod_dir / "go.sum").exists():
-                original_sum = temp_go_mod_dir / "go.sum"
-
-        if not original_sum:
-            current_sum = Path("go.sum")
-            if current_sum.exists():
-                original_sum = current_sum
-
-        if original_sum and original_sum.exists():
-            # Copy original go.sum as base, but deduplicate entries
-            seen = set()
-            with open(output_path, 'w') as out:
-                for line in original_sum.read_text().splitlines():
-                    line = line.strip()
-                    if not line or line.startswith('#'):
-                        continue
-                    # Extract module@version as key for deduplication
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        key = f"{parts[0]} {parts[1]}"  # module version
-                        if key not in seen:
-                            seen.add(key)
-                            out.write(line + '\n')
-            print(f"    ✅ Created go.sum.gomodgit from {original_sum} ({len(seen)} unique entries)")
-        else:
-            # Create minimal synthetic file
-            with open(output_path, 'w') as f:
-                # Add synthetic entries for successfully processed modules
-                if hasattr(self, 'processed_modules') and self.processed_modules:
-                    for module_info in self.processed_modules:
-                        module_path = module_info.get('module_path', '')
-                        version = module_info.get('version', '')
-                        if module_path and version and version != 'v0.0.0':
-                            # Use synthetic checksum that build will override
-                            f.write(f"{module_path} {version} h1:SYNTHETIC-CHECKSUM-BUILD-WILL-OVERRIDE\n")
-                            f.write(f"{module_path} {version}/go.mod h1:SYNTHETIC-CHECKSUM-BUILD-WILL-OVERRIDE\n")
-
-            print(f"    ⚠️  Created synthetic go.sum.gomodgit (build will generate actual checksums)")
-
-    def generate_checksums_from_zip_files(self, cache_dir):
-        """Generate go.sum.gomodgit by calculating checksums directly from hybrid zip files."""
-        print("    📋 Calculating checksums directly from hybrid zip files...")
-
-        import base64
-        import hashlib
-        import subprocess
-        from pathlib import Path
-
-        try:
-            # Import the dirhash library (same as Go's internal checksum calculator)
-            from golang.org.x.mod.sumdb import dirhash
-        except ImportError:
-            # Create a simple Go program to calculate checksums
-            print("    🔧 Using Go's dirhash library for checksum calculation...")
-
-        checksums = {}  # Track unique checksums by module@version
-        download_dir = cache_dir / "download"
-
-        if not download_dir.exists():
-            print(f"    ❌ Download directory not found: {download_dir}")
-            self.fallback_go_sum_generation()
-            return
-
-        print(f"    📂 Scanning zip files in: {download_dir}")
-
-        # Find all .zip files in the module cache
-        zip_files = list(download_dir.rglob("*.zip"))
-        print(f"    📦 Found {len(zip_files)} zip files to process")
-
-        if len(zip_files) == 0:
-            print("    ❌ No zip files found in cache")
-            self.fallback_go_sum_generation()
-            return
-
-        try:
-            dirhash_helper = self.get_dirhash_helper()
-        except FileNotFoundError as exc:
-            print(f"    ❌ {exc}")
-            self.fallback_go_sum_generation()
-            return
-
-        # Calculate checksum for each zip file
-        for zip_path in zip_files:
-            try:
-                # Extract module path and version from directory structure
-                # Path format: cache/download/github.com/owner/repo/@v/version.zip
-                parts = zip_path.parts
-                v_index = parts.index('@v')
-                download_index = parts.index('download')
-
-                # Get full module path from 'download' to '@v' (exclusive)
-                escaped_module_parts = parts[download_index + 1:v_index]
-                escaped_module = '/'.join(escaped_module_parts)
-                escaped_version = zip_path.stem  # filename without .zip
-
-                # Unescape module path and version (reverse the !lowercase escaping)
-                import re
-                def unescape_module_path(escaped):
-                    """Reverse the !lowercase escaping used by Go module cache"""
-                    def replace_escaped(match):
-                        return match.group(1).upper()
-                    return re.sub(r'!([a-z])', replace_escaped, escaped)
-
-                module_path = unescape_module_path(escaped_module)
-                version = unescape_module_path(escaped_version)
-
-                # Use Go to calculate the checksum (most reliable method)
-                result = subprocess.run(
-                    [str(dirhash_helper), str(zip_path)],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-
-                if result.returncode == 0:
-                    checksum = result.stdout.strip()
-                    module_version = f"{module_path} {version}"
-
-                    # Calculate go.mod checksum from OUR .mod file (NOT from sum.golang.org)
-                    # Our hybrid cache creates .mod files from raw git, so we MUST use those
-                    mod_file_path = zip_path.parent / f"{zip_path.stem}.mod"
-                    mod_checksum = None
-                    if mod_file_path.exists():
-                        import hashlib
-                        import base64
-
-                        mod_content = mod_file_path.read_bytes()
-                        file_hash = hashlib.sha256(mod_content).hexdigest()
-                        summary = f"{file_hash}  go.mod\n".encode('ascii')
-                        digest = hashlib.sha256(summary).digest()
-                        mod_checksum = "h1:" + base64.b64encode(digest).decode('ascii')
-
-                    # Store unique checksums (avoid duplicates)
-                    if module_version not in checksums:
-                        checksums[module_version] = {'zip': checksum, 'mod': mod_checksum}
-                        print(f"    ✓ {module_path}@{version}: {checksum[:20]}...")
-                else:
-                    print(f"    ⚠️  Failed to calculate checksum for {module_path}@{version}: {result.stderr}")
-
-            except Exception as e:
-                print(f"    ⚠️  Error processing {zip_path}: {e}")
-                continue
-
-        if not checksums:
-            print("    ❌ No checksums calculated successfully")
-            self.fallback_go_sum_generation()
-            return
-
-        # Write go.sum.gomodgit with calculated checksums
-        output_path = Path("go.sum.gomodgit")
-        with open(output_path, 'w') as f:
-            # Sort by module path for consistency
-            for module_version in sorted(checksums.keys()):
-                checksum_data = checksums[module_version]
-                zip_checksum = checksum_data['zip']
-                mod_checksum = checksum_data['mod']
-
-                # Write zip checksum
-                f.write(f"{module_version} {zip_checksum}\n")
-
-                # Write go.mod checksum (or placeholder if not available)
-                if mod_checksum:
-                    f.write(f"{module_version}/go.mod {mod_checksum}\n")
-                else:
-                    f.write(f"{module_version}/go.mod h1:0000000000000000000000000000000000000000000=\n")
-
-        print(f"    ✅ Generated go.sum.gomodgit with {len(checksums)} modules ({len(checksums)*2} entries)")
-        print(f"    🎯 Zip checksums: calculated from OUR hybrid zip files")
-        print(f"    🎯 go.mod checksums: calculated from OUR hybrid .mod files")
-        print(f"    📄 Output: {output_path}")
-        print(f"    ⚠️  These checksums match OUR hybrid cache, NOT Go proxy content!")
-
-    def create_version_info(self, repo_dir: Path, hash_val: str, ref: str, version: str):
-        """Create a version information file in the repository."""
-        import datetime
-        
-        version_info = f"""Module Version Information
-========================
-Go Module Version: {version}
-Git Hash: {hash_val}
-Git Ref: {ref}
-Checked out at: {datetime.datetime.now().isoformat()}
-"""
-        
-        info_file = repo_dir / '.go-module-info'
-        with open(info_file, 'w') as f:
-            f.write(version_info)
-
-    def create_vendor_json(self):
-        """Create vendor/vendor.json file for compatibility."""
-        if not self.vendor_dir:
-            return
-            
-        vendor_json = {
-            "comment": f"Generated by go_mod_fetcher.py v{VERSION}",
-            "ignore": "",
-            "package": [],
-            "rootPath": ""
-        }
-        
-        vendor_json_path = self.vendor_dir / "vendor.json"
-        with open(vendor_json_path, 'w') as f:
-            json.dump(vendor_json, f, indent=2)
-
-    def process_module(self, module_path: str, version: str) -> bool:
-        """Process a single module: download info, clone repo, checkout revision."""
-        # Check if we've already processed this module
-        module_key = (module_path, version)
-        if module_key in self.processed_modules:
-            print(f"    ⚡ Skipping {module_path}@{version} (already processed)")
-            return True
-        
-        print(f"    Getting module download info...")
-        
-        # Get module download info
-        download_info = self.get_module_download_info(module_path, version)
-        if not download_info:
-            print(f"    ⚠️  Could not get download info for {module_path}@{version}")
-            return False
-
-        # Check if VCS info is available
-        origin = download_info.get('Origin', {})
-        repo_url = None
-
-        if origin and origin.get('VCS') and origin.get('URL'):
-            # Use VCS info from go mod download if available
-            repo_url = origin['URL']
-            print(f"    📍 Using VCS URL from go mod download: {repo_url}")
-        else:
-            # Fallback: derive repository URL from module path for common hosting platforms
-            repo_url = self.derive_repo_url(module_path)
-            if repo_url:
-                print(f"    📍 Derived repository URL: {repo_url}")
-            else:
-                print(f"    ❌ Cannot derive repository URL for {module_path}")
-                return False
-
-        # Create repository directory
-        safe_name = self.safe_module_name(module_path)
-        repo_dir = self.output_dir / safe_name
-        repo_key = self._normalize_repo_identifier(repo_url)
-
-        # Clone or update repository
-        if not self.clone_or_update_repo(repo_url, repo_dir):
-            return False
-
-        if repo_key:
-            self._repo_requires_full_history(repo_dir, repo_key)
-
-        # Checkout specific revision
-        hash_val = origin.get('Hash', '') if origin else ''
-        ref = origin.get('Ref', '') if origin else ''
-
-        if not self.checkout_revision(repo_dir, hash_val, ref, version, repo_url):
-            return False
-
-        # Mark this module as processed
-        self.processed_modules.add(module_key)
-
-        # Create version info file
-        self.create_version_info(repo_dir, hash_val, ref, version)
-
-        # Copy source to vendor directory if requested (optimized)
-        if self.vendor_dir:
-            if not hasattr(self, 'vendor_modules'):
-                self.vendor_modules = []
-            self.vendor_modules.append({
-                'path': module_path,
-                'version': version,
-                'safe_name': self.safe_module_name(module_path)
-            })
-            
-            if not self.copy_source_to_vendor(repo_dir, module_path):
-                return False
-        else:
-            # Pre-cache package discovery for modules.txt generation even without vendor
-            if self.generate_oe_files:
-                self.discover_go_packages(repo_dir, module_path)
-
-        # Generate OpenEmbedded files if requested
-        if self.generate_oe_files:
-            # Always add module to oe_modules for repository analysis, even if SRC_URI generation fails
-            module_entry = {
-                'path': module_path,
-                'version': version,
-                'safe_name': self.safe_module_name(module_path)
-            }
-            if repo_key and self._repo_requires_full_history(repo_dir, repo_key):
-                module_entry['requires_full_history'] = True
-
-            src_uri = self.generate_oe_src_uri(module_path, repo_url, repo_dir)
-            if src_uri:
-                self.oe_src_uris.append(src_uri)
-                # Mark as successfully fetched
-                module_entry['fetch_success'] = True
-            else:
-                # Mark as failed but still include for repository analysis
-                module_entry['fetch_success'] = False
-                print(f"    ⚠️  SRC_URI generation failed, but including {module_path} in repository analysis")
-
-            self.oe_modules.append(module_entry)
-
-        return True
-
-    def fetch_all_modules(self, go_mod_source: str, include_indirect: bool = False, 
-                         git_repo: Optional[str] = None, git_ref: Optional[str] = None):
-        """Fetch all modules from go.mod file or Git repository."""
-        
-        print(f"fetch_all_modules called with:")
-        print(f"  go_mod_source: {go_mod_source}")
-        print(f"  include_indirect: {include_indirect}")  
-        print(f"  vendor_like: {self.vendor_like}")
-        print(f"  git_repo: {git_repo}")
-        print(f"  git_ref: {git_ref}")
-        print()
-        
-        # Determine the source of go.mod
-        if git_repo and git_ref:
-            print(f"Processing modules from Git repository: {git_repo}")
-            print(f"Using ref: {git_ref}")
-            
-            if not self.validate_git_ref(git_repo, git_ref):
-                print(f"❌ Git ref '{git_ref}' not found in repository {git_repo}")
-                return False
-            
-            try:
-                go_mod_path = self.fetch_go_mod_from_git(git_repo, git_ref, go_mod_source)
-            except Exception as e:
-                print(f"❌ Error fetching go.mod from Git: {e}")
-                return False
-        else:
-            go_mod_path = go_mod_source
-            print(f"Processing modules from local file: {go_mod_path}")
-        
-        print(f"Output directory: {self.output_dir}")
-        if self.vendor_dir:
-            print(f"Vendor directory: {self.vendor_dir}")
-        
-        # Parse go.mod for detailed dependency information (explicit/replaced markers)
-        print("🔍 Parsing go.mod for dependency markers...")
-        try:
-            self.direct_deps, self.indirect_deps, self.replace_directives = self.parse_go_mod_detailed(go_mod_path)
-        except Exception as e:
-            print(f"⚠️  Warning: Could not parse go.mod details: {e}")
-            print("    Will mark all dependencies as explicit")
-        
-        # Get dependencies based on the chosen strategy
-        try:
-            if self.vendor_like:
-                print("📦 Using vendor-like dependency resolution...")
-                modules = self.get_vendor_like_dependencies(go_mod_path)
-            elif self.include_indirect:
-                print("📄 Using comprehensive dependency resolution...")
-                modules = self.get_all_dependencies(go_mod_path)
-            else:
-                print("📋 Using direct dependencies only...")
-                modules = self.parse_go_mod(go_mod_path)
-        except Exception as e:
-            print(f"❌ Error getting dependencies: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
-        if not modules:
-            print("⚠️  No dependencies found")
-            return True
-
-        if self.vendor_like:
-            dependency_type = "vendor-like dependencies"
-        elif self.include_indirect:
-            dependency_type = "all dependencies (including transitive)"
-        else:
-            dependency_type = "direct dependencies"
-            
-        print(f"📊 Found {len(modules)} {dependency_type} to process")
-        
-        # Debug: Show first few modules for verification
-        print("🔍 First few modules to process:")
-        for i, (module_path, version) in enumerate(modules[:5]):
-            print(f"  {i+1}. {module_path}@{version}")
-        if len(modules) > 5:
-            print(f"  ... and {len(modules) - 5} more")
-        print()
-        
-        # Create vendor.json if using vendor directory
-        if self.vendor_dir:
-            self.create_vendor_json()
-        
-        success_count = 0
-        failed_modules = []
-        
-        for i, (module_path, version) in enumerate(modules, 1):
-            print(f"[{i}/{len(modules)}] Processing: {module_path}@{version}")
-            
-            if self.process_module(module_path, version):
-                print(f"  ✅ Successfully processed {module_path}")
-                success_count += 1
-            else:
-                print(f"  ❌ Failed to process {module_path}")
-                failed_modules.append((module_path, version))
-
-        print(f"\n📊 Completed! Successfully processed {success_count}/{len(modules)} modules")
-
-        # Ensure ALL vendor modules are included in oe_modules for repository analysis
-        if self.generate_oe_files and self.vendor_like and hasattr(self, 'vendor_packages'):
-            self.ensure_all_vendor_modules_included()
-
-        # Performance report
-        cache_hits = len(self.package_cache)
-        if cache_hits > 0:
-            print(f"⚡ Performance: {cache_hits} package discoveries cached (avoiding redundant scans)")
-
-        if failed_modules:
-            print(f"❌ Failed modules ({len(failed_modules)}):")
-            for module_path, version in failed_modules[:10]:
-                print(f"  - {module_path}@{version}")
-            if len(failed_modules) > 10:
-                print(f"  ... and {len(failed_modules) - 10} more failures")
-            
-            # Add only critical failed modules as stub entries for OpenEmbedded files
-            # Only include: explicit dependencies OR modules with replace directives
-            if self.generate_oe_files:
-                critical_failed_modules = []
-                for module_path, version in failed_modules:
-                    is_explicit = module_path in self.direct_deps
-                    is_replaced = module_path in self.replace_directives
-                    
-                    if is_explicit or is_replaced:
-                        critical_failed_modules.append((module_path, version))
-                        safe_name = self.safe_module_name(module_path)
-                        stub_entry = {
-                            'path': module_path,
-                            'version': version,
-                            'safe_name': safe_name,
-                            'is_stub': True  # Mark as stub entry
-                        }
-                        self.oe_modules.append(stub_entry)
-                        reason = []
-                        if is_explicit:
-                            reason.append("explicit")
-                        if is_replaced:
-                            reason.append("replaced")
-                        print(f"  📝 Added critical stub: {module_path}@{version} ({', '.join(reason)})")
-                
-                skipped_count = len(failed_modules) - len(critical_failed_modules)
-                if critical_failed_modules:
-                    print(f"\n📝 Added {len(critical_failed_modules)} critical failed modules as stub entries")
-                if skipped_count > 0:
-                    print(f"📝 Skipped {skipped_count} indirect failed modules (not adding to modules.txt)")
-        
-        print(f"📁 Check the modules in: {self.output_dir}")
-        if self.vendor_dir:
-            print(f"📦 Vendor source code in: {self.vendor_dir}")
-        
-        # Write OpenEmbedded files if requested
-        if self.generate_oe_files:
-            # Validate our repository structure against go mod vendor reference (non-blocking)
-            if hasattr(self, 'vendor_reference_dir') and self.vendor_reference_dir:
-                print("🔍 Validating repository structure against 'go mod vendor' reference...")
-                validation_success = self.validate_repository_structure()
-                if not validation_success:
-                    print("⚠️  Repository structure validation found issues, but continuing with file generation...")
-                    print("💡 Note: Validation issues may indicate potential build problems, but files will be generated anyway.")
-                else:
-                    print("✅ Repository structure validation passed!")
-
-            # Always generate files - let the actual build be the final judge
-            self.write_oe_files()
-        
-        # Clean up temporary files
-        self.cleanup_temp_files()
-        
-        return success_count == len(modules)
-
-    def validate_repository_structure(self):
-        """
-        Validate that our cloned repositories can recreate the go mod vendor structure.
-        This ensures our SRC_URI and relocation logic will work correctly.
-        """
-        print("    🔍 Creating test vendor structure from cloned repositories...")
-
-        # Ensure overrides are loaded for validation
-        if not hasattr(self, 'submodule_overrides') or not self.submodule_overrides:
-            self.submodule_overrides = self.load_submodule_overrides()
-            if self.submodule_overrides:
-                print(f"    📋 Loaded {len(self.submodule_overrides)} override relationships for validation")
-
-        # Create a temporary directory to simulate the build process
-        import tempfile
-        with tempfile.TemporaryDirectory() as test_vendor_dir:
-            test_vendor_path = Path(test_vendor_dir) / "vendor"
-            test_vendor_path.mkdir()
-
-            # Track validation issues
-            validation_issues = []
-            missing_packages = []
-
-            # Process each module that should be in vendor
-            for module_entry in self.oe_modules:
-                module_path = module_entry['path']
-
-                # Skip modules that failed to fetch (they won't be in build either)
-                if not module_entry.get('fetch_success', True):
-                    continue
-
-                # Check if this module should have packages according to reference
-                if module_path in self.vendor_packages:
-                    expected_packages = self.vendor_packages[module_path]
-
-                    # Find the source repository for this module
-                    source_repo_path = self.find_source_repository(module_path)
-                    if not source_repo_path:
-                        validation_issues.append(f"No source repository found for {module_path}")
-                        continue
-
-                    # Simulate the relocation process
-                    try:
-                        self.simulate_module_relocation(module_path, source_repo_path, test_vendor_path)
-                    except Exception as e:
-                        validation_issues.append(f"Failed to simulate relocation for {module_path}: {e}")
-                        continue
-
-                    # Check if expected packages exist in simulated vendor
-                    for package in expected_packages:
-                        expected_package_path = test_vendor_path / package.replace('/', os.sep)
-                        if not expected_package_path.exists():
-                            missing_packages.append(package)
-
-            # Report validation results
-            if validation_issues:
-                print(f"    ❌ {len(validation_issues)} validation issues found:")
-                for issue in validation_issues[:10]:  # Show first 10
-                    print(f"        • {issue}")
-                if len(validation_issues) > 10:
-                    print(f"        ... and {len(validation_issues) - 10} more")
-
-            if missing_packages:
-                print(f"    ❌ {len(missing_packages)} expected packages missing from simulated vendor:")
-                for pkg in missing_packages[:10]:  # Show first 10
-                    print(f"        • {pkg}")
-                if len(missing_packages) > 10:
-                    print(f"        ... and {len(missing_packages) - 10} more")
-
-                print("    ℹ️ Automatic override generation has been removed; please review the missing packages manually.")
-
-            if not validation_issues and not missing_packages:
-                print("    ✅ All expected packages can be created from cloned repositories")
-                return True
-            else:
-                print(f"    ❌ Validation failed: {len(validation_issues)} issues, {len(missing_packages)} missing packages")
-                return False
-
-    def find_source_repository(self, module_path: str) -> Path:
-        """Find the cloned repository that contains this module."""
-        module_safe_name = self.safe_module_name(module_path)
-
-        # Check for exact match first
-        exact_path = Path(self.output_dir) / module_safe_name
-        if exact_path.exists():
-            return exact_path
-
-        # Check for parent repository (e.g., example.org/foo/bar -> example_org_foo)
-        path_parts = module_path.split('/')
-        for i in range(len(path_parts) - 1, 0, -1):
-            parent_path = '/'.join(path_parts[:i])
-            parent_safe_name = self.safe_module_name(parent_path)
-            parent_repo_path = Path(self.output_dir) / parent_safe_name
-            if parent_repo_path.exists():
-                return parent_repo_path
-
-        return None
-
-    def simulate_module_relocation(self, module_path: str, source_repo_path: Path, test_vendor_path: Path):
-        """
-        Simulate the module relocation process to test if it will work during build.
-        This needs to recreate the same logic as our relocation.inc will use.
-        """
-        # Use the same submodule detection logic from repository analysis
-        submodule_relationships = self.detect_submodule_relationships_for_validation(source_repo_path, module_path)
-
-        if submodule_relationships:
-            # This repository provides multiple modules - copy the full repo and create submodule links
-            self.copy_full_repository_with_submodules(source_repo_path, test_vendor_path, submodule_relationships)
-        else:
-            # Single module - copy repository to module path
-            target_path = test_vendor_path / module_path.replace('/', os.sep)
-            self.copy_repository_contents(source_repo_path, target_path)
-
-    def detect_submodule_relationships_for_validation(self, repo_path: Path, primary_module: str) -> dict:
-        """
-        Detect if this repository provides multiple modules (submodules).
-        Returns mapping of module_path -> subpath within repository.
-        Uses both override.conf and generic detection.
-        """
-        relationships = {}
-
-        # First, check override.conf for explicit relationships
-        if hasattr(self, 'submodule_overrides') and self.submodule_overrides:
-            for override_module, (parent_module, subpath) in self.submodule_overrides.items():
-                # If this repository is the parent for an override, include it
-                if parent_module == primary_module:
-                    relationships[override_module] = subpath
-                    # Also include the parent module itself
-                    relationships[primary_module] = ''
-
-        # Check if this repository is supposed to provide other modules according to our analysis
-        repo_provides = []
-        for module_entry in self.oe_modules:
-            if module_entry.get('fetch_success', True):
-                # Check if this could be from the same repository
-                if self.could_be_same_repository(primary_module, module_entry['path']):
-                    repo_provides.append(module_entry['path'])
-
-        if len(repo_provides) > 1:
-            # Multiple modules from same repo - determine subpaths
-            for module_path in repo_provides:
-                if module_path not in relationships:  # Don't override explicit overrides
-                    subpath = self.determine_subpath_in_repository(primary_module, module_path)
-                    relationships[module_path] = subpath
-
-        return relationships
-
-    def could_be_same_repository(self, module1: str, module2: str) -> bool:
-        """Check if two modules could come from the same repository."""
-        # Simple heuristic: same domain and owner (first 3 parts for github.com/owner/repo)
-        parts1 = module1.split('/')[:3]
-        parts2 = module2.split('/')[:3]
-        return parts1 == parts2
-
-    def determine_subpath_in_repository(self, base_module: str, target_module: str) -> str:
-        """Determine the subpath of target_module relative to base_module repository."""
-        base_parts = base_module.split('/')
-        target_parts = target_module.split('/')
-
-        # Find common prefix
-        common_length = 0
-        for i in range(min(len(base_parts), len(target_parts))):
-            if base_parts[i] == target_parts[i]:
-                common_length = i + 1
-            else:
-                break
-
-        # If target has more parts after common prefix, that's the subpath
-        if len(target_parts) > common_length:
-            return '/'.join(target_parts[common_length:])
-        else:
-            return ''
-
-    def copy_full_repository_with_submodules(self, source_repo_path: Path, test_vendor_path: Path, relationships: dict):
-        """Copy repository and create all expected submodule paths."""
-        import shutil
-
-        for module_path, subpath in relationships.items():
-            target_path = test_vendor_path / module_path.replace('/', os.sep)
-
-            if subpath:
-                # Copy subpath from repository
-                source_subpath = source_repo_path / subpath
-                if source_subpath.exists():
-                    self.copy_repository_contents(source_subpath, target_path)
-            else:
-                # Copy full repository
-                self.copy_repository_contents(source_repo_path, target_path)
-
-    def copy_repository_contents(self, source_path: Path, target_path: Path):
-        """Copy repository contents to simulate relocation."""
-        import shutil
-
-        if not source_path.exists():
-            return
-
-        target_path.mkdir(parents=True, exist_ok=True)
-
-        # Copy all contents recursively
-        for item in source_path.iterdir():
-            if item.name.startswith('.git'):
-                continue  # Skip git metadata
-
-            target_item = target_path / item.name
-            try:
-                if item.is_dir():
-                    shutil.copytree(item, target_item, dirs_exist_ok=True)
-                else:
-                    shutil.copy2(item, target_item)
-            except Exception:
-                pass  # Skip files that can't be copied
-
-    def get_repository_module_for_path(self, module_path: str) -> str:
-        """Get the repository module that provides this module path."""
-        for module_entry in self.oe_modules:
-            if module_entry['path'] == module_path:
-                return module_path
-        return module_path
-
-    def generate_fallback_src_uri(self, module_path: str, safe_name: str) -> Optional[str]:
-        """Try to create a generic SRC_URI for modules missing from the primary fetch."""
-        def strip_version_suffix(path: str) -> str:
-            return re.sub(r'/v\d+$', '', path)
-
-        # Attempt to derive a usable repository URL without per-module knowledge
-        repo_url = self.derive_repo_url(module_path)
-        if not repo_url:
-            cleaned_path = strip_version_suffix(module_path)
-            repo_url = f"https://{cleaned_path}"
-
-        if not repo_url.startswith('http'):
-            print(f"    ⚠️  Cannot derive a repository URL for {module_path} generically")
-            return None
-
-        # Resolve a commit to pin the source deterministically
-        commit_hash = None
-        for ref in ('HEAD', 'main', 'master'):
-            try:
-                result = subprocess.run(
-                    ['git', 'ls-remote', repo_url, ref],
-                    capture_output=True,
-                    text=True,
-                    timeout=30
-                )
-            except subprocess.TimeoutExpired:
-                print(f"    ⚠️  Timeout determining commit for {repo_url} ({ref})")
-                return None
-
-            if result.returncode == 0 and result.stdout.strip():
-                commit_hash = result.stdout.strip().split()[0]
-                if ref != 'HEAD':
-                    print(f"    📍 Found commit {commit_hash} for {repo_url} ({ref})")
-                break
-
-        if not commit_hash:
-            print(f"    ⚠️  Could not determine a commit for {repo_url}; skipping fallback")
-            return None
-
-        base_url = repo_url.replace('https://', '').replace('http://', '')
-        src_uri = f"git://{base_url};protocol=https;nobranch=1;rev={commit_hash}"
-
-        repo_key = self._normalize_repo_identifier(repo_url)
-        if repo_key in self.repos_requiring_deep_fetch:
-            print(f"    🔄 Generated fallback SRC_URI for {module_path}: {repo_url}@{commit_hash} (full history required)")
-        else:
-            src_uri += ';shallow=1'
-            print(f"    🔄 Generated fallback SRC_URI for {module_path}: {repo_url}@{commit_hash} (shallow)")
-
-        src_uri += f";destsuffix=${{GO_SRCURI_DESTSUFFIX}}/modules/{safe_name}"
-        return src_uri
-
-
-    def ensure_all_vendor_modules_included(self):
-        """
-        Ensure ALL modules from vendor analysis are included in oe_modules,
-        and attempt to generate proper SRC_URI entries for missing vendor modules.
-        This is critical for complete repository analysis and build success.
-        """
-        print("🔍 Ensuring all vendor modules are included for repository analysis...")
-
-        # Get list of modules already in oe_modules
-        existing_modules = {m['path'] for m in self.oe_modules}
-
-        # Get all modules from vendor analysis (modules.txt)
-        vendor_modules = set(self.vendor_packages.keys()) if self.vendor_packages else set()
-
-        # Find missing modules
-        missing_modules = vendor_modules - existing_modules
-
-        if missing_modules:
-            print(f"    📋 Found {len(missing_modules)} modules missing from oe_modules")
-            print(f"    🔧 Processing missing vendor modules with proper SRC_URI generation...")
-
-            success_count = 0
-            ordered_missing = sorted(missing_modules)
-            for index, module_path in enumerate(ordered_missing, start=1):
-                # Try to get version from vendor analysis (this should have been parsed)
-                version = "unknown"
-                if hasattr(self, 'vendor_module_info') and module_path in self.vendor_module_info:
-                    version = self.vendor_module_info[module_path].get('version', 'unknown')
-
-                print(f"      🔄 [{index}/{len(ordered_missing)}] Processing missing vendor module: {module_path}@{version}")
-
-                # Try to process this module properly with SRC_URI generation
-                if self.process_module(module_path, version):
-                    print(f"      ✅ Successfully processed {module_path}")
-                    success_count += 1
-                else:
-                    print(f"      ⚠️  Failed to process {module_path}, adding with fallback SRC_URI...")
-
-                    # Generate fallback SRC_URI for this module
-                    safe_name = self.safe_module_name(module_path)
-                    fallback_src_uri = self.generate_fallback_src_uri(module_path, safe_name)
-
-                    if fallback_src_uri:
-                        self.oe_src_uris.append(fallback_src_uri)
-                        print(f"      📁 Generated fallback SRC_URI for {module_path}")
-
-                    # Add module entry for repository analysis
-                    missing_entry = {
-                        'path': module_path,
-                        'version': version,
-                        'safe_name': safe_name,
-                        'fetch_success': bool(fallback_src_uri),
-                        'fallback_generated': True  # Mark as fallback-generated
-                    }
-                    self.oe_modules.append(missing_entry)
-
-            print(f"    ✅ Processed {success_count}/{len(missing_modules)} missing vendor modules successfully")
-            print(f"    ✅ Repository analysis now includes all {len(vendor_modules)} vendor modules")
-        else:
-            print(f"    ✅ All {len(vendor_modules)} vendor modules already included in oe_modules")
-
-
-def detect_current_git_context() -> Optional[Dict[str, Optional[str]]]:
-    """Return information about the current Git repository, if any."""
+def git_ls_remote(url: str, ref: str) -> Optional[str]:
+    global LS_REMOTE_CACHE_DIRTY
+    key = (url, ref)
+    if key in LS_REMOTE_CACHE:
+        return LS_REMOTE_CACHE[key]
     try:
-        inside = subprocess.run(
-            ["git", "rev-parse", "--is-inside-work-tree"],
+        result = subprocess.run(
+            ["git", "ls-remote", url, ref],
             capture_output=True,
             text=True,
             check=True,
         )
-    except (FileNotFoundError, subprocess.CalledProcessError):
+        for line in result.stdout.strip().splitlines():
+            if not line:
+                continue
+            LS_REMOTE_CACHE[key] = line.split()[0]
+            LS_REMOTE_CACHE_DIRTY = True
+            return LS_REMOTE_CACHE[key]
+    except subprocess.CalledProcessError:
+        LS_REMOTE_CACHE[key] = None
+        LS_REMOTE_CACHE_DIRTY = True
+        return None
+    return None
+
+
+def get_github_mirror_url(vcs_url: str) -> Optional[str]:
+    """
+    Get GitHub mirror URL for golang.org/x repositories.
+
+    golang.org/x repositories are mirrored on GitHub at github.com/golang/*.
+    These mirrors are often more reliable than go.googlesource.com.
+
+    Args:
+        vcs_url: Original VCS URL (e.g., https://go.googlesource.com/tools)
+
+    Returns:
+        GitHub mirror URL if applicable, None otherwise
+    """
+    if 'go.googlesource.com' in vcs_url:
+        # Extract package name from URL
+        # https://go.googlesource.com/tools -> tools
+        pkg_name = vcs_url.rstrip('/').split('/')[-1]
+        return f"https://github.com/golang/{pkg_name}"
+    return None
+
+
+def resolve_pseudo_version_commit(vcs_url: str, timestamp_str: str, short_commit: str,
+                                   clone_cache_dir: Optional[Path] = None) -> Optional[str]:
+    """
+    Resolve a pseudo-version's short commit hash to a full 40-character hash.
+
+    This function clones (or updates) a git repository and searches the commit history
+    for a commit that matches both the timestamp and short commit hash from a pseudo-version.
+
+    For golang.org/x repositories, automatically tries GitHub mirrors if the primary
+    source fails (go.googlesource.com can be slow or unreliable).
+
+    Args:
+        vcs_url: Git repository URL
+        timestamp_str: Timestamp from pseudo-version (format: YYYYMMDDHHmmss)
+        short_commit: Short commit hash (12 characters) from pseudo-version
+        clone_cache_dir: Optional directory to cache cloned repositories (recommended)
+
+    Returns:
+        Full 40-character commit hash, or None if not found
+    """
+    # Parse timestamp
+    try:
+        dt = datetime.strptime(timestamp_str, "%Y%m%d%H%M%S")
+        # Search window: ±1 day around timestamp for efficiency
+        since = (dt - timedelta(days=1)).isoformat()
+        until = (dt + timedelta(days=1)).isoformat()
+    except ValueError:
         return None
 
-    if inside.stdout.strip().lower() != "true":
-        return None
+    # Try primary URL and GitHub mirror (if applicable)
+    urls_to_try = [vcs_url]
+    github_mirror = get_github_mirror_url(vcs_url)
+    if github_mirror:
+        urls_to_try.append(github_mirror)
 
-    def _run_git_cmd(args: List[str]) -> Optional[str]:
+    for try_url in urls_to_try:
+        # Determine clone directory based on URL being tried
+        if clone_cache_dir:
+            clone_cache_dir.mkdir(parents=True, exist_ok=True)
+            repo_hash = hashlib.sha256(try_url.encode()).hexdigest()[:16]
+            clone_dir = clone_cache_dir / f"repo_{repo_hash}"
+        else:
+            clone_dir = Path(tempfile.mkdtemp(prefix="pseudo-resolve-"))
+
         try:
-            result = subprocess.run(args, capture_output=True, text=True, check=True)
-            return result.stdout.strip() or None
-        except subprocess.CalledProcessError:
-            return None
+            # Clone or update repository
+            if clone_dir.exists() and (clone_dir / 'HEAD').exists():
+                # Repository already cloned, fetch latest
+                try:
+                    subprocess.run(
+                        ['git', 'fetch', '--all', '--quiet'],
+                        cwd=clone_dir,
+                        capture_output=True,
+                        check=True,
+                        timeout=60
+                    )
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                    # Fetch failed, try to use existing clone anyway
+                    pass
+            else:
+                # Clone repository (bare clone for efficiency)
+                if clone_dir.exists():
+                    shutil.rmtree(clone_dir)
+                clone_dir.mkdir(parents=True, exist_ok=True)
 
-    toplevel = _run_git_cmd(["git", "rev-parse", "--show-toplevel"])
-    commit = _run_git_cmd(["git", "rev-parse", "HEAD"])
-    branch = _run_git_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+                subprocess.run(
+                    ['git', 'clone', '--bare', '--quiet', try_url, str(clone_dir)],
+                    capture_output=True,
+                    check=True,
+                    timeout=300  # 5 minute timeout
+                )
 
-    remote_url = _run_git_cmd(["git", "config", "--get", "remote.origin.url"])
-    if not remote_url:
-        remote_output = _run_git_cmd(["git", "remote", "-v"])
-        if remote_output:
-            seen = {}
-            for line in remote_output.splitlines():
+            # Search for commits matching timestamp and short hash
+            result = subprocess.run(
+                ['git', 'log', '--all', '--format=%H %ct',
+                 f'--since={since}', f'--until={until}'],
+                cwd=clone_dir,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=30
+            )
+
+            # Find commit with matching short hash prefix
+            for line in result.stdout.strip().splitlines():
+                if not line:
+                    continue
                 parts = line.split()
-                if len(parts) >= 2:
-                    name, url = parts[0], parts[1]
-                    if name not in seen:
-                        seen[name] = url
-            if "origin" in seen:
-                remote_url = seen["origin"]
-            elif seen:
-                remote_url = next(iter(seen.values()))
+                if len(parts) < 2:
+                    continue
+                full_hash = parts[0]
+                if full_hash.startswith(short_commit):
+                    return full_hash
 
+            # Commit not found in this repository, try next URL
+            continue
+
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            # Clone/fetch failed, try next URL if available
+            if not clone_cache_dir and clone_dir.exists():
+                shutil.rmtree(clone_dir)
+            continue
+        finally:
+            # Clean up temp directory if we created one
+            if not clone_cache_dir and clone_dir.exists():
+                try:
+                    shutil.rmtree(clone_dir)
+                except:
+                    pass
+
+    # All URLs failed
+    return None
+
+
+def derive_timestamp_from_version(version: str) -> str:
+    pseudo = re.match(r'v\d+\.\d+\.\d+-(\d{14})-', version)
+    if pseudo:
+        try:
+            return datetime.strptime(pseudo.group(1), "%Y%m%d%H%M%S").strftime("%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            pass
+    return "1970-01-01T00:00:00Z"
+
+
+def _cache_metadata_key(module_path: str, version: str) -> Tuple[str, str]:
+    return (module_path, version)
+
+
+def load_metadata_cache_file() -> None:
+    if not MODULE_METADATA_CACHE_PATH.exists():
+        return
+    try:
+        data = json.loads(MODULE_METADATA_CACHE_PATH.read_text())
+    except Exception:
+        return
+    for key, value in data.items():
+        try:
+            module_path, version = key.split("|||", 1)
+        except ValueError:
+            continue
+        if not isinstance(value, dict):
+            continue
+        MODULE_METADATA_CACHE[_cache_metadata_key(module_path, version)] = {
+            'vcs_url': value.get('vcs_url', ''),
+            'commit': value.get('commit', ''),
+            'timestamp': value.get('timestamp', ''),
+            'subdir': value.get('subdir', ''),
+        }
+
+
+def save_metadata_cache() -> None:
+    if not MODULE_METADATA_CACHE_DIRTY:
+        return
+    payload = {
+        f"{module}|||{version}": value
+        for (module, version), value in MODULE_METADATA_CACHE.items()
+    }
+    try:
+        MODULE_METADATA_CACHE_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    except Exception:
+        pass
+
+
+def update_metadata_cache(module_path: str, version: str, vcs_url: str, commit: str,
+                          timestamp: str = "", subdir: str = "", dirty: bool = True) -> None:
+    global MODULE_METADATA_CACHE_DIRTY
+    key = _cache_metadata_key(module_path, version)
+    value = {
+        'vcs_url': vcs_url or '',
+        'commit': commit or '',
+        'timestamp': timestamp or '',
+        'subdir': subdir or '',
+    }
+    if MODULE_METADATA_CACHE.get(key) != value:
+        MODULE_METADATA_CACHE[key] = value
+        if dirty:
+            MODULE_METADATA_CACHE_DIRTY = True
+
+
+def get_cached_metadata(module_path: str, version: str) -> Optional[dict]:
+    entry = MODULE_METADATA_CACHE.get(_cache_metadata_key(module_path, version))
+    if not entry:
+        return None
+    timestamp = entry.get('timestamp') or derive_timestamp_from_version(version)
     return {
-        "toplevel": toplevel,
-        "commit": commit,
-        "branch": branch,
-        "remote": remote_url,
+        "module_path": module_path,
+        "version": version,
+        "vcs_url": entry.get('vcs_url', ''),
+        "vcs_hash": entry.get('commit', ''),
+        "vcs_ref": "",
+        "timestamp": timestamp,
+        "subdir": entry.get('subdir', ''),
     }
 
 
-def prompt_yes_no(question: str, default: bool = True) -> bool:
-    """Prompt the user with a yes/no question and return the answer."""
-    if default:
-        prompt = " [Y/n] "
-    else:
-        prompt = " [y/N] "
+def load_metadata_from_inc(output_dir: Path) -> None:
+    git_inc = output_dir / "go-mod-git.inc"
+    cache_inc = output_dir / "go-mod-cache.inc"
 
-    while True:
+    sha_to_url: Dict[str, str] = {}
+    if git_inc.exists():
+        for line in git_inc.read_text().splitlines():
+            line = line.strip()
+            if not line.startswith('SRC_URI'):
+                continue
+            if '"' not in line:
+                continue
+            content = line.split('"', 1)[1].rsplit('"', 1)[0]
+            parts = [p for p in content.split(';') if p]
+            if not parts:
+                continue
+            url_part = parts[0]
+            dest_sha = None
+            for part in parts[1:]:
+                if part.startswith('destsuffix='):
+                    dest = part.split('=', 1)[1]
+                    dest_sha = dest.rsplit('/', 1)[-1]
+                    break
+            if not dest_sha:
+                continue
+            if url_part.startswith('git://'):
+                url_https = 'https://' + url_part[6:]
+            else:
+                url_https = url_part
+            sha_to_url[dest_sha] = url_https
+
+    if cache_inc.exists():
+        text = cache_inc.read_text()
+        marker = "GO_MODULE_CACHE_DATA = '"
+        if marker in text:
+            start = text.index(marker) + len(marker)
+            try:
+                end = text.index("'\n\n", start)
+            except ValueError:
+                end = len(text)
+            try:
+                data = json.loads(text[start:end])
+            except Exception:
+                data = []
+            for entry in data:
+                module_path = entry.get('module')
+                version = entry.get('version')
+                sha = entry.get('vcs_hash')
+                commit = entry.get('commit')
+                timestamp = entry.get('timestamp', '')
+                subdir = entry.get('subdir', '')
+                if not module_path or not version:
+                    continue
+                vcs_url = sha_to_url.get(sha, '')
+                if not vcs_url:
+                    continue
+                # Skip entries with invalid commit hashes
+                if commit and len(commit) != 40:
+                    continue
+                if not timestamp:
+                    timestamp = derive_timestamp_from_version(version)
+                update_metadata_cache(module_path, version, vcs_url, commit or '', timestamp, subdir, dirty=False)
+
+
+def load_metadata_from_module_cache_task(output_dir: Path) -> None:
+    legacy_path = output_dir / "module_cache_task.inc"
+    if not legacy_path.exists():
+        return
+    import ast
+    pattern = re.compile(r'\(\{.*?\}\)', re.DOTALL)
+    text = legacy_path.read_text()
+    for match in pattern.finditer(text):
+        blob = match.group()[1:-1]  # strip parentheses
         try:
-            answer = input(question + prompt).strip().lower()
-        except EOFError:
-            return default
+            entry = ast.literal_eval(blob)
+        except Exception:
+            continue
+        module_path = entry.get('module')
+        version = entry.get('version')
+        vcs_url = entry.get('repo_url') or entry.get('url') or ''
+        commit = entry.get('commit') or ''
+        subdir = entry.get('subdir', '')
+        if not module_path or not version or not vcs_url or not commit:
+            continue
+        if vcs_url.startswith('git://'):
+            vcs_url = 'https://' + vcs_url[6:]
+        timestamp = derive_timestamp_from_version(version)
+        update_metadata_cache(module_path, version, vcs_url, commit, timestamp, subdir, dirty=True)
 
-        if not answer:
-            return default
-        if answer in ("y", "yes"):
-            return True
-        if answer in ("n", "no"):
+
+def bootstrap_metadata_cache(output_dir: Path) -> None:
+    load_metadata_cache_file()
+    load_metadata_from_inc(output_dir)
+    load_metadata_from_module_cache_task(output_dir)
+
+
+def resolve_module_metadata(module_path: str, version: str) -> Optional[dict]:
+    parts = module_path.split('/')
+
+    # Handle gopkg.in special case
+    if parts[0] == 'gopkg.in':
+        # gopkg.in/pkg.v3 -> github.com/go-pkg/pkg
+        # gopkg.in/user/pkg.v3 -> github.com/user/pkg
+        if len(parts) == 2:
+            # gopkg.in/pkg.v3
+            pkg_name = parts[1].rsplit('.', 1)[0]  # Remove .vN suffix
+            vcs_url = f"https://github.com/go-{pkg_name}/{pkg_name}"
+            base_repo = f"github.com/go-{pkg_name}/{pkg_name}"
+        elif len(parts) == 3:
+            # gopkg.in/user/pkg.v3
+            user = parts[1]
+            pkg_name = parts[2].rsplit('.', 1)[0]  # Remove .vN suffix
+            vcs_url = f"https://github.com/{user}/{pkg_name}"
+            base_repo = f"github.com/{user}/{pkg_name}"
+        else:
+            print(f"  ⚠️  Unable to derive repository for gopkg.in path {module_path}@{version}")
+            return None
+        subdir = ''
+    elif len(parts) < 3:
+        print(f"  ⚠️  Unable to derive repository for {module_path}@{version}")
+        return None
+    else:
+        base_repo = '/'.join(parts[:3])
+        # Calculate subdir from module path, but strip version suffixes (v2, v3, v11, etc.)
+        if len(parts) > 3:
+            subdir_parts = parts[3:]
+            # Remove trailing version suffix if present (e.g., v2, v3, v11)
+            if subdir_parts and subdir_parts[-1].startswith('v') and subdir_parts[-1][1:].isdigit():
+                subdir_parts = subdir_parts[:-1]
+            subdir = '/'.join(subdir_parts) if subdir_parts else ''
+        else:
+            subdir = ''
+        vcs_url = f"https://{base_repo}"
+
+    tag = version.split('+')[0]
+    commit = None
+    pseudo_match = re.match(r'v\d+\.\d+\.\d+-\d{14}-([0-9a-fA-F]+)', tag)
+    expected_commit = pseudo_match.group(1) if pseudo_match else None
+
+    cached = get_cached_metadata(module_path, version)
+    if cached and cached.get('vcs_url') and cached.get('vcs_hash'):
+        cached_commit = cached.get('vcs_hash') or ''
+        if expected_commit and cached_commit and not cached_commit.startswith(expected_commit):
+            cached = None
+        if cached:
+            return cached
+
+    if pseudo_match:
+        short_commit = expected_commit
+        commit = git_ls_remote(vcs_url, short_commit)
+        if not commit:
+            # Can't expand short commit - BitBake needs full hash
+            cached = get_cached_metadata(module_path, version)
+            if cached and cached.get('vcs_hash'):
+                return cached
+            return None
+    else:
+        commit = git_ls_remote(vcs_url, f"refs/tags/{tag}") or git_ls_remote(vcs_url, tag)
+
+    if not commit:
+        cached = get_cached_metadata(module_path, version)
+        if cached and cached.get('vcs_hash'):
+            return cached
+        # Don't print warning here - caller will handle skipping indirect-only deps
+        return None
+
+    if pseudo_match:
+        timestamp_raw = tag.split('-')[1]
+        timestamp = datetime.strptime(timestamp_raw, "%Y%m%d%H%M%S").strftime("%Y-%m-%dT%H:%M:%SZ")
+    else:
+        timestamp = "1970-01-01T00:00:00Z"
+
+    update_metadata_cache(module_path, version, vcs_url, commit, timestamp, subdir, dirty=True)
+
+    return {
+        "module_path": module_path,
+        "version": version,
+        "vcs_url": vcs_url,
+        "vcs_hash": commit,
+        "vcs_ref": "",
+        "timestamp": timestamp,
+        "subdir": subdir,
+    }
+
+
+MODULE_CACHE_TASK_HEADER = textwrap.dedent(r'''
+DEPENDS += "go-dirhash-native"
+
+python do_create_module_cache() {
+    """
+    Build Go module cache from downloaded git repositories.
+    This creates the same cache structure as oe-core's gomod.bbclass.
+    """
+    import hashlib
+    import json
+    import os
+    import shutil
+    import subprocess
+    import zipfile
+    import stat
+    from pathlib import Path
+    from datetime import datetime
+
+    go_helper = Path(d.getVar('STAGING_BINDIR_NATIVE')) / "dirhash"
+    if not go_helper.exists():
+        bb.fatal(f"Go checksum helper not found at {go_helper}. Ensure go-dirhash-native is in DEPENDS.")
+
+    go_sum_hashes = {}
+    go_sum_path = Path(d.getVar('S')) / "src" / "import" / "go.sum"
+    if go_sum_path.exists():
+        with open(go_sum_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) != 3:
+                    continue
+                mod, ver, hash_value = parts
+                if mod.endswith('/go.mod') or not hash_value.startswith('h1:'):
+                    continue
+                key = f"{mod}@{ver}"
+                go_sum_hashes.setdefault(key, hash_value)
+
+    def escape_module_path(path):
+        """Escape capital letters using exclamation points (same as BitBake gomod.py)"""
+        import re
+        return re.sub(r'([A-Z])', lambda m: '!' + m.group(1).lower(), path)
+
+    def sanitize_module_name(name):
+        """Remove quotes from module names"""
+        if not name:
+            return name
+        stripped = name.strip()
+        if len(stripped) >= 2 and stripped[0] == '"' and stripped[-1] == '"':
+            return stripped[1:-1]
+        return stripped
+
+    def create_module_zip(module_path, version, vcs_path, subdir, timestamp, commit):
+        """Create module zip file from git repository"""
+        module_path = sanitize_module_name(module_path)
+        escaped_module = escape_module_path(module_path)
+        escaped_version = escape_module_path(version)
+
+        # Create cache directory structure
+        workdir = Path(d.getVar('WORKDIR'))
+        s = Path(d.getVar('S'))
+        cache_dir = s / "pkg" / "mod" / "cache" / "download"
+        download_dir = cache_dir / escaped_module / "@v"
+        download_dir.mkdir(parents=True, exist_ok=True)
+
+        bb.note(f"Creating cache for {module_path}@{version}")
+
+        # 1. Create .info file
+        info_path = download_dir / f"{escaped_version}.info"
+        info_data = {
+            "Version": version,
+            "Time": timestamp
+        }
+        with open(info_path, 'w') as f:
+            json.dump(info_data, f)
+        bb.debug(1, f"Created {info_path}")
+
+        # 2. Create .mod file
+        mod_path = download_dir / f"{escaped_version}.mod"
+        effective_subdir = subdir or ""
+
+        def candidate_subdirs():
+            candidates = []
+            parts = module_path.split('/')
+            if len(parts) >= 4:
+                extra = '/'.join(parts[3:])
+                if extra:
+                    candidates.append(extra)
+
+            if effective_subdir:
+                candidates.insert(0, effective_subdir)
+            else:
+                candidates.append('')
+
+            suffix = parts[-1]
+            if suffix.startswith('v') and suffix[1:].isdigit():
+                suffix_path = f"{effective_subdir}/{suffix}" if effective_subdir else suffix
+                if suffix_path not in candidates:
+                    candidates.insert(0, suffix_path)
+
+            if '' not in candidates:
+                candidates.append('')
+            return candidates
+
+        gomod_file = None
+        for candidate in candidate_subdirs():
+            path_candidate = Path(vcs_path) / candidate / "go.mod" if candidate else Path(vcs_path) / "go.mod"
+            if path_candidate.exists():
+                gomod_file = path_candidate
+                if candidate != effective_subdir:
+                    effective_subdir = candidate
+                    subdir = effective_subdir
+                    module['subdir'] = effective_subdir
+                break
+
+        if gomod_file is None:
+            gomod_file = Path(vcs_path) / effective_subdir / "go.mod" if effective_subdir else Path(vcs_path) / "go.mod"
+
+        def synthesize_go_mod(modname):
+            sanitized = sanitize_module_name(modname)
+            return f"module {sanitized}\n".encode('utf-8')
+
+        mod_content = None
+
+        def is_vendored_package(rel_path):
+            if rel_path.startswith("vendor/"):
+                prefix_len = len("vendor/")
+            else:
+                idx = rel_path.find("/vendor/")
+                if idx < 0:
+                    return False
+                prefix_len = len("/vendor/")
+            return "/" in rel_path[prefix_len:]
+
+        if '+incompatible' in version:
+            mod_content = synthesize_go_mod(module_path)
+            bb.debug(1, f"Synthesizing go.mod for +incompatible module {module_path}@{version}")
+        elif gomod_file.exists():
+            mod_content = gomod_file.read_bytes()
+        else:
+            bb.debug(1, f"go.mod not found at {gomod_file}")
+            mod_content = synthesize_go_mod(module_path)
+
+        with open(mod_path, 'wb') as f:
+            f.write(mod_content)
+        bb.debug(1, f"Created {mod_path}")
+
+        license_blobs = []
+        if effective_subdir:
+            license_candidates = [
+                "LICENSE",
+                "LICENSE.txt",
+                "LICENSE.md",
+                "LICENCE",
+                "COPYING",
+                "COPYING.txt",
+                "COPYING.md",
+            ]
+            for candidate in license_candidates:
+                try:
+                    content = subprocess.check_output(
+                        ["git", "show", f"{commit}:{candidate}"],
+                        cwd=vcs_path,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except subprocess.CalledProcessError:
+                    continue
+                license_blobs.append((Path(candidate).name, content))
+                break
+
+        # 3. Create .zip file using git archive + filtering
+        zip_path = download_dir / f"{escaped_version}.zip"
+        zip_prefix = f"{module_path}@{version}/"
+        module_key = f"{module_path}@{version}"
+        expected_hash = go_sum_hashes.get(module_key)
+
+        import tarfile
+        import tempfile
+
+        def assemble_zip(include_vendor_modules: bool) -> bool:
+            try:
+                with tempfile.TemporaryDirectory(dir=str(download_dir)) as tmpdir:
+                    tar_path = Path(tmpdir) / "archive.tar"
+                    archive_cmd = ["git", "archive", "--format=tar", "-o", str(tar_path), commit]
+                    if subdir:
+                        archive_cmd.append(subdir)
+
+                    subprocess.run(archive_cmd, cwd=str(vcs_path), check=True, capture_output=True)
+
+                    with tarfile.open(tar_path, 'r') as tf:
+                        tf.extractall(tmpdir)
+                    tar_path.unlink(missing_ok=True)
+
+                    extract_root = Path(tmpdir)
+                    if subdir:
+                        extract_root = extract_root / subdir
+
+                    excluded_prefixes = []
+                    for gomod_file in extract_root.rglob("go.mod"):
+                        rel_path = gomod_file.relative_to(extract_root).as_posix()
+                        if rel_path != "go.mod":
+                            prefix = gomod_file.parent.relative_to(extract_root).as_posix()
+                            if prefix and not prefix.endswith("/"):
+                                prefix += "/"
+                            excluded_prefixes.append(prefix)
+
+                    if zip_path.exists():
+                        zip_path.unlink()
+
+                def add_zip_entry(zf, arcname, data, mode=None):
+                    info = zipfile.ZipInfo(arcname)
+                    info.date_time = (1980, 1, 1, 0, 0, 0)
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                    info.create_system = 3  # Unix
+                    if mode is None:
+                        mode = stat.S_IFREG | 0o644
+                    info.external_attr = ((mode & 0xFFFF) << 16)
+                    zf.writestr(info, data)
+
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    for file_path in sorted(extract_root.rglob("*")):
+                        if file_path.is_dir():
+                            continue
+
+                        rel_path = file_path.relative_to(extract_root).as_posix()
+
+                        if file_path.is_symlink():
+                            continue
+
+                        if is_vendored_package(rel_path):
+                            continue
+
+                        if rel_path == "vendor/modules.txt" and not include_vendor_modules:
+                            continue
+
+                        if any(rel_path.startswith(prefix) for prefix in excluded_prefixes):
+                            continue
+                        if rel_path.endswith("go.mod") and rel_path != "go.mod":
+                            continue
+
+                        if rel_path == "go.mod":
+                            data = mod_content
+                            mode = stat.S_IFREG | 0o644
+                        else:
+                            data = file_path.read_bytes()
+                            try:
+                                mode = file_path.stat().st_mode
+                            except FileNotFoundError:
+                                mode = stat.S_IFREG | 0o644
+
+                        add_zip_entry(zf, zip_prefix + rel_path, data, mode)
+
+                    for license_name, content in license_blobs:
+                        if (extract_root / license_name).exists():
+                            continue
+                        add_zip_entry(zf, zip_prefix + license_name, content, stat.S_IFREG | 0o644)
+                return True
+            except subprocess.CalledProcessError as e:
+                bb.error(f"Failed to create zip for {module_path}@{version}: {e.stderr.decode()}")
+                return False
+            except Exception as e:
+                bb.error(f"Failed to assemble zip for {module_path}@{version}: {e}")
+                return False
+
+        if not assemble_zip(include_vendor_modules=True):
             return False
-        print("Please respond with 'y' or 'n'.")
 
+        def calculate_hash() -> str:
+            result = subprocess.run(
+                [str(go_helper), str(zip_path)],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or "dirhash helper failed")
+            hash_value = result.stdout.strip()
+            if not hash_value.startswith("h1:"):
+                raise RuntimeError(f"unexpected dirhash output: {hash_value}")
+            return hash_value
 
-def validate_srcrev(recipedir: Path, git_ref: Optional[str], source_dir: Optional[Path]) -> bool:
+        try:
+            hash_value = calculate_hash()
+        except Exception as e:
+            bb.warn(f"Failed to create ziphash for {module_path}@{version}: {e}")
+            hash_value = None
+
+        if expected_hash and hash_value and hash_value != expected_hash:
+            bb.debug(1, f"Hash mismatch for {module_key} ({hash_value} != {expected_hash}), retrying without vendor/modules.txt")
+            if not assemble_zip(include_vendor_modules=False):
+                return False
+            try:
+                hash_value = calculate_hash()
+            except Exception as e:
+                bb.warn(f"Failed to create ziphash for {module_path}@{version}: {e}")
+                hash_value = None
+
+            if hash_value and hash_value != expected_hash:
+                bb.warn(f"{module_key} still mismatches expected hash after retry ({hash_value} != {expected_hash})")
+
+        if hash_value:
+            ziphash_path = download_dir / f"{escaped_version}.ziphash"
+            with open(ziphash_path, 'w') as f:
+                f.write(f"{hash_value}\n")
+            bb.debug(1, f"Created {ziphash_path}")
+        else:
+            bb.warn(f"Skipping ziphash for {module_key} due to calculation errors")
+
+        # 5. Extract zip to pkg/mod for offline builds
+        extract_dir = s / "pkg" / "mod"
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_dir)
+            bb.debug(1, f"Extracted {module_path}@{version} to {extract_dir}")
+        except Exception as e:
+            bb.error(f"Failed to extract {module_path}@{version}: {e}")
+            return False
+
+        return True
+
+    def regenerate_go_sum():
+        s_path = Path(d.getVar('S'))
+        cache_dir = s_path / "pkg" / "mod" / "cache" / "download"
+        go_sum_path = s_path / "src" / "import" / "go.sum"
+
+        if not cache_dir.exists():
+            bb.warn("Module cache directory not found - skipping go.sum regeneration")
+            return
+
+        if not go_helper.exists():
+            bb.warn("Go dirhash helper missing - skipping go.sum regeneration")
+            return
+
+        def calculate_zip_checksum(zip_file):
+            result = subprocess.run(
+                [str(go_helper), str(zip_file)],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=60
+            )
+            if result.returncode != 0:
+                bb.warn(f"Failed to calculate zip checksum for {zip_file}: {result.stderr}")
+                return None
+            hash_value = result.stdout.strip()
+            if not hash_value.startswith("h1:"):
+                bb.warn(f"Unexpected checksum format for {zip_file}: {hash_value}")
+                return None
+            return hash_value
+
+        def calculate_mod_checksum(mod_path):
+            try:
+                mod_bytes = mod_path.read_bytes()
+            except FileNotFoundError:
+                return None
+
+            import base64
+
+            file_hash = hashlib.sha256(mod_bytes).hexdigest()
+            summary = f"{file_hash}  go.mod\n".encode('ascii')
+            digest = hashlib.sha256(summary).digest()
+            return "h1:" + base64.b64encode(digest).decode('ascii')
+
+        def unescape(value):
+            import re
+
+            return re.sub(r'!([a-z])', lambda m: m.group(1).upper(), value)
+
+        existing_entries = {}
+
+        if go_sum_path.exists():
+            with open(go_sum_path, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) != 3:
+                        continue
+                    mod, ver, hash_value = parts
+                    existing_entries[(mod, ver)] = hash_value
+
+        new_entries = {}
+
+        for zip_file in sorted(cache_dir.rglob("*.zip")):
+            zip_hash = calculate_zip_checksum(zip_file)
+            if not zip_hash:
+                continue
+
+            parts = zip_file.parts
+            try:
+                v_index = parts.index('@v')
+                download_index = parts.index('download')
+            except ValueError:
+                bb.warn(f"Unexpected cache layout for {zip_file}")
+                continue
+
+            escaped_module_parts = parts[download_index + 1:v_index]
+            escaped_module = '/'.join(escaped_module_parts)
+            escaped_version = zip_file.stem
+
+            module_path = unescape(escaped_module)
+            version = unescape(escaped_version)
+
+            new_entries[(module_path, version)] = zip_hash
+
+            mod_checksum = calculate_mod_checksum(zip_file.with_suffix('.mod'))
+            if mod_checksum:
+                new_entries[(module_path, f"{version}/go.mod")] = mod_checksum
+
+        if not new_entries and not existing_entries:
+            bb.warn("No go.sum entries available - skipping regeneration")
+            return
+
+        final_entries = existing_entries.copy()
+        final_entries.update(new_entries)
+
+        go_sum_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(go_sum_path, 'w') as f:
+            for (mod, ver) in sorted(final_entries.keys()):
+                f.write(f"{mod} {ver} {final_entries[(mod, ver)]}\n")
+
+        bb.debug(1, f"Regenerated go.sum with {len(final_entries)} entries")
+
+    # Process all modules
+    workdir = Path(d.getVar('WORKDIR'))
+    modules_data = json.loads(d.getVar('GO_MODULE_CACHE_DATA'))
+
+    bb.note(f"Building module cache for {len(modules_data)} modules")
+
+    success_count = 0
+    fail_count = 0
+
+    for module in modules_data:
+        vcs_hash = module['vcs_hash']
+        vcs_path = workdir / "sources" / "vcs_cache" / vcs_hash
+
+        # Checkout the exact commit
+        try:
+            subprocess.run(
+                ['git', 'checkout', '-q', module['commit']],
+                cwd=str(vcs_path),
+                check=True,
+                capture_output=True
+            )
+        except subprocess.CalledProcessError as e:
+            bb.error(f"Failed to checkout {module['commit']} in {vcs_path}: {e.stderr.decode()}")
+            fail_count += 1
+            continue
+
+        # Create module cache files
+        if create_module_zip(
+            module['module'],
+            module['version'],
+            vcs_path,
+            module.get('subdir', ''),
+            module['timestamp'],
+            module['commit']
+        ):
+            success_count += 1
+        else:
+            fail_count += 1
+
+    if fail_count == 0:
+        regenerate_go_sum()
+    else:
+        bb.warn("Skipping go.sum regeneration due to module cache failures")
+
+    bb.note(f"Module cache complete: {success_count} succeeded, {fail_count} failed")
+
+    if fail_count > 0:
+        bb.fatal(f"Failed to create cache for {fail_count} modules")
+}
+
+addtask create_module_cache after do_unpack before do_configure
+''')
+
+MODULE_CACHE_TASK_FOOTER = ""
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def unescape_module_path(path: str) -> str:
     """
-    Validate that the source directory is checked out to the commit expected by the recipe.
-
-    Args:
-        recipedir: Directory containing the BitBake recipe (.bb file)
-        git_ref: The git ref passed via --git-ref (or None if not specified)
-        source_dir: The source directory to validate (or None if using --git-repo)
-
-    Returns:
-        True if validation passes or is not applicable, False if mismatch detected
+    Unescape Go module paths that use ! for uppercase letters.
+    Example: github.com/!sirupsen/logrus -> github.com/Sirupsen/logrus
     """
-    if not recipedir:
-        # No recipe directory specified, skip validation
-        return True
+    import re
+    return re.sub(r'!([a-z])', lambda m: m.group(1).upper(), path)
 
-    if not source_dir or not source_dir.exists():
-        # No source directory to validate (e.g., using --git-repo which will clone fresh)
-        return True
+def escape_module_path(path: str) -> str:
+    """
+    Escape Go module paths by converting uppercase to !lowercase.
+    Example: github.com/Sirupsen/logrus -> github.com/!sirupsen/logrus
+    """
+    import re
+    return re.sub(r'([A-Z])', lambda m: '!' + m.group(1).lower(), path)
 
-    # Find .bb file in recipe directory
-    recipe_files = list(recipedir.glob("*.bb"))
-    if not recipe_files:
-        print(f"⚠️  Warning: No .bb recipe file found in {recipedir}")
-        return True
+# =============================================================================
+# Phase 1: Discovery
+# =============================================================================
 
-    if len(recipe_files) > 1:
-        print(f"⚠️  Warning: Multiple .bb files found in {recipedir}, skipping validation")
-        return True
+def discover_modules(source_dir: Path, gomodcache: Optional[str] = None) -> List[Dict]:
+    """
+    Phase 1: Discovery
 
-    recipe_file = recipe_files[0]
+    Let Go download modules to discover correct paths and metadata.
+    This is ONLY for discovery - we build from git sources.
 
-    # Extract SRCREV from recipe file
-    srcrev_pattern = re.compile(r'^\s*SRCREV(?:_\w+)?\s*=\s*"([a-f0-9]{40})"\s*$', re.MULTILINE)
+    Returns list of modules with:
+    - module_path: CORRECT path from filesystem (no /v3 stripping!)
+    - version: Module version
+    - vcs_url: Git repository URL
+    - vcs_hash: Git commit hash
+    - vcs_ref: Git reference (tag/branch)
+    - timestamp: Commit timestamp
+    - subdir: Subdirectory within repo (for submodules)
+    """
+    print("\n" + "=" * 70)
+    print("PHASE 1: DISCOVERY - Using Go to discover module metadata")
+    print("=" * 70)
+
+    # Create temporary or use provided GOMODCACHE
+    if gomodcache:
+        temp_cache = Path(gomodcache)
+        print(f"Using existing GOMODCACHE: {temp_cache}")
+        cleanup_cache = False
+    else:
+        temp_cache = Path(tempfile.mkdtemp(prefix="go-discover-"))
+        print(f"Created temporary cache: {temp_cache}")
+        cleanup_cache = True
 
     try:
-        recipe_content = recipe_file.read_text()
-        srcrev_matches = srcrev_pattern.findall(recipe_content)
+        # Set up environment for Go
+        env = os.environ.copy()
+        env['GOMODCACHE'] = str(temp_cache)
+        env['GOPROXY'] = 'https://proxy.golang.org'
 
-        if not srcrev_matches:
-            # No SRCREV found in recipe, skip validation
-            return True
+        print(f"\nDownloading modules to discover metadata...")
+        print(f"Source: {source_dir}")
 
-        # Use the first SRCREV found (typically SRCREV_<mainrepo>)
-        expected_srcrev = srcrev_matches[0]
+        # Let Go download everything
+        result = subprocess.run(
+            ['go', 'mod', 'download'],
+            cwd=source_dir,
+            env=env,
+            capture_output=True,
+            text=True
+        )
 
-    except Exception as e:
-        print(f"⚠️  Warning: Could not read recipe file {recipe_file}: {e}")
-        return True
+        if result.returncode != 0:
+            print(f"Warning: go mod download had errors:\n{result.stderr}")
+            # Continue anyway - some modules may have been downloaded
 
-    # Get actual commit from source directory or git_ref
-    if git_ref:
-        # If --git-ref was specified, validate it matches the recipe's SRCREV
-        # Normalize git_ref to full commit hash if possible
-        try:
-            result = subprocess.run(
-                ["git", "rev-parse", git_ref],
-                cwd=source_dir,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            actual_commit = result.stdout.strip()
-        except subprocess.CalledProcessError:
-            print(f"⚠️  Warning: Could not resolve git ref '{git_ref}' in {source_dir}")
-            return True
+        # Walk filesystem to discover what Go created
+        modules = []
+        download_dir = temp_cache / "cache" / "download"
 
-        if actual_commit != expected_srcrev:
-            print(f"\n❌ ERROR: Git ref mismatch detected!")
-            print(f"   Recipe expects: {expected_srcrev[:12]} (SRCREV in {recipe_file.name})")
-            print(f"   --git-ref provided: {git_ref} → {actual_commit[:12]}")
-            print(f"\n   The --git-ref argument should match the recipe's SRCREV.")
-            print(f"   Please use: --git-ref {expected_srcrev}")
-            return False
-    else:
-        # No --git-ref specified, check current HEAD in source directory
-        try:
-            result = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=source_dir,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            actual_commit = result.stdout.strip()
-        except subprocess.CalledProcessError as e:
-            print(f"⚠️  Warning: Could not get git HEAD from {source_dir}: {e}")
-            return True
+        if not download_dir.exists():
+            print(f"Error: Download directory not found: {download_dir}")
+            return []
 
-        if actual_commit != expected_srcrev:
-            print(f"\n❌ ERROR: Source directory commit mismatch detected!")
-            print(f"   Recipe expects: {expected_srcrev[:12]} (SRCREV in {recipe_file.name})")
-            print(f"   Source directory ({source_dir}) is at: {actual_commit[:12]}")
-            print(f"\n   The source directory is checked out to the wrong commit.")
-            print(f"   Please checkout the correct commit:")
-            print(f"     cd {source_dir} && git checkout {expected_srcrev}")
-            return False
+        print(f"\nScanning {download_dir} for modules...")
 
-    # Validation passed
-    print(f"✅ SRCREV validation passed: {expected_srcrev[:12]}")
+        for dirpath, _, filenames in os.walk(download_dir):
+            path_parts = Path(dirpath).relative_to(download_dir).parts
+
+            # Look for @v directories
+            if not path_parts or path_parts[-1] != '@v':
+                continue
+
+            # Module path is everything before @v
+            module_path = '/'.join(path_parts[:-1])
+            module_path = unescape_module_path(module_path)  # Unescape !-encoding
+
+            # Process each .info file
+            for filename in filenames:
+                if not filename.endswith('.info'):
+                    continue
+
+                version = filename[:-5]  # Strip .info extension
+                info_path = Path(dirpath) / filename
+
+                try:
+                    # Read metadata from .info file
+                    with open(info_path) as f:
+                        info = json.load(f)
+
+                    # Extract VCS information
+                    origin = info.get('Origin', {})
+                    vcs_url = origin.get('URL')
+                    vcs_hash = origin.get('Hash')
+                    vcs_ref = origin.get('Ref', '')
+
+                    if not vcs_url or not vcs_hash:
+                        print(f"  ⚠️  Skipping {module_path}@{version}: No VCS info")
+                        continue
+
+                    # BitBake requires full 40-character commit hashes
+                    if len(vcs_hash) != 40:
+                        print(f"  ⚠️  Skipping {module_path}@{version}: Short commit hash ({vcs_hash})")
+                        continue
+
+                    # Detect subdir for submodules
+                    # This is a simple heuristic - may need refinement
+                    subdir = origin.get('Subdir', '')
+
+                    modules.append({
+                        'module_path': module_path,
+                        'version': version,
+                        'vcs_url': vcs_url,
+                        'vcs_hash': vcs_hash,
+                        'vcs_ref': vcs_ref,
+                        'timestamp': info.get('Time', ''),
+                        'subdir': subdir,
+                    })
+
+                    print(f"  ✓ {module_path}@{version}")
+
+                except Exception as e:
+                    print(f"  ✗ Error processing {info_path}: {e}")
+                    continue
+
+        print(f"\nDiscovered {len(modules)} modules with VCS info")
+        return modules
+
+    finally:
+        # Clean up temp cache if we created it
+        if cleanup_cache and temp_cache.exists():
+            print(f"\nCleaning up temporary cache: {temp_cache}")
+            shutil.rmtree(temp_cache)
+
+# =============================================================================
+# Phase 2: Recipe Generation
+# =============================================================================
+
+def generate_recipe(modules: List[Dict], source_dir: Path, output_dir: Path,
+                   git_repo: str, git_ref: str) -> bool:
+    """
+    Phase 2: Recipe Generation
+
+    Generate BitBake recipe with git:// SRC_URI entries.
+    No file:// entries - we'll build cache from git during do_create_module_cache.
+
+    Creates:
+    - go-mod-git.inc: SRC_URI with git:// entries
+    - go-mod-cache.inc: BitBake task to build module cache
+    """
+    print("\n" + "=" * 70)
+    print("PHASE 2: RECIPE GENERATION - Creating BitBake recipe files")
+    print("=" * 70)
+
+    src_uri_entries = []
+    modules_data = []
+    vcs_repos = {}  # Track unique VCS repos to avoid duplicates
+
+    for module in modules:
+        vcs_url = module['vcs_url']
+        vcs_hash = module['vcs_hash']
+
+        # Calculate VCS hash for destsuffix (unique per repo URL)
+        vcs_key = f"git3:{vcs_url}"
+        vcs_sha = hashlib.sha256(vcs_key.encode()).hexdigest()
+        module['vcs_sha'] = vcs_sha
+
+        # Track this repo (may be shared by multiple modules)
+        if vcs_sha not in vcs_repos:
+            vcs_repos[vcs_sha] = {
+                'url': vcs_url,
+                'hash': vcs_hash,
+                'modules': []
+            }
+        vcs_repos[vcs_sha]['modules'].append(module)
+
+    print(f"\nFound {len(vcs_repos)} unique git repositories")
+    print(f"Supporting {len(modules)} modules")
+
+    # Generate SRC_URI entries for each unique repo
+    for idx, (vcs_sha, repo_info) in enumerate(vcs_repos.items()):
+        git_url = repo_info['url']
+        commit_hash = repo_info['hash']
+        fetch_name = f"git_{vcs_sha[:12]}"
+
+        # Convert https:// to git:// for BitBake
+        if git_url.startswith('https://'):
+            git_url_bb = 'git://' + git_url[8:]
+            protocol = 'https'
+        elif git_url.startswith('http://'):
+            git_url_bb = 'git://' + git_url[7:]
+            protocol = 'http'
+        else:
+            git_url_bb = git_url
+            protocol = 'https'  # default
+
+        src_uri_entries.append(
+            f'{git_url_bb};protocol={protocol};nobranch=1;'
+            f'rev={commit_hash};'
+            f'name={fetch_name};'
+            f'destsuffix=vcs_cache/{vcs_sha}'
+        )
+
+        print(f"  {fetch_name}: {repo_info['url'][:60]}...")
+
+    # Prepare modules data for do_create_module_cache
+    for module in modules:
+        vcs_key = f"git3:{module['vcs_url']}"
+        vcs_sha = hashlib.sha256(vcs_key.encode()).hexdigest()
+
+        update_metadata_cache(
+            module['module_path'],
+            module['version'],
+            module['vcs_url'],
+            module['vcs_hash'],
+            module.get('timestamp', ''),
+            module.get('subdir', ''),
+            dirty=True,
+        )
+
+        modules_data.append({
+            'module': module['module_path'],
+            'version': module['version'],
+            'vcs_hash': module['vcs_sha'],
+            'commit': module['vcs_hash'],
+            'timestamp': module['timestamp'],
+            'subdir': module.get('subdir', ''),
+        })
+
+    # Write go-mod-git.inc
+    git_inc_path = output_dir / "go-mod-git.inc"
+    print(f"\nWriting {git_inc_path}")
+
+    with open(git_inc_path, 'w') as f:
+        f.write("# Generated by oe-go-mod-fetcher.py v" + VERSION + "\n")
+        f.write("# Git repositories for Go module dependencies\n\n")
+        for entry in src_uri_entries:
+            f.write(f'SRC_URI += "{entry}"\n')
+        f.write('\n')
+
+        # Write checksums (empty for now - BitBake will fill these in)
+        f.write("# SRCREVs for git repositories\n")
+        for vcs_sha, repo_info in vcs_repos.items():
+            fetch_name = f"git_{vcs_sha[:12]}"
+            f.write(f'SRCREV_{fetch_name} = "{repo_info["hash"]}"\n')
+
+    # Write go-mod-cache.inc
+    cache_inc_path = output_dir / "go-mod-cache.inc"
+    print(f"Writing {cache_inc_path}")
+
+    with open(cache_inc_path, 'w') as f:
+        f.write("# Generated by oe-go-mod-fetcher.py v" + VERSION + "\n")
+        f.write("# Module cache builder for Go dependencies\n\n")
+
+        # Write modules data as JSON
+        f.write("# Module metadata for cache building\n")
+        f.write("GO_MODULE_CACHE_DATA = '")
+        json.dump(modules_data, f, separators=(',', ':'))
+        f.write("'\n\n")
+
+        # Write the BitBake task
+        f.write(MODULE_CACHE_TASK_HEADER)
+        f.write(MODULE_CACHE_TASK_FOOTER)
+
+    print(f"\n✅ Generated recipe files:")
+    print(f"   {git_inc_path}")
+    print(f"   {cache_inc_path}")
+    print(f"\nTo use these files, add to your recipe:")
+    print(f"   require go-mod-git.inc")
+    print(f"   require go-mod-cache.inc")
+
     return True
 
+# =============================================================================
+# Main Entry Point
+# =============================================================================
 
 def main():
     print(f"Go Module Git Fetcher v{VERSION}")
-    print("=" * 40)
-    
+    print("Hybrid Architecture: Discovery from Go + Build from Git")
+    print("=" * 70)
+
     parser = argparse.ArgumentParser(
-        description=f"Fetch Git repositories for Go modules and checkout exact revisions (v{VERSION})",
+        description=f"Generate BitBake recipes for Go modules using hybrid approach (v{VERSION})",
         epilog="""
+This tool uses a 3-phase hybrid approach:
+  1. Discovery: Run 'go mod download' to get correct module paths
+  2. Recipe Generation: Create git:// SRC_URI entries for BitBake
+  3. Cache Building: Build module cache from git during do_create_module_cache
+
+Persistent Caches:
+  The generator maintains two caches in the scripts directory:
+  - .oe-go-mod-fetcher.module-cache.json: Module metadata (commit, subdir, etc.)
+  - .oe-go-mod-fetcher.ls-remote-cache.json: Git ls-remote results
+
+  These caches speed up regeneration but may need cleaning when:
+  - Derivation logic changes (e.g., subdir calculation fixes)
+  - Cached data becomes stale or incorrect
+
+  Use --clean-cache to remove metadata cache before regeneration.
+  Use --clean-ls-remote-cache to remove both caches (slower, but fully fresh).
+
 Examples:
-  # Use vendor-like filtering (RECOMMENDED for Yocto - ~120 deps instead of 350)
-  %(prog)s --git-repo https://example.org/project.git --git-ref main --vendor-like --openembedded
+  # Normal regeneration (fast, uses caches)
+  %(prog)s --recipedir /path/to/recipe/output
 
-  # Use hybrid approach for fast parallel downloads (NEW - 10x faster than gomodgit)
-  %(prog)s --git-repo https://example.org/project.git --git-ref main --use-hybrid --recipedir /path/to/recipe
+  # Clean metadata cache (e.g., after fixing subdir derivation)
+  %(prog)s --recipedir /path/to/recipe/output --clean-cache
 
-  # Use BitBake's gomodgit infrastructure (works but slow - 20+ minutes)
-  %(prog)s --git-repo https://example.org/project.git --git-ref main --use-gomodgit --recipedir /path/to/recipe
-
-  # Include all dependencies (comprehensive - may be 300+ modules)
-  %(prog)s --git-repo https://example.org/project.git --git-ref main --include-indirect --vendor vendor
+  # Fully clean regeneration (slow, calls git ls-remote for everything)
+  %(prog)s --recipedir /path/to/recipe/output --clean-ls-remote-cache
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    
-    parser.add_argument(
-        "go_mod_file",
-        nargs='?',
-        default="go.mod",
-        help="Path to local go.mod file (default: go.mod)"
-    )
-    
-    parser.add_argument("--git-repo", help="Git repository URL to fetch go.mod from")
-    parser.add_argument("--git-ref", help="Git ref (tag, branch, or commit) to checkout")
-    parser.add_argument("--go-mod-path", default="go.mod", help="Path to go.mod file within the Git repository")
-    
-    parser.add_argument("-o", "--output", default="modules", help="Output directory for cloned repositories")
-    parser.add_argument("--vendor", help="Create vendor directory with source code")
-    parser.add_argument("--openembedded", action="store_true", 
-                       help="Generate OpenEmbedded files (modules.txt, src_uri.inc, relocation.inc)")
-    parser.add_argument("--gomodcache", help="Directory to use for Go module cache (overrides GOMODCACHE)")
-    parser.add_argument("--git-timeout", type=int, default=120,
-                        help="Timeout in seconds for git clone/fetch commands (default: 120)")
-    parser.add_argument("--git-retries", type=int, default=3,
-                        help="Number of attempts for git clone/fetch commands (default: 3)")
-    
-    scope_group = parser.add_mutually_exclusive_group()
-    scope_group.add_argument("--include-indirect", action="store_true", help="Include all transitive dependencies")
-    scope_group.add_argument("--vendor-like", action="store_true", help="Use 'go mod vendor' filtering (RECOMMENDED)")
 
-    parser.add_argument("--detect-missing-overrides", action="store_true",
-                       help="Compare with 'go mod vendor' to detect missing overrides")
-    parser.add_argument("--use-gomodgit", action="store_true",
-                       help="Use BitBake's gomodgit:// infrastructure (EXPERIMENTAL)")
-    parser.add_argument("--use-hybrid", action="store_true",
-                       help="Use hybrid git:// + custom module cache approach for fast parallel downloads")
-    parser.add_argument("--generate-gomodgit", action="store_true",
-                       help="Generate go.sum.gomodgit reference checksums (optional; defaults to off)")
-    parser.add_argument("--recipedir", help="Output directory for generated .inc files (default: current directory)")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
-    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    parser.add_argument(
+        "--recipedir",
+        required=True,
+        help="Output directory for generated .inc files"
+    )
+
+    parser.add_argument(
+        "--gomodcache",
+        help="Directory to use for Go module cache (for discovery phase)"
+    )
+
+    parser.add_argument(
+        "--source-dir",
+        help="Source directory containing go.mod (default: current directory)"
+    )
+
+    parser.add_argument(
+        "--git-repo",
+        help="Git repository URL (for documentation purposes)"
+    )
+
+    parser.add_argument(
+        "--git-ref",
+        help="Git reference (for documentation purposes)"
+    )
+
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Verbose output"
+    )
+
+    parser.add_argument(
+        "--clean-cache",
+        action="store_true",
+        help="Clear metadata cache before regeneration (useful when derivation logic changes)"
+    )
+
+    parser.add_argument(
+        "--clean-ls-remote-cache",
+        action="store_true",
+        help="Clear git ls-remote cache in addition to metadata cache (implies --clean-cache)"
+    )
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {VERSION}"
+    )
+
+    # Add compatibility args that we ignore (for backward compatibility)
+    parser.add_argument("--use-hybrid", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("go_mod_file", nargs='?', help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
-    # Offer to auto-populate Git arguments when running inside a repository
-    if (not args.git_repo or not args.git_ref) and sys.stdin.isatty():
-        context = detect_current_git_context()
-        if context and context.get("commit"):
-            repo_candidate = context.get("remote") or context.get("toplevel")
-            ref_candidate = context.get("commit")
-            missing_repo = not args.git_repo
-            missing_ref = not args.git_ref
+    # Determine source directory
+    if args.source_dir:
+        source_dir = Path(args.source_dir).resolve()
+    else:
+        source_dir = Path.cwd()
 
-            if repo_candidate and (missing_repo or missing_ref):
-                commit_short = ref_candidate[:12] if ref_candidate else None
-                branch = context.get("branch") or "HEAD"
-                print("💡 Detected local Git repository context:")
-                if context.get("toplevel"):
-                    print(f"   Path: {context['toplevel']}")
-                if context.get("remote"):
-                    print(f"   Remote: {context['remote']}")
-                if commit_short:
-                    branch_display = f" ({branch})" if branch and branch != "HEAD" else ""
-                    print(f"   HEAD: {commit_short}{branch_display}")
-
-                print("   Proposed values:")
-                if missing_repo:
-                    print(f"     --git-repo = {repo_candidate}")
-                else:
-                    print(f"     --git-repo = {args.git_repo} (existing)")
-                if missing_ref:
-                    print(f"     --git-ref  = {ref_candidate}")
-                else:
-                    print(f"     --git-ref  = {args.git_ref} (existing)")
-
-                if prompt_yes_no("Use these Git settings?", default=True):
-                    if missing_repo:
-                        args.git_repo = repo_candidate
-                    if missing_ref:
-                        args.git_ref = ref_candidate
-                else:
-                    print("   ↩️  Keeping command-line values unchanged.")
-
-    # Set default to vendor-like if nothing specified and generating OpenEmbedded files
-    if not args.include_indirect and not args.vendor_like:
-        if args.openembedded:
-            print("💡 Using --vendor-like (recommended for Yocto builds)")
-            args.vendor_like = True
-        else:
-            print("💡 Using direct dependencies only.")
-    
-    if args.vendor_like:
-        print("✅ Using --vendor-like: This mimics 'go mod vendor' behavior")
-        print("   This typically results in ~120 modules, similar to what Go builds actually need.")
-        print()
-    
-    # Validate arguments
-    if args.git_repo and not args.git_ref:
-        parser.error("--git-ref is required when using --git-repo")
-    elif args.git_ref and not args.git_repo:
-        parser.error("--git-repo is required when using --git-ref")
-
-    # Prepare Go environment (and create cache directory if requested)
-    base_go_env = None
-    if args.gomodcache:
-        gomodcache_path = Path(args.gomodcache).expanduser().resolve()
-        gomodcache_path.mkdir(parents=True, exist_ok=True)
-        args.gomodcache = str(gomodcache_path)
-        base_go_env = os.environ.copy()
-        base_go_env['GOMODCACHE'] = args.gomodcache
-
-    # Check tools
-    try:
-        result = subprocess.run(["go", "version"], check=True, capture_output=True, text=True, env=base_go_env)
-        print(f"✅ Go toolchain: {result.stdout.strip()}")
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("❌ Error: 'go' command not found. Please install Go.")
+    # Validate source directory has go.mod
+    if not (source_dir / "go.mod").exists():
+        print(f"❌ Error: go.mod not found in {source_dir}")
         sys.exit(1)
 
-    try:
-        result = subprocess.run(["git", "--version"], check=True, capture_output=True, text=True)
-        print(f"✅ Git: {result.stdout.strip()}")
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        print("❌ Error: 'git' command not found. Please install Git.")
-        sys.exit(1)
-    
-    print()
+    print(f"Source directory: {source_dir}")
 
-    # Create fetcher and process modules
-    try:
-        fetcher = GoModuleFetcher(
-            args.output,
-            args.vendor,
-            args.openembedded,
-            args.include_indirect,
-            args.vendor_like,
-            args.gomodcache,
-            generate_gomodgit=args.generate_gomodgit,
-            git_timeout=args.git_timeout,
-            git_retries=args.git_retries
-        )
-        fetcher.args = args  # Store args for later use
+    # Validate output directory
+    output_dir = Path(args.recipedir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Output directory: {output_dir}")
 
-        # Handle gomodgit infrastructure bootstrap
-        if args.use_gomodgit:
-            print("🚀 Bootstrapping BitBake gomodgit:// infrastructure")
+    exit_code = 0
 
-            if args.git_repo:
-                # Fetch the main repository to get source directory
-                source_dir = fetcher.fetch_main_repo(args.git_repo, args.git_ref)
-                if not source_dir:
-                    print("❌ Failed to fetch main repository")
-                    sys.exit(1)
-            else:
-                # Use current directory if local go.mod file specified
-                source_dir = Path(".").absolute()
-                if not (source_dir / args.go_mod_file).exists():
-                    print(f"❌ go.mod file not found: {args.go_mod_file}")
-                    sys.exit(1)
-
-            # Validate SRCREV if recipedir is specified
-            if args.recipedir:
-                recipedir = Path(args.recipedir)
-                # For --git-repo case, we don't validate since fetch_main_repo already checked out the ref
-                # For local directory case, validate the current checkout
-                validation_source = None if args.git_repo else source_dir
-                if not validate_srcrev(recipedir, args.git_ref, validation_source):
-                    sys.exit(1)
-
-            # Use the new gomodgit infrastructure
-            output_dir = Path(args.recipedir) if args.recipedir else Path(".")
-            fetcher.bootstrap_gomodgit_infrastructure(source_dir, output_dir=output_dir)
-            success = True
-        elif args.use_hybrid:
-            print("🚀 Bootstrapping hybrid git:// + custom module cache infrastructure")
-
-            if args.git_repo:
-                # Fetch the main repository to get source directory
-                source_dir = fetcher.fetch_main_repo(args.git_repo, args.git_ref)
-                if not source_dir:
-                    print("❌ Failed to fetch main repository")
-                    sys.exit(1)
-            else:
-                # Use current directory if local go.mod file specified
-                source_dir = Path(".").absolute()
-                if not (source_dir / args.go_mod_file).exists():
-                    print(f"❌ go.mod file not found: {args.go_mod_file}")
-                    sys.exit(1)
-
-            # Validate SRCREV if recipedir is specified
-            if args.recipedir:
-                recipedir = Path(args.recipedir)
-                # For --git-repo case, we don't validate since fetch_main_repo already checked out the ref
-                # For local directory case, validate the current checkout
-                validation_source = None if args.git_repo else source_dir
-                if not validate_srcrev(recipedir, args.git_ref, validation_source):
-                    sys.exit(1)
-
-            # Use the new hybrid infrastructure
-            output_dir = Path(args.recipedir) if args.recipedir else Path(".")
-            fetcher.bootstrap_hybrid_infrastructure(source_dir, output_dir=output_dir)
-            success = True
+    # Handle cache cleaning flags
+    if args.clean_ls_remote_cache:
+        print("\n🗑️  Cleaning git ls-remote cache...")
+        if LS_REMOTE_CACHE_PATH.exists():
+            LS_REMOTE_CACHE_PATH.unlink()
+            print(f"   Removed {LS_REMOTE_CACHE_PATH}")
         else:
-            success = fetcher.fetch_all_modules(
-                args.go_mod_path if args.git_repo else args.go_mod_file,
-                include_indirect=args.include_indirect,
-                git_repo=args.git_repo,
-                git_ref=args.git_ref
+            print(f"   Cache file not found: {LS_REMOTE_CACHE_PATH}")
+        # Also clean metadata cache when cleaning ls-remote
+        args.clean_cache = True
+
+    if args.clean_cache:
+        print("\n🗑️  Cleaning module metadata cache...")
+        if MODULE_METADATA_CACHE_PATH.exists():
+            MODULE_METADATA_CACHE_PATH.unlink()
+            print(f"   Removed {MODULE_METADATA_CACHE_PATH}")
+        else:
+            print(f"   Cache file not found: {MODULE_METADATA_CACHE_PATH}")
+        print("   Note: Bootstrap from .inc files still enabled. Use --help for details.")
+
+    bootstrap_metadata_cache(output_dir)
+    load_ls_remote_cache()
+
+    try:
+        # Phase 1: Discovery
+        modules = discover_modules(source_dir, args.gomodcache)
+
+        discovered_keys = {(m['module_path'], m['version']) for m in modules}
+        go_sum_modules = parse_go_sum(source_dir / "go.sum")
+
+        print(f"\nResolving {len(go_sum_modules - discovered_keys)} additional modules from go.sum...")
+
+        # Build index of discovered modules by module_path for fallback lookups
+        modules_by_path = {}
+        for m in modules:
+            path = m['module_path']
+            if path not in modules_by_path:
+                modules_by_path[path] = []
+            modules_by_path[path].append(m)
+
+        for module_path, version in sorted(go_sum_modules):
+            if (module_path, version) in discovered_keys:
+                continue
+
+            # Try to resolve module metadata
+            fallback = resolve_module_metadata(module_path, version)
+            if fallback:
+                modules.append(fallback)
+                discovered_keys.add((module_path, version))
+                # Also add to index for future fallbacks
+                if module_path not in modules_by_path:
+                    modules_by_path[module_path] = []
+                modules_by_path[module_path].append(fallback)
+            else:
+                # If resolution failed, try to use VCS info from another version of same module
+                if module_path in modules_by_path:
+                    # Found other versions of this module - use their VCS URL
+                    reference_module = modules_by_path[module_path][0]
+                    vcs_url = reference_module['vcs_url']
+
+                    # Try to resolve using known VCS URL
+                    tag = version.split('+')[0]
+                    commit = None
+
+                    # Check if this is a pseudo-version with short commit
+                    pseudo_match = re.match(r'v\d+\.\d+\.\d+-(\d{14})-([0-9a-fA-F]+)', tag)
+
+                    if pseudo_match:
+                        # Pseudo-version with short commit - need to clone and search
+                        timestamp_str = pseudo_match.group(1)
+                        short_commit = pseudo_match.group(2)
+
+                        # Use clone cache directory
+                        clone_cache_dir = Path.home() / '.cache' / 'oe-go-mod-fetcher' / 'repos'
+
+                        commit = resolve_pseudo_version_commit(
+                            vcs_url,
+                            timestamp_str,
+                            short_commit,
+                            clone_cache_dir=clone_cache_dir
+                        )
+
+                        if commit:
+                            print(f"  ✓ {module_path}@{version} (resolved pseudo-version via repository clone)")
+                    else:
+                        # Regular tagged version - use git ls-remote
+                        commit = git_ls_remote(vcs_url, f"refs/tags/{tag}") or git_ls_remote(vcs_url, tag)
+
+                        if commit:
+                            print(f"  ✓ {module_path}@{version} (resolved using VCS URL from sibling version)")
+
+                    if commit:
+                        # Successfully resolved!
+                        timestamp = derive_timestamp_from_version(version)
+                        subdir = reference_module.get('subdir', '')
+
+                        update_metadata_cache(module_path, version, vcs_url, commit, timestamp, subdir, dirty=True)
+
+                        fallback = {
+                            "module_path": module_path,
+                            "version": version,
+                            "vcs_url": vcs_url,
+                            "vcs_hash": commit,
+                            "vcs_ref": "",
+                            "timestamp": timestamp,
+                            "subdir": subdir,
+                        }
+                        modules.append(fallback)
+                        discovered_keys.add((module_path, version))
+                        modules_by_path[module_path].append(fallback)
+                        continue
+
+                # Module couldn't be resolved - likely an indirect-only dependency
+                # that only needs go.mod file (no source code)
+                print(f"  ⚠️  Skipping {module_path}@{version} (indirect-only dependency)")
+                continue
+
+        if not modules:
+            print("❌ No modules discovered")
+            exit_code = 1
+        else:
+            # Phase 2: Recipe Generation
+            success = generate_recipe(
+                modules,
+                source_dir,
+                output_dir,
+                args.git_repo or "unknown",
+                args.git_ref or "unknown"
             )
-        
-        fetcher.cleanup_temp_files()
-        sys.exit(0 if success else 1)
-        
+
+            if success:
+                print("\n" + "=" * 70)
+                print("✅ SUCCESS - Recipe generation complete")
+                print("=" * 70)
+                exit_code = 0
+            else:
+                print("\n❌ FAILED - Recipe generation failed")
+                exit_code = 1
+
     except KeyboardInterrupt:
-        print("\nOperation cancelled by user")
-        sys.exit(1)
+        print("\n\nOperation cancelled by user")
+        exit_code = 1
     except Exception as e:
-        print(f"Unexpected error: {e}")
+        print(f"\n❌ Unexpected error: {e}")
         if args.verbose:
             import traceback
             traceback.print_exc()
-        sys.exit(1)
+        exit_code = 1
+    finally:
+        save_ls_remote_cache()
+        save_metadata_cache()
+
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
