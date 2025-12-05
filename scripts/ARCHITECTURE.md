@@ -95,42 +95,37 @@ BitBake do_fetch ─► vcs_cache/… bare repos ─► do_create_module_cache �
 
 ### BitBake Discovery Workflow (Recommended)
 
-The `go-mod-discovery.bbclass` provides modular tasks for discovery, extraction, and generation. Tasks can be run individually or chained together.
+The `go-mod-discovery.bbclass` provides modular tasks for flexible discovery and generation.
 
 **Available Tasks:**
 
 | Task | Purpose | Network? |
 |------|---------|----------|
-| `discover_modules` | Build project, download modules to cache | Yes |
-| `extract_modules` | Extract metadata from cache to `modules.json` | No |
-| `generate_modules` | Generate `.inc` files from `modules.json` | No |
-| `discover_and_generate` | Run all three in sequence | Yes |
+| `discover_modules` | Build project, download modules from proxy.golang.org | Yes |
+| `extract_modules` | Extract VCS metadata from discovery cache to JSON | No |
+| `generate_modules` | Generate .inc files from extracted metadata | No |
+| `discover_and_generate` | Run all three steps: discover → extract → generate | Yes |
 | `show_upgrade_commands` | Print copy-pasteable command lines | No |
 | `clean_discovery` | Remove persistent discovery cache | No |
 
-**Quick Start - All-in-One:**
+**Quick Start (All-in-One):**
 ```bash
 # Configure recipe with GO_MOD_DISCOVERY_GIT_REPO, then:
 bitbake k3s -c discover_and_generate
 # Done! Recipe .inc files are automatically regenerated.
 ```
 
-**Step-by-Step Workflow:**
+**Step-by-Step (for debugging or rerunning individual steps):**
 ```bash
-# Step 1: Download modules (slow, requires network)
-bitbake k3s -c discover_modules
-
-# Step 2: Extract metadata to JSON (fast, no network)
-bitbake k3s -c extract_modules
-
-# Step 3: Generate .inc files (fast, no network)
-bitbake k3s -c generate_modules
+bitbake k3s -c discover_modules    # Download modules
+bitbake k3s -c extract_modules     # Extract metadata to JSON
+bitbake k3s -c generate_modules    # Generate .inc files
 ```
 
-This modular approach is useful when:
-- Debugging discovery issues (run steps individually)
-- Reusing an existing cache (skip step 1, run steps 2-3)
-- Testing different generation options (rerun step 3 only)
+The modular approach allows:
+- Re-running `generate_modules` without re-downloading if metadata changes
+- Inspecting the intermediate `modules.json` for debugging
+- Reusing the discovery cache across multiple recipe updates
 
 **Show Commands Without Running:**
 ```bash
@@ -139,8 +134,8 @@ bitbake k3s -c show_upgrade_commands
 
 This prints all available options with recipe-specific values filled in:
 - Option 1: Direct script invocation (no BitBake)
-- Option 2: Step-by-step BitBake tasks
-- Option 3: All-in-one BitBake task
+- Option 2: All-in-one BitBake task (`discover_and_generate`)
+- Option 3: Step-by-step tasks
 - Option 4: Use existing discovery cache
 
 **Recipe Configuration (k3s example):**

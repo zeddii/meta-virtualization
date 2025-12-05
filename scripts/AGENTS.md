@@ -2,12 +2,35 @@
 
 This document captures the state of the Go module fetcher rewrite and is intended for agents picking up the work.
 
-## Quick Start (Updated 2025-12-04)
+## Quick Start (Updated 2025-12-05)
 
-**One-command workflow to regenerate recipe files:**
+**Available BitBake Tasks:**
+
+| Task | What it does | Network? |
+|------|--------------|----------|
+| `discover_modules` | Build project, download modules from proxy.golang.org | Yes |
+| `extract_modules` | Extract VCS metadata from discovery cache to JSON | No |
+| `generate_modules` | Generate .inc files from extracted metadata | No |
+| `discover_and_generate` | Run all three: discover → extract → generate | Yes |
+| `show_upgrade_commands` | Print copy-pasteable commands | No |
+| `clean_discovery` | Remove discovery cache | No |
+
+**All-in-one workflow:**
 ```bash
-bitbake k3s -c discover_modules   # Discovers → Extracts → Generates
-bitbake k3s                        # Build with regenerated recipe
+bitbake k3s -c discover_and_generate   # Discovers → Extracts → Generates
+bitbake k3s                            # Build with regenerated recipe
+```
+
+**Step-by-step workflow (for debugging):**
+```bash
+bitbake k3s -c discover_modules    # Download modules
+bitbake k3s -c extract_modules     # Extract metadata to JSON
+bitbake k3s -c generate_modules    # Generate .inc files
+```
+
+**See available commands with recipe-specific values:**
+```bash
+bitbake k3s -c show_upgrade_commands
 ```
 
 **Recipe must have:**
@@ -18,20 +41,19 @@ GO_MOD_DISCOVERY_GIT_REF = "${SRCREV_k3s}"
 inherit go-mod-discovery
 ```
 
-**Individual steps (for debugging):**
+**Direct script invocation (no BitBake):**
 ```bash
-# Discovery only
-GO_MOD_DISCOVERY_SKIP_EXTRACT="1" bitbake k3s -c discover_modules
+# Option 1: Generate from git repo (recommended for new recipes)
+python3 scripts/oe-go-mod-fetcher.py \
+    --git-repo https://github.com/rancher/k3s.git \
+    --git-ref <commit> \
+    --recipedir recipes-containers/k3s
 
-# Discovery + Extraction only
-GO_MOD_DISCOVERY_SKIP_GENERATE="1" bitbake k3s -c discover_modules
-
-# Manual extraction
+# Option 2: Use existing discovery cache
 python3 scripts/extract-discovered-modules.py \
     --gomodcache ${TOPDIR}/go-mod-discovery/k3s/${PV}/cache \
     --output /tmp/modules.json
 
-# Manual generation
 python3 scripts/oe-go-mod-fetcher.py \
     --discovered-modules /tmp/modules.json \
     --git-repo https://github.com/rancher/k3s.git \
