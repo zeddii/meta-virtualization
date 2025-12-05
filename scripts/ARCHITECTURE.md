@@ -95,14 +95,53 @@ BitBake do_fetch ─► vcs_cache/… bare repos ─► do_create_module_cache �
 
 ### BitBake Discovery Workflow (Recommended)
 
-The `go-mod-discovery.bbclass` provides an automated workflow that runs all three phases (discovery, extraction, generation) in a single BitBake command.
+The `go-mod-discovery.bbclass` provides modular tasks for discovery, extraction, and generation. Tasks can be run individually or chained together.
 
-**One-Command Workflow:**
+**Available Tasks:**
+
+| Task | Purpose | Network? |
+|------|---------|----------|
+| `discover_modules` | Build project, download modules to cache | Yes |
+| `extract_modules` | Extract metadata from cache to `modules.json` | No |
+| `generate_modules` | Generate `.inc` files from `modules.json` | No |
+| `discover_and_generate` | Run all three in sequence | Yes |
+| `show_upgrade_commands` | Print copy-pasteable command lines | No |
+| `clean_discovery` | Remove persistent discovery cache | No |
+
+**Quick Start - All-in-One:**
 ```bash
 # Configure recipe with GO_MOD_DISCOVERY_GIT_REPO, then:
-bitbake k3s -c discover_modules
+bitbake k3s -c discover_and_generate
 # Done! Recipe .inc files are automatically regenerated.
 ```
+
+**Step-by-Step Workflow:**
+```bash
+# Step 1: Download modules (slow, requires network)
+bitbake k3s -c discover_modules
+
+# Step 2: Extract metadata to JSON (fast, no network)
+bitbake k3s -c extract_modules
+
+# Step 3: Generate .inc files (fast, no network)
+bitbake k3s -c generate_modules
+```
+
+This modular approach is useful when:
+- Debugging discovery issues (run steps individually)
+- Reusing an existing cache (skip step 1, run steps 2-3)
+- Testing different generation options (rerun step 3 only)
+
+**Show Commands Without Running:**
+```bash
+bitbake k3s -c show_upgrade_commands
+```
+
+This prints all available options with recipe-specific values filled in:
+- Option 1: Direct script invocation (no BitBake)
+- Option 2: Step-by-step BitBake tasks
+- Option 3: All-in-one BitBake task
+- Option 4: Use existing discovery cache
 
 **Recipe Configuration (k3s example):**
 ```bitbake
@@ -113,27 +152,19 @@ GO_MOD_DISCOVERY_GIT_REF = "${SRCREV_k3s}"
 inherit go-mod-discovery
 ```
 
-**What `do_discover_modules` Does:**
-1. **Discovery**: Runs `go build` with network access to download all modules to a persistent cache
-2. **Extraction**: Automatically runs `extract-discovered-modules.py` to create `modules.json`
-3. **Generation**: Automatically runs `oe-go-mod-fetcher.py` to regenerate recipe `.inc` files
-
-**Running Individual Steps (if needed):**
+**Manual Script Invocation (Alternative to BitBake):**
 ```bash
-# Step 1 only: Download modules (skip extraction and generation)
-GO_MOD_DISCOVERY_SKIP_EXTRACT = "1"
-bitbake k3s -c discover_modules
+# Option 1: Generate directly from git repo (recommended for new recipes)
+python3 ./meta-virtualization/scripts/oe-go-mod-fetcher.py \
+    --git-repo https://github.com/rancher/k3s.git \
+    --git-ref ${SRCREV} \
+    --recipedir ./meta-virtualization/recipes-containers/k3s
 
-# Steps 1-2 only: Download and extract (skip generation)
-GO_MOD_DISCOVERY_SKIP_GENERATE = "1"
-bitbake k3s -c discover_modules
-
-# Manual extraction (if automatic extraction failed):
+# Option 2: Use existing discovery cache
 python3 ./meta-virtualization/scripts/extract-discovered-modules.py \
     --gomodcache ${TOPDIR}/go-mod-discovery/k3s/${PV}/cache \
     --output ${TOPDIR}/go-mod-discovery/k3s/${PV}/modules.json
 
-# Manual generation (if automatic generation failed):
 python3 ./meta-virtualization/scripts/oe-go-mod-fetcher.py \
     --discovered-modules ${TOPDIR}/go-mod-discovery/k3s/${PV}/modules.json \
     --git-repo https://github.com/rancher/k3s.git \
@@ -145,12 +176,11 @@ python3 ./meta-virtualization/scripts/oe-go-mod-fetcher.py \
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GO_MOD_DISCOVERY_BUILD_TARGET` | (required) | Go build target (e.g., `./cmd/server`) |
-| `GO_MOD_DISCOVERY_GIT_REPO` | `""` | Git repo URL (required for auto-generation) |
+| `GO_MOD_DISCOVERY_GIT_REPO` | `""` | Git repo URL (required for `generate_modules`) |
 | `GO_MOD_DISCOVERY_GIT_REF` | `${SRCREV}` | Git commit/tag |
 | `GO_MOD_DISCOVERY_RECIPEDIR` | `${FILE_DIRNAME}` | Output directory for .inc files |
-| `GO_MOD_DISCOVERY_SKIP_EXTRACT` | `"0"` | Set to `"1"` to skip extraction |
-| `GO_MOD_DISCOVERY_SKIP_GENERATE` | `"0"` | Set to `"1"` to skip generation |
 | `GO_MOD_DISCOVERY_DIR` | `${TOPDIR}/go-mod-discovery/${PN}/${PV}` | Persistent cache location |
+| `GO_MOD_DISCOVERY_MODULES_JSON` | `${GO_MOD_DISCOVERY_DIR}/modules.json` | Extracted metadata file |
 
 ### Manual Fix Loop (Single Module Repair)
 1. Run `gen-single-module.py MODULE REPO --list-commits N` to inspect history. If BitBake failed against a GitHub mirror, retry with the canonical upstream (e.g., `https://gvisor.googlesource.com/gvisor`).
