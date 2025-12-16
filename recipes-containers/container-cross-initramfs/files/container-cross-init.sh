@@ -364,8 +364,17 @@ process_podman() {
         echo "Container loaded successfully!"
         podman images
     else
-        echo "WARNING: Container import failed"
-        podman images
+        echo "===ERROR==="
+        echo "Container import failed - no storage to export"
+        podman images 2>&1 || true
+        echo "Debugging info:"
+        echo "  /mnt/input contents:"
+        ls -la /mnt/input/ 2>&1 || echo "    (could not list)"
+        echo "  skopeo version:"
+        skopeo --version 2>&1 || echo "    (skopeo not working)"
+        echo "  podman version:"
+        podman --version 2>&1 || echo "    (podman not working)"
+        return 1
     fi
 
     # Package containers storage
