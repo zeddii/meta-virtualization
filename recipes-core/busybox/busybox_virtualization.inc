@@ -8,4 +8,5 @@ SRC_URI += " \
 	    file://ps-extras.cfg \
 	    file://getopt.cfg \
 	    file://nsenter.cfg \
+            file://utils.cfg \
            "
