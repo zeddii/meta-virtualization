@@ -1,0 +1,23 @@
+vdkr aarch64 Blobs
+=====================
+
+This directory should contain the kernel and initramfs for aarch64 vdkr.
+
+Required files:
+  - Image              (Linux kernel for aarch64)
+  - initramfs.cpio.gz  (vdkr initramfs with Docker tools)
+
+To build these blobs:
+
+  MACHINE=qemuarm64 bitbake vdkr-initramfs-create
+
+Then copy from the deploy directory:
+
+  cp tmp/deploy/images/qemuarm64/vdkr-initramfs/Image \
+     meta-virtualization/recipes-containers/vdkr/files/blobs/aarch64/
+
+  cp tmp/deploy/images/qemuarm64/vdkr-initramfs/initramfs.cpio.gz \
+     meta-virtualization/recipes-containers/vdkr/files/blobs/aarch64/
+
+Alternatively, set VDKR_USE_DEPLOY = "1" in local.conf to use blobs
+directly from DEPLOY_DIR without copying to the layer.
