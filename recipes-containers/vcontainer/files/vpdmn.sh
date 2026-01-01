@@ -1,0 +1,1957 @@
+#!/bin/bash
+# SPDX-FileCopyrightText: Copyright (C) 2025 Bruce Ashfield
+#
+# SPDX-License-Identifier: MIT
+#
+# vpdmn: Podman-like interface for cross-architecture container operations
+#
+# This provides a familiar podman-like CLI that executes commands inside
+# a QEMU-emulated environment with the target architecture's Podman.
+#
+# Version: 1.0.0
+#
+# Command naming convention:
+#   - Commands matching Podman's syntax/semantics use Podman's name (import, load, save, etc.)
+#   - Extended commands with non-Podman behavior use 'v' prefix (vimport)
+
+set -e
+
+VERSION="1.1.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ============================================================================
+# Configuration Management
+# ============================================================================
+# Config directory can be set via:
+#   1. --config-dir command line option
+#   2. VPDMN_CONFIG_DIR environment variable
+#   3. Default: ~/.config/vpdmn
+#
+# Config file format: key=value (one per line)
+# Supported keys: arch, timeout, state-dir, verbose
+# ============================================================================
+
+# Pre-parse --config-dir from command line (needs to happen before detect_default_arch)
+_preparse_config_dir() {
+    local i=1
+    while [ $i -le $# ]; do
+        local arg="${!i}"
+        case "$arg" in
+            --config-dir)
+                i=$((i + 1))
+                echo "${!i}"
+                return
+                ;;
+            --config-dir=*)
+                echo "${arg#--config-dir=}"
+                return
+                ;;
+        esac
+        i=$((i + 1))
+    done
+    echo ""
+}
+
+_PREPARSE_CONFIG_DIR=$(_preparse_config_dir "$@")
+CONFIG_DIR="${_PREPARSE_CONFIG_DIR:-${VPDMN_CONFIG_DIR:-$HOME/.config/vpdmn}}"
+CONFIG_FILE="$CONFIG_DIR/config"
+
+# Read a config value
+# Usage: config_get <key> [default]
+config_get() {
+    local key="$1"
+    local default="$2"
+
+    if [ -f "$CONFIG_FILE" ]; then
+        local value=$(grep "^${key}=" "$CONFIG_FILE" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]')
+        if [ -n "$value" ]; then
+            echo "$value"
+            return
+        fi
+    fi
+    echo "$default"
+}
+
+# Write a config value
+# Usage: config_set <key> <value>
+config_set() {
+    local key="$1"
+    local value="$2"
+
+    mkdir -p "$CONFIG_DIR"
+
+    if [ -f "$CONFIG_FILE" ]; then
+        # Remove existing key
+        grep -v "^${key}=" "$CONFIG_FILE" > "$CONFIG_FILE.tmp" 2>/dev/null || true
+        mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+    fi
+
+    # Add new value
+    echo "${key}=${value}" >> "$CONFIG_FILE"
+}
+
+# Remove a config value
+# Usage: config_unset <key>
+config_unset() {
+    local key="$1"
+
+    if [ -f "$CONFIG_FILE" ]; then
+        grep -v "^${key}=" "$CONFIG_FILE" > "$CONFIG_FILE.tmp" 2>/dev/null || true
+        mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+    fi
+}
+
+# List all config values
+config_list() {
+    if [ -f "$CONFIG_FILE" ]; then
+        cat "$CONFIG_FILE"
+    fi
+}
+
+# Get config default value
+config_default() {
+    local key="$1"
+    case "$key" in
+        arch)      uname -m ;;
+        timeout)   echo "300" ;;
+        state-dir) echo "$HOME/.vpdmn" ;;
+        verbose)   echo "false" ;;
+        *)         echo "" ;;
+    esac
+}
+
+# ============================================================================
+# Architecture Detection
+# ============================================================================
+# Priority order:
+# 1. --arch / -a command line flag (parsed below)
+# 2. Executable name: vpdmn-aarch64 -> aarch64, vpdmn-x86_64 -> x86_64
+# 3. VPDMN_ARCH environment variable
+# 4. Config file: $CONFIG_DIR/config (arch key)
+# 5. Legacy config file: $CONFIG_DIR/arch (for backwards compatibility)
+# 6. Host architecture (uname -m)
+# ============================================================================
+
+detect_arch_from_name() {
+    local prog_name=$(basename "$0")
+    case "$prog_name" in
+        vpdmn-aarch64) echo "aarch64" ;;
+        vpdmn-x86_64)  echo "x86_64" ;;
+        *)             echo "" ;;
+    esac
+}
+
+detect_default_arch() {
+    # Check executable name first
+    local name_arch=$(detect_arch_from_name)
+    if [ -n "$name_arch" ]; then
+        echo "$name_arch"
+        return
+    fi
+
+    # Check environment variable
+    if [ -n "$VPDMN_ARCH" ]; then
+        echo "$VPDMN_ARCH"
+        return
+    fi
+
+    # Check new config file (arch key)
+    local config_arch=$(config_get "arch" "")
+    if [ -n "$config_arch" ]; then
+        echo "$config_arch"
+        return
+    fi
+
+    # Check legacy config file for backwards compatibility
+    local legacy_file="$CONFIG_DIR/arch"
+    if [ -f "$legacy_file" ]; then
+        local legacy_arch=$(cat "$legacy_file" | tr -d '[:space:]')
+        if [ -n "$legacy_arch" ]; then
+            echo "$legacy_arch"
+            return
+        fi
+    fi
+
+    # Fall back to host architecture
+    uname -m
+}
+
+DEFAULT_ARCH=$(detect_default_arch)
+BLOB_DIR="${VPDMN_BLOB_DIR:-}"
+VERBOSE="${VPDMN_VERBOSE:-false}"
+STATELESS="${VPDMN_STATELESS:-false}"
+
+# Default state directory (per-architecture)
+DEFAULT_STATE_DIR="${VPDMN_STATE_DIR:-$HOME/.vpdmn}"
+
+# Runner script (shared with vdkr)
+RUNNER="${VPDMN_RUNNER:-$SCRIPT_DIR/vrunner.sh}"
+
+# Colors (use $'...' for proper escape interpretation)
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[0;33m'
+BLUE=$'\033[0;34m'
+CYAN=$'\033[0;36m'
+BOLD=$'\033[1m'
+NC=$'\033[0m'
+
+# Check OCI image architecture and warn/error if mismatched
+# Usage: check_oci_arch <oci_dir> <target_arch>
+# Returns: 0 if match or non-OCI, 1 if mismatch
+check_oci_arch() {
+    local oci_dir="$1"
+    local target_arch="$2"
+
+    # Only check OCI directories
+    if [ ! -f "$oci_dir/index.json" ]; then
+        return 0
+    fi
+
+    # Try to extract architecture from the OCI image
+    # OCI structure: index.json -> manifest -> config blob -> architecture
+    local image_arch=""
+
+    # First, get the manifest digest from index.json
+    local manifest_digest=$(cat "$oci_dir/index.json" 2>/dev/null | \
+        grep -o '"digest"[[:space:]]*:[[:space:]]*"sha256:[a-f0-9]*"' | head -1 | \
+        sed 's/.*sha256:\([a-f0-9]*\)".*/\1/')
+
+    if [ -n "$manifest_digest" ]; then
+        local manifest_file="$oci_dir/blobs/sha256/$manifest_digest"
+        if [ -f "$manifest_file" ]; then
+            # Get the config digest from manifest
+            local config_digest=$(cat "$manifest_file" 2>/dev/null | \
+                grep -o '"config"[[:space:]]*:[[:space:]]*{[^}]*"digest"[[:space:]]*:[[:space:]]*"sha256:[a-f0-9]*"' | \
+                sed 's/.*sha256:\([a-f0-9]*\)".*/\1/')
+
+            if [ -n "$config_digest" ]; then
+                local config_file="$oci_dir/blobs/sha256/$config_digest"
+                if [ -f "$config_file" ]; then
+                    # Extract architecture from config
+                    image_arch=$(cat "$config_file" 2>/dev/null | \
+                        grep -o '"architecture"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | \
+                        sed 's/.*"\([^"]*\)"$/\1/')
+                fi
+            fi
+        fi
+    fi
+
+    if [ -z "$image_arch" ]; then
+        # Couldn't determine architecture, allow import with warning
+        echo -e "${YELLOW}[vpdmn]${NC} Warning: Could not determine image architecture" >&2
+        return 0
+    fi
+
+    # Normalize architecture names
+    local normalized_image_arch="$image_arch"
+    local normalized_target_arch="$target_arch"
+
+    case "$image_arch" in
+        arm64) normalized_image_arch="aarch64" ;;
+        amd64) normalized_image_arch="x86_64" ;;
+    esac
+
+    case "$target_arch" in
+        arm64) normalized_target_arch="aarch64" ;;
+        amd64) normalized_target_arch="x86_64" ;;
+    esac
+
+    if [ "$normalized_image_arch" != "$normalized_target_arch" ]; then
+        echo -e "${RED}[vpdmn]${NC} Architecture mismatch!" >&2
+        echo -e "${RED}[vpdmn]${NC}   Image architecture: ${BOLD}$image_arch${NC}" >&2
+        echo -e "${RED}[vpdmn]${NC}   Target architecture: ${BOLD}$target_arch${NC}" >&2
+        echo -e "${YELLOW}[vpdmn]${NC} Use --arch $image_arch to import to a matching environment" >&2
+        return 1
+    fi
+
+    [ "$VERBOSE" = "true" ] && echo -e "${GREEN}[vpdmn]${NC} Image architecture: $image_arch (matches target)" >&2
+    return 0
+}
+
+show_usage() {
+    local PROG_NAME=$(basename "$0")
+    cat << EOF
+${BOLD}${PROG_NAME}${NC} v$VERSION - Podman CLI for cross-architecture emulation
+
+${BOLD}USAGE:${NC}
+    ${PROG_NAME} [OPTIONS] <command> [args...]
+
+${BOLD}PODMAN-COMPATIBLE COMMANDS:${NC}
+  ${BOLD}Images:${NC}
+    ${CYAN}images${NC}                       List images in emulated Podman
+    ${CYAN}pull${NC} <image>                 Pull image from registry
+    ${CYAN}load${NC} -i <file>               Load Podman image archive (podman save output)
+    ${CYAN}import${NC} <tarball> [name:tag]  Import rootfs tarball as image
+    ${CYAN}save${NC} -o <file> <image>       Save image to tar archive
+    ${CYAN}tag${NC} <source> <target>        Tag an image
+    ${CYAN}rmi${NC} <image>                  Remove an image
+    ${CYAN}history${NC} <image>              Show image layer history
+    ${CYAN}inspect${NC} <image|container>    Display detailed info
+
+  ${BOLD}Containers:${NC}
+    ${CYAN}run${NC} [opts] <image> [cmd]     Run a command in a new container
+    ${CYAN}ps${NC} [options]                 List containers
+    ${CYAN}rm${NC} <container>               Remove a container
+    ${CYAN}logs${NC} <container>             View container logs
+    ${CYAN}start${NC} <container>            Start a stopped container
+    ${CYAN}stop${NC} <container>             Stop a running container
+    ${CYAN}restart${NC} <container>          Restart a container
+    ${CYAN}kill${NC} <container>             Kill a running container
+    ${CYAN}pause${NC} <container>            Pause a running container
+    ${CYAN}unpause${NC} <container>          Unpause a container
+    ${CYAN}commit${NC} <container> <image>   Create image from container
+    ${CYAN}exec${NC} [opts] <container> <cmd>  Execute command in container
+    ${CYAN}cp${NC} <src> <dest>              Copy files to/from container
+
+  ${BOLD}Registry:${NC}
+    ${CYAN}login${NC} [options]              Log in to a registry
+    ${CYAN}logout${NC} [registry]            Log out from a registry
+    ${CYAN}push${NC} <image>                 Push image to registry
+    ${CYAN}search${NC} <term>                Search registries for images
+
+  ${BOLD}System:${NC}
+    ${CYAN}info${NC}                         Display system info
+    ${CYAN}version${NC}                      Show Podman version
+    ${CYAN}system df${NC}                    Show disk usage of images/containers/volumes
+    ${CYAN}system prune${NC}                 Remove unused data
+    ${CYAN}system prune -a${NC}              Remove all unused images
+
+${BOLD}EXTENDED COMMANDS (vpdmn-specific):${NC}
+    ${CYAN}vimport${NC} <path> [name:tag]    Import from OCI dir, tarball, or directory (auto-detect)
+    ${CYAN}vrun${NC} [opts] <image> [cmd]    Run command, clearing entrypoint (see RUN vs VRUN below)
+    ${CYAN}vstorage${NC}                     List all storage directories (alias: vstorage list)
+    ${CYAN}vstorage list${NC}                List all storage directories with details
+    ${CYAN}vstorage path [arch]${NC}         Show path to storage directory
+    ${CYAN}vstorage df${NC}                  Show detailed disk usage breakdown
+    ${CYAN}vstorage clean [arch|--all]${NC}  Clean storage directories (stops memres first)
+    ${CYAN}clean${NC}                        ${YELLOW}[DEPRECATED]${NC} Use 'vstorage clean' instead
+
+${BOLD}MEMORY RESIDENT MODE (vmemres):${NC}
+    ${CYAN}vmemres start${NC} [-p port:port] Start memory resident VM in background
+    ${CYAN}vmemres stop${NC}                 Stop memory resident VM
+    ${CYAN}vmemres restart${NC} [--clean]    Restart VM (optionally clean state first)
+    ${CYAN}vmemres status${NC}               Show memory resident VM status
+    ${CYAN}vmemres list${NC}                 List all running memres instances
+    (Note: 'memres' also works as an alias for 'vmemres')
+
+    Port forwarding with vmemres:
+      -p <host_port>:<container_port>[/protocol]
+         Forward host port to container port (protocol: tcp or udp, default: tcp)
+         Multiple -p options can be specified
+
+${BOLD}RUN vs VRUN:${NC}
+    ${CYAN}run${NC}   - Full Podman passthrough. Entrypoint is honored.
+            Command args are passed TO the entrypoint.
+            Example: run alpine /bin/sh    -> entrypoint receives '/bin/sh' as arg
+    ${CYAN}vrun${NC}  - Convenience wrapper. Clears entrypoint when command given.
+            Command args become the container's command directly.
+            Example: vrun alpine /bin/sh   -> runs /bin/sh as PID 1
+
+    Use 'run' when you need --entrypoint, -e, --rm, or other podman options.
+    Use 'vrun' for simple "run this command in image" cases.
+
+${BOLD}CONFIGURATION (vconfig):${NC}
+    ${CYAN}vconfig${NC}                      Show all configuration values
+    ${CYAN}vconfig${NC} <key>                Get configuration value
+    ${CYAN}vconfig${NC} <key> <value>        Set configuration value
+    ${CYAN}vconfig${NC} <key> --reset        Reset to default value
+
+    Supported keys: arch, timeout, state-dir, verbose
+    Config file: \$CONFIG_DIR/config (default: ~/.config/vpdmn/config)
+
+${BOLD}GLOBAL OPTIONS:${NC}
+    --arch, -a <arch>     Target architecture: x86_64 or aarch64 [default: ${DEFAULT_ARCH}]
+    --config-dir <path>   Configuration directory [default: ~/.config/vpdmn]
+    --instance, -I <name> Use named instance (shortcut for --state-dir ~/.vpdmn/<name>)
+    --blob-dir <path>     Path to kernel/initramfs blobs (override default)
+    --stateless           Start with fresh Podman state (no persistence)
+    --state-dir <path>    Override state directory [default: ~/.vpdmn/<arch>]
+    --storage <file>      Export podman storage after command (tar file)
+    --input-storage <tar> Load Podman state from tar before command
+    --no-kvm              Disable KVM acceleration (use TCG emulation)
+    --verbose, -v         Enable verbose output
+    --help, -h            Show this help
+
+${BOLD}PODMAN RUN/VRUN OPTIONS:${NC}
+    All podman run options are passed through (e.g., -it, -e, -p, --rm, etc.)
+    Interactive mode (-it) automatically handles daemon stop/restart
+    -v <host>:<container>[:mode]  Mount host path in container (requires vmemres)
+                                   mode: ro (read-only) or rw (read-write, default)
+
+${BOLD}EXAMPLES:${NC}
+    # List images (uses persistent state by default)
+    ${PROG_NAME} images
+
+    # Import rootfs tarball (matches 'podman import' exactly)
+    ${PROG_NAME} import rootfs.tar myapp:latest
+
+    # Import OCI directory (extended command, auto-detects format)
+    ${PROG_NAME} vimport ./container-oci/ myapp:latest
+    ${PROG_NAME} images        # Image persists!
+
+    # Save image to tar archive
+    ${PROG_NAME} save -o myapp.tar myapp:latest
+
+    # Load a Podman image archive (from 'podman save')
+    ${PROG_NAME} load -i myapp.tar
+
+    # Start fresh (ignore existing state)
+    ${PROG_NAME} --stateless images
+
+    # Export storage for deployment to target
+    ${PROG_NAME} --storage /tmp/podman-storage.tar vimport ./container-oci/ myapp:latest
+
+    # Run a command in a container (podman-compatible syntax)
+    ${PROG_NAME} run alpine /bin/echo hello
+    ${PROG_NAME} run --rm alpine uname -m      # Check container architecture
+
+    # Interactive shell (podman-compatible syntax)
+    ${PROG_NAME} run -it alpine /bin/sh
+
+    # With environment variables and other podman options
+    ${PROG_NAME} run --rm -e FOO=bar myapp:latest
+    ${PROG_NAME} run -it -p 8080:80 nginx:latest
+
+    # Pull an image from a registry
+    ${PROG_NAME} pull alpine:latest
+
+    # vrun: convenience wrapper (clears entrypoint when command given)
+    ${PROG_NAME} vrun myapp:latest /bin/ls -la  # Runs /bin/ls directly, not via entrypoint
+
+${BOLD}NOTES:${NC}
+    - Architecture detection (in priority order):
+        1. --arch / -a flag
+        2. Executable name (vpdmn-aarch64 or vpdmn-x86_64)
+        3. VPDMN_ARCH environment variable
+        4. Config file: ~/.config/vpdmn/arch
+        5. Host architecture (uname -m)
+    - Current architecture: ${DEFAULT_ARCH}
+    - State persists in ~/.vpdmn/<arch>/
+    - Use --stateless for fresh Podman state each run
+    - Use --storage to export Podman storage to tar file
+    - run vs vrun:
+        run  = exact podman run syntax (entrypoint honored)
+        vrun = clears entrypoint when command given (runs command directly)
+
+${BOLD}ENVIRONMENT:${NC}
+    VPDMN_BLOB_DIR   Path to kernel/initramfs blobs
+    VPDMN_STATE_DIR  Base directory for state [default: ~/.vpdmn]
+    VPDMN_STATELESS  Run stateless by default (true/false)
+    VPDMN_VERBOSE    Enable verbose output (true/false)
+
+EOF
+}
+
+# Build runner args
+build_runner_args() {
+    local args=()
+
+    # Specify runtime (docker for vdkr, podman for vpdmn)
+    args+=("--runtime" "podman")
+    args+=("--arch" "$TARGET_ARCH")
+
+    [ -n "$BLOB_DIR" ] && args+=("--blob-dir" "$BLOB_DIR")
+    [ "$VERBOSE" = "true" ] && args+=("--verbose")
+    [ "$NETWORK" = "true" ] && args+=("--network")
+    [ "$INTERACTIVE" = "true" ] && args+=("--interactive")
+    [ -n "$STORAGE_OUTPUT" ] && args+=("--output-type" "storage" "--output" "$STORAGE_OUTPUT")
+    [ -n "$STATE_DIR" ] && args+=("--state-dir" "$STATE_DIR")
+    [ -n "$INPUT_STORAGE" ] && args+=("--input-storage" "$INPUT_STORAGE")
+    [ "$DISABLE_KVM" = "true" ] && args+=("--no-kvm")
+
+    # Add port forwards (each -p adds a --port-forward)
+    for pf in "${PORT_FORWARDS[@]}"; do
+        args+=("--port-forward" "$pf")
+    done
+
+    echo "${args[@]}"
+}
+
+# Parse global options first
+TARGET_ARCH="$DEFAULT_ARCH"
+STORAGE_OUTPUT=""
+STATE_DIR=""
+INPUT_STORAGE=""
+NETWORK="true"
+INTERACTIVE="false"
+PORT_FORWARDS=()
+DISABLE_KVM="false"
+COMMAND=""
+COMMAND_ARGS=()
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        --arch|-a)
+            # Only parse as global option before command is set
+            if [ -z "$COMMAND" ]; then
+                TARGET_ARCH="$2"
+                shift 2
+            else
+                COMMAND_ARGS+=("$1")
+                shift
+            fi
+            ;;
+        --blob-dir)
+            BLOB_DIR="$2"
+            shift 2
+            ;;
+        --storage)
+            STORAGE_OUTPUT="$2"
+            shift 2
+            ;;
+        --state-dir)
+            STATE_DIR="$2"
+            shift 2
+            ;;
+        --instance|-I)
+            # Shortcut: -I web expands to --state-dir ~/.vpdmn/web
+            STATE_DIR="$DEFAULT_STATE_DIR/$2"
+            shift 2
+            ;;
+        --config-dir)
+            # Already pre-parsed, just consume it
+            shift 2
+            ;;
+        --config-dir=*)
+            # Already pre-parsed, just consume it
+            shift
+            ;;
+        --input-storage)
+            INPUT_STORAGE="$2"
+            shift 2
+            ;;
+        --stateless)
+            STATELESS="true"
+            shift
+            ;;
+        --no-network)
+            NETWORK="false"
+            shift
+            ;;
+        --no-kvm)
+            DISABLE_KVM="true"
+            shift
+            ;;
+        -it|--interactive)
+            INTERACTIVE="true"
+            shift
+            ;;
+        -i)
+            # -i alone means interactive, but only before we have a command
+            # After a command, -i might be an argument (e.g., load -i file)
+            if [ -z "$COMMAND" ]; then
+                INTERACTIVE="true"
+            else
+                COMMAND_ARGS+=("$1")
+            fi
+            shift
+            ;;
+        -t)
+            # -t alone means interactive (allocate TTY) before command
+            # After command, -t might be an argument
+            if [ -z "$COMMAND" ]; then
+                INTERACTIVE="true"
+            else
+                COMMAND_ARGS+=("$1")
+            fi
+            shift
+            ;;
+        --verbose)
+            VERBOSE="true"
+            shift
+            ;;
+        -v)
+            # -v can mean verbose (before command) or volume (after command like run/vrun)
+            if [ -z "$COMMAND" ]; then
+                VERBOSE="true"
+            else
+                # After command, -v is likely a volume flag - pass to subcommand
+                COMMAND_ARGS+=("$1")
+            fi
+            shift
+            ;;
+        --help|-h)
+            show_usage
+            exit 0
+            ;;
+        --version)
+            echo "vpdmn version $VERSION"
+            exit 0
+            ;;
+        -*)
+            # Unknown option - might be for subcommand
+            COMMAND_ARGS+=("$1")
+            shift
+            ;;
+        *)
+            if [ -z "$COMMAND" ]; then
+                COMMAND="$1"
+            else
+                COMMAND_ARGS+=("$1")
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [ -z "$COMMAND" ]; then
+    show_usage
+    exit 0
+fi
+
+# Set up state directory (default to persistent unless --stateless)
+if [ "$STATELESS" != "true" ] && [ -z "$STATE_DIR" ] && [ -z "$INPUT_STORAGE" ]; then
+    STATE_DIR="$DEFAULT_STATE_DIR/$TARGET_ARCH"
+fi
+
+# Check runner exists
+if [ ! -x "$RUNNER" ]; then
+    echo -e "${RED}[vpdmn]${NC} Runner script not found: $RUNNER" >&2
+    exit 1
+fi
+
+# Helper function to check if daemon is running
+daemon_is_running() {
+    # Use STATE_DIR if set, otherwise use default
+    local state_dir="${STATE_DIR:-$DEFAULT_STATE_DIR/$TARGET_ARCH}"
+    local pid_file="$state_dir/daemon.pid"
+    if [ -f "$pid_file" ]; then
+        local pid=$(cat "$pid_file")
+        if [ -d "/proc/$pid" ]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Helper function to run command via daemon or regular mode
+run_podman_command() {
+    local podman_cmd="$1"
+    local runner_args=$(build_runner_args)
+
+    if daemon_is_running; then
+        # Use daemon mode - faster
+        [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[vpdmn]${NC} Using daemon mode" >&2
+        "$RUNNER" $runner_args --daemon-send "$podman_cmd"
+    else
+        # Regular mode - start QEMU for this command
+        "$RUNNER" $runner_args -- "$podman_cmd"
+    fi
+}
+
+# Helper function to run command with input
+# Uses daemon mode with virtio-9p if daemon is running, otherwise regular mode
+run_podman_command_with_input() {
+    local input_path="$1"
+    local input_type="$2"
+    local podman_cmd="$3"
+    local runner_args=$(build_runner_args)
+
+    if daemon_is_running; then
+        # Use daemon mode with virtio-9p shared directory
+        [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[vpdmn]${NC} Using daemon mode for file I/O" >&2
+        "$RUNNER" $runner_args --input "$input_path" --input-type "$input_type" --daemon-send-input -- "$podman_cmd"
+    else
+        # Regular mode - start QEMU for this command
+        "$RUNNER" $runner_args --input "$input_path" --input-type "$input_type" -- "$podman_cmd"
+    fi
+}
+
+# ============================================================================
+# Volume Mount Support
+# ============================================================================
+# Volumes are copied to the share directory before running the container.
+# Format: -v /host/path:/container/path[:ro|:rw]
+#
+# Implementation:
+#   - Copy host path to $SHARE_DIR/volumes/<hash>/
+#   - Transform -v to use /mnt/share/volumes/<hash>:/container/path
+#   - After container exits, sync back for :rw mounts (default)
+#
+# Limitations:
+#   - Requires daemon mode (memres) for volume mounts
+#   - Changes in container are synced back after container exits (not real-time)
+#   - Large volumes may be slow to copy
+# ============================================================================
+
+# Array to track volume mounts for cleanup/sync
+declare -a VOLUME_MOUNTS=()
+declare -a VOLUME_MODES=()
+
+# Generate a short hash for volume directory naming
+volume_hash() {
+    echo "$1" | md5sum | cut -c1-8
+}
+
+# Global to receive result from prepare_volume (avoids subshell issue)
+PREPARE_VOLUME_RESULT=""
+
+# Prepare a volume mount: copy host path to share directory
+# Sets PREPARE_VOLUME_RESULT to the guest path (avoids subshell issue with arrays)
+prepare_volume() {
+    local host_path="$1"
+    local container_path="$2"
+    local mode="$3"  # ro or rw (default: rw)
+
+    [ -z "$mode" ] && mode="rw"
+    PREPARE_VOLUME_RESULT=""
+
+    # Validate host path exists
+    if [ ! -e "$host_path" ]; then
+        echo -e "${RED}[vpdmn]${NC} Volume source not found: $host_path" >&2
+        return 1
+    fi
+
+    # Get share directory
+    local share_dir="${STATE_DIR:-$DEFAULT_STATE_DIR/$TARGET_ARCH}/share"
+    local volumes_dir="$share_dir/volumes"
+
+    # Create volumes directory
+    mkdir -p "$volumes_dir"
+
+    # Generate unique directory name based on host path
+    local hash=$(volume_hash "$host_path")
+    local vol_dir="$volumes_dir/$hash"
+
+    # Clean and copy
+    rm -rf "$vol_dir"
+    mkdir -p "$vol_dir"
+
+    if [ -d "$host_path" ]; then
+        # Directory: copy contents
+        cp -rL "$host_path"/* "$vol_dir/" 2>/dev/null || true
+        [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[vpdmn]${NC} Volume: copied directory $host_path -> /mnt/share/volumes/$hash" >&2
+    else
+        # File: copy file
+        cp -L "$host_path" "$vol_dir/"
+        [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[vpdmn]${NC} Volume: copied file $host_path -> /mnt/share/volumes/$hash" >&2
+    fi
+
+    # Sync to ensure data is visible to guest
+    sync
+
+    # Track for later sync-back (in parent shell, not subshell)
+    VOLUME_MOUNTS+=("$host_path:$vol_dir:$container_path")
+    VOLUME_MODES+=("$mode")
+
+    # Set result in global variable (caller reads this, not $(prepare_volume))
+    PREPARE_VOLUME_RESULT="/mnt/share/volumes/$hash"
+}
+
+# Sync volumes back from guest to host (for :rw mounts)
+sync_volumes_back() {
+    local share_dir="${STATE_DIR:-$DEFAULT_STATE_DIR/$TARGET_ARCH}/share"
+    local volumes_dir="$share_dir/volumes"
+
+    # Wait briefly for 9p filesystem to sync writes from guest to host
+    # The 9p mount uses cache=none but there can still be propagation delay
+    sleep 1
+    sync
+
+    for i in "${!VOLUME_MOUNTS[@]}"; do
+        local mount="${VOLUME_MOUNTS[$i]}"
+        local mode="${VOLUME_MODES[$i]}"
+
+        if [ "$mode" = "rw" ]; then
+            # Parse mount string: host_path:vol_dir:container_path
+            local host_path=$(echo "$mount" | cut -d: -f1)
+            local vol_dir=$(echo "$mount" | cut -d: -f2)
+
+            if [ -d "$vol_dir" ] && [ -d "$host_path" ]; then
+                [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[vpdmn]${NC} Syncing volume back: $vol_dir -> $host_path" >&2
+                # Use rsync if available, otherwise cp
+                if command -v rsync >/dev/null 2>&1; then
+                    rsync -a --delete "$vol_dir/" "$host_path/"
+                else
+                    rm -rf "$host_path"/*
+                    cp -rL "$vol_dir"/* "$host_path/" 2>/dev/null || true
+                fi
+            elif [ -f "$host_path" ]; then
+                # Single file mount
+                local filename=$(basename "$host_path")
+                if [ -f "$vol_dir/$filename" ]; then
+                    cp -L "$vol_dir/$filename" "$host_path"
+                fi
+            fi
+        fi
+    done
+}
+
+# Clean up volume directories
+cleanup_volumes() {
+    local share_dir="${STATE_DIR:-$DEFAULT_STATE_DIR/$TARGET_ARCH}/share"
+    local volumes_dir="$share_dir/volumes"
+
+    if [ -d "$volumes_dir" ]; then
+        rm -rf "$volumes_dir"
+    fi
+
+    # Clear tracking arrays
+    VOLUME_MOUNTS=()
+    VOLUME_MODES=()
+}
+
+# Global variable to hold transformed volume arguments
+TRANSFORMED_VOLUME_ARGS=()
+
+# Parse volume mounts from arguments and transform them
+# Input: array elements passed as arguments
+# Output: sets TRANSFORMED_VOLUME_ARGS with transformed arguments
+# Side effect: populates VOLUME_MOUNTS array
+parse_and_prepare_volumes() {
+    TRANSFORMED_VOLUME_ARGS=()
+    local args=("$@")
+    local i=0
+
+    while [ $i -lt ${#args[@]} ]; do
+        local arg="${args[$i]}"
+
+        case "$arg" in
+            -v|--volume)
+                # Next arg is the volume spec
+                i=$((i + 1))
+                if [ $i -ge ${#args[@]} ]; then
+                    echo -e "${RED}[vpdmn]${NC} -v requires an argument" >&2
+                    return 1
+                fi
+                local vol_spec="${args[$i]}"
+
+                # Parse volume spec: host:container[:mode]
+                local host_path=$(echo "$vol_spec" | cut -d: -f1)
+                local container_path=$(echo "$vol_spec" | cut -d: -f2)
+                local mode=$(echo "$vol_spec" | cut -d: -f3)
+
+                # Make host path absolute
+                if [[ "$host_path" != /* ]]; then
+                    host_path="$(pwd)/$host_path"
+                fi
+
+                # Prepare volume (sets PREPARE_VOLUME_RESULT global)
+                prepare_volume "$host_path" "$container_path" "$mode" || return 1
+                local guest_path="$PREPARE_VOLUME_RESULT"
+
+                # Add transformed volume option
+                if [ -d "$host_path" ]; then
+                    TRANSFORMED_VOLUME_ARGS+=("-v" "${guest_path}:${container_path}${mode:+:$mode}")
+                else
+                    # For single file, include filename
+                    local filename=$(basename "$host_path")
+                    TRANSFORMED_VOLUME_ARGS+=("-v" "${guest_path}/${filename}:${container_path}${mode:+:$mode}")
+                fi
+                ;;
+            *)
+                TRANSFORMED_VOLUME_ARGS+=("$arg")
+                ;;
+        esac
+        i=$((i + 1))
+    done
+}
+
+# Handle commands
+case "$COMMAND" in
+    images)
+        # podman images
+        run_podman_command "podman images ${COMMAND_ARGS[*]}"
+        ;;
+
+    pull)
+        # podman pull <image>
+        # Daemon mode already has networking enabled, so this works via daemon
+        if [ ${#COMMAND_ARGS[@]} -lt 1 ]; then
+            echo -e "${RED}[vpdmn]${NC} pull requires <image>" >&2
+            exit 1
+        fi
+
+        IMAGE_NAME="${COMMAND_ARGS[0]}"
+
+        if daemon_is_running; then
+            # Use daemon mode (already has networking)
+            run_podman_command "podman pull $IMAGE_NAME && podman images"
+        else
+            # Regular mode - need to enable networking
+            NETWORK="true"
+            RUNNER_ARGS=$(build_runner_args)
+            "$RUNNER" $RUNNER_ARGS -- "podman pull $IMAGE_NAME && podman images"
+        fi
+        ;;
+
+    load)
+        # podman load -i <file>
+        # Parse -i argument
+        INPUT_FILE=""
+        LOAD_ARGS=()
+        i=0
+        while [ $i -lt ${#COMMAND_ARGS[@]} ]; do
+            arg="${COMMAND_ARGS[$i]}"
+            case "$arg" in
+                -i|--input)
+                    i=$((i + 1))
+                    INPUT_FILE="${COMMAND_ARGS[$i]}"
+                    ;;
+                *)
+                    LOAD_ARGS+=("$arg")
+                    ;;
+            esac
+            i=$((i + 1))
+        done
+
+        if [ -z "$INPUT_FILE" ]; then
+            echo -e "${RED}[vpdmn]${NC} load requires -i <file>" >&2
+            exit 1
+        fi
+
+        if [ ! -f "$INPUT_FILE" ]; then
+            echo -e "${RED}[vpdmn]${NC} File not found: $INPUT_FILE" >&2
+            exit 1
+        fi
+
+        run_podman_command_with_input "$INPUT_FILE" "tar" \
+            "podman load -i {INPUT}/$(basename "$INPUT_FILE") ${LOAD_ARGS[*]}"
+        ;;
+
+    import)
+        # podman import <tarball> [name:tag] - matches Podman's import exactly
+        # Only accepts tarballs (rootfs archives), not OCI directories
+        if [ ${#COMMAND_ARGS[@]} -lt 1 ]; then
+            echo -e "${RED}[vpdmn]${NC} import requires <tarball> [name:tag]" >&2
+            echo "For OCI directories, use 'vimport' instead." >&2
+            exit 1
+        fi
+
+        INPUT_PATH="${COMMAND_ARGS[0]}"
+        IMAGE_NAME="${COMMAND_ARGS[1]:-imported:latest}"
+
+        if [ ! -e "$INPUT_PATH" ]; then
+            echo -e "${RED}[vpdmn]${NC} Not found: $INPUT_PATH" >&2
+            exit 1
+        fi
+
+        # Only accept files (tarballs), not directories
+        if [ -d "$INPUT_PATH" ]; then
+            echo -e "${RED}[vpdmn]${NC} import only accepts tarballs, not directories" >&2
+            echo "For OCI directories, use: vpdmn vimport $INPUT_PATH $IMAGE_NAME" >&2
+            exit 1
+        fi
+
+        run_podman_command_with_input "$INPUT_PATH" "tar" \
+            "podman import {INPUT}/$(basename "$INPUT_PATH") $IMAGE_NAME && podman images"
+        ;;
+
+    vimport)
+        # Extended import: handles OCI directories, tarballs, and plain directories
+        # Auto-detects format
+        if [ ${#COMMAND_ARGS[@]} -lt 1 ]; then
+            echo -e "${RED}[vpdmn]${NC} vimport requires <path> [name:tag]" >&2
+            exit 1
+        fi
+
+        INPUT_PATH="${COMMAND_ARGS[0]}"
+        IMAGE_NAME="${COMMAND_ARGS[1]:-imported:latest}"
+
+        if [ ! -e "$INPUT_PATH" ]; then
+            echo -e "${RED}[vpdmn]${NC} Not found: $INPUT_PATH" >&2
+            exit 1
+        fi
+
+        # Detect input type
+        if [ -d "$INPUT_PATH" ]; then
+            if [ -f "$INPUT_PATH/index.json" ] || [ -f "$INPUT_PATH/oci-layout" ]; then
+                INPUT_TYPE="oci"
+
+                # Check architecture before importing
+                if ! check_oci_arch "$INPUT_PATH" "$TARGET_ARCH"; then
+                    exit 1
+                fi
+
+                # Use skopeo to properly import OCI image with full metadata (entrypoint, cmd, etc.)
+                # For Podman, we can use skopeo or podman pull directly from OCI
+                PODMAN_CMD="skopeo copy oci:{INPUT} containers-storage:$IMAGE_NAME && podman images"
+            else
+                # Directory but not OCI - check if it looks like a deploy/images dir
+                # and provide a helpful hint
+                if ls "$INPUT_PATH"/*-oci >/dev/null 2>&1; then
+                    echo -e "${RED}[vpdmn]${NC} Directory is not an OCI container: $INPUT_PATH" >&2
+                    echo -e "${YELLOW}[vpdmn]${NC} Found OCI directories inside. Did you mean one of these?" >&2
+                    for oci_dir in "$INPUT_PATH"/*-oci; do
+                        if [ -d "$oci_dir" ]; then
+                            echo "    $(basename "$oci_dir")" >&2
+                        fi
+                    done
+                    echo "" >&2
+                    echo "Example: vpdmn vimport $INPUT_PATH/$(ls "$INPUT_PATH" | grep -m1 '\-oci$') myimage:latest" >&2
+                    exit 1
+                fi
+                INPUT_TYPE="dir"
+                PODMAN_CMD="podman import {INPUT} $IMAGE_NAME && podman images"
+            fi
+        else
+            INPUT_TYPE="tar"
+            PODMAN_CMD="podman import {INPUT}/$(basename "$INPUT_PATH") $IMAGE_NAME && podman images"
+        fi
+
+        run_podman_command_with_input "$INPUT_PATH" "$INPUT_TYPE" "$PODMAN_CMD"
+        ;;
+
+    save)
+        # podman save -o <file> <image>
+        OUTPUT_FILE=""
+        IMAGE_NAME=""
+        i=0
+        while [ $i -lt ${#COMMAND_ARGS[@]} ]; do
+            arg="${COMMAND_ARGS[$i]}"
+            case "$arg" in
+                -o|--output)
+                    i=$((i + 1))
+                    OUTPUT_FILE="${COMMAND_ARGS[$i]}"
+                    ;;
+                *)
+                    IMAGE_NAME="$arg"
+                    ;;
+            esac
+            i=$((i + 1))
+        done
+
+        if [ -z "$OUTPUT_FILE" ]; then
+            echo -e "${RED}[vpdmn]${NC} save requires -o <file>" >&2
+            exit 1
+        fi
+
+        if [ -z "$IMAGE_NAME" ]; then
+            echo -e "${RED}[vpdmn]${NC} save requires <image> name" >&2
+            exit 1
+        fi
+
+        if daemon_is_running; then
+            # Use daemon mode with virtio-9p - save to shared dir, then copy to host
+            [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[vpdmn]${NC} Using daemon mode for save" >&2
+            SHARE_DIR="${STATE_DIR:-$DEFAULT_STATE_DIR/$TARGET_ARCH}/share"
+
+            # Clear share dir and run save command
+            rm -rf "$SHARE_DIR"/* 2>/dev/null || true
+            run_podman_command "podman save -o /mnt/share/output.tar $IMAGE_NAME"
+
+            # Copy from share dir to output file
+            if [ -f "$SHARE_DIR/output.tar" ]; then
+                cp "$SHARE_DIR/output.tar" "$OUTPUT_FILE"
+                rm -f "$SHARE_DIR/output.tar"
+                echo -e "${GREEN}[vpdmn]${NC} Saved to $OUTPUT_FILE ($(du -h "$OUTPUT_FILE" | cut -f1))"
+            else
+                echo -e "${RED}[vpdmn]${NC} Save failed - output not found in shared directory" >&2
+                exit 1
+            fi
+        else
+            # Regular mode - use serial output
+            RUNNER_ARGS=$(build_runner_args)
+            RUNNER_ARGS=$(echo "$RUNNER_ARGS" | sed 's/--output-type storage//')
+            "$RUNNER" $RUNNER_ARGS --output-type tar --output "$OUTPUT_FILE" \
+                -- "podman save -o /tmp/output.tar $IMAGE_NAME"
+        fi
+        ;;
+
+    tag|rmi)
+        # Commands that work with existing images
+        run_podman_command "podman $COMMAND ${COMMAND_ARGS[*]}"
+        ;;
+
+    # Container lifecycle commands
+    ps)
+        # List containers
+        run_podman_command "podman ps ${COMMAND_ARGS[*]}"
+        ;;
+
+    rm)
+        # Remove containers
+        run_podman_command "podman rm ${COMMAND_ARGS[*]}"
+        ;;
+
+    logs)
+        # View container logs
+        run_podman_command "podman logs ${COMMAND_ARGS[*]}"
+        ;;
+
+    inspect)
+        # Inspect container or image
+        run_podman_command "podman inspect ${COMMAND_ARGS[*]}"
+        ;;
+
+    start|stop|restart|kill|pause|unpause)
+        # Container state commands
+        run_podman_command "podman $COMMAND ${COMMAND_ARGS[*]}"
+        ;;
+
+    # Image commands
+    commit)
+        # Commit container to image
+        run_podman_command "podman commit ${COMMAND_ARGS[*]}"
+        ;;
+
+    history)
+        # Show image history
+        run_podman_command "podman history ${COMMAND_ARGS[*]}"
+        ;;
+
+    # Registry commands
+    push)
+        # Push image to registry
+        run_podman_command "podman push ${COMMAND_ARGS[*]}"
+        ;;
+
+    search)
+        # Search registries
+        run_podman_command "podman search ${COMMAND_ARGS[*]}"
+        ;;
+
+    login)
+        # Login to registry - may need credentials via stdin
+        # For non-interactive: podman login -u user -p pass registry
+        run_podman_command "podman login ${COMMAND_ARGS[*]}"
+        ;;
+
+    logout)
+        # Logout from registry
+        run_podman_command "podman logout ${COMMAND_ARGS[*]}"
+        ;;
+
+    # Podman exec - execute command in running container
+    exec)
+        if [ ${#COMMAND_ARGS[@]} -lt 2 ]; then
+            echo -e "${RED}[vpdmn]${NC} exec requires <container> <command>" >&2
+            exit 1
+        fi
+
+        # Check for interactive flags
+        EXEC_INTERACTIVE=false
+        EXEC_ARGS=()
+        for arg in "${COMMAND_ARGS[@]}"; do
+            case "$arg" in
+                -it|-ti|--interactive|--tty)
+                    EXEC_INTERACTIVE=true
+                    EXEC_ARGS+=("$arg")
+                    ;;
+                -i|-t)
+                    EXEC_INTERACTIVE=true
+                    EXEC_ARGS+=("$arg")
+                    ;;
+                *)
+                    EXEC_ARGS+=("$arg")
+                    ;;
+            esac
+        done
+
+        if [ "$EXEC_INTERACTIVE" = "true" ]; then
+            # Interactive exec can use daemon_interactive if daemon is running
+            if daemon_is_running; then
+                # Use daemon interactive mode - keeps daemon running
+                [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[vpdmn]${NC} Using daemon interactive mode" >&2
+                RUNNER_ARGS=$(build_runner_args)
+                "$RUNNER" $RUNNER_ARGS --daemon-interactive -- "podman exec ${EXEC_ARGS[*]}"
+            else
+                # No daemon running, use regular QEMU
+                RUNNER_ARGS=$(build_runner_args)
+                "$RUNNER" $RUNNER_ARGS -- "podman exec ${EXEC_ARGS[*]}"
+            fi
+        else
+            # Non-interactive exec via daemon
+            run_podman_command "podman exec ${EXEC_ARGS[*]}"
+        fi
+        ;;
+
+    # Podman cp - copy files to/from container
+    cp)
+        if [ ${#COMMAND_ARGS[@]} -lt 2 ]; then
+            echo -e "${RED}[vpdmn]${NC} cp requires <src> <dest>" >&2
+            echo "Usage: vpdmn cp <container>:<path> <local_path>" >&2
+            echo "       vpdmn cp <local_path> <container>:<path>" >&2
+            exit 1
+        fi
+
+        SRC="${COMMAND_ARGS[0]}"
+        DEST="${COMMAND_ARGS[1]}"
+
+        # Determine direction: host->container or container->host
+        if [[ "$SRC" == *":"* ]] && [[ "$DEST" != *":"* ]]; then
+            # Container to host: podman cp container:/path /local/path
+            # Run podman cp to /mnt/share, then copy from share to host
+            CONTAINER_PATH="$SRC"
+            HOST_PATH="$DEST"
+            SHARE_DIR="${STATE_DIR:-$DEFAULT_STATE_DIR/$TARGET_ARCH}/share"
+
+            if daemon_is_running; then
+                rm -rf "$SHARE_DIR"/* 2>/dev/null || true
+                run_podman_command "podman cp $CONTAINER_PATH /mnt/share/"
+                # Find what was copied and move to destination
+                if [ -n "$(ls -A "$SHARE_DIR" 2>/dev/null)" ]; then
+                    cp -r "$SHARE_DIR"/* "$HOST_PATH" 2>/dev/null || cp -r "$SHARE_DIR"/* "$(dirname "$HOST_PATH")/"
+                    rm -rf "$SHARE_DIR"/*
+                    echo -e "${GREEN}[vpdmn]${NC} Copied to $HOST_PATH"
+                else
+                    echo -e "${RED}[vpdmn]${NC} Copy failed - no files in share directory" >&2
+                    exit 1
+                fi
+            else
+                echo -e "${RED}[vpdmn]${NC} cp requires daemon mode. Start with: vpdmn memres start" >&2
+                exit 1
+            fi
+
+        elif [[ "$SRC" != *":"* ]] && [[ "$DEST" == *":"* ]]; then
+            # Host to container: podman cp /local/path container:/path
+            HOST_PATH="$SRC"
+            CONTAINER_PATH="$DEST"
+
+            if [ ! -e "$HOST_PATH" ]; then
+                echo -e "${RED}[vpdmn]${NC} Source not found: $HOST_PATH" >&2
+                exit 1
+            fi
+
+            if daemon_is_running; then
+                SHARE_DIR="${STATE_DIR:-$DEFAULT_STATE_DIR/$TARGET_ARCH}/share"
+                rm -rf "$SHARE_DIR"/* 2>/dev/null || true
+                cp -r "$HOST_PATH" "$SHARE_DIR/"
+                sync
+                BASENAME=$(basename "$HOST_PATH")
+                run_podman_command "podman cp /mnt/share/$BASENAME $CONTAINER_PATH"
+                rm -rf "$SHARE_DIR"/*
+                echo -e "${GREEN}[vpdmn]${NC} Copied to $CONTAINER_PATH"
+            else
+                echo -e "${RED}[vpdmn]${NC} cp requires daemon mode. Start with: vpdmn memres start" >&2
+                exit 1
+            fi
+        else
+            echo -e "${RED}[vpdmn]${NC} Invalid cp syntax. One path must be container:path" >&2
+            exit 1
+        fi
+        ;;
+
+    vconfig)
+        # Configuration management (runs on host, not in VM)
+        VALID_KEYS="arch timeout state-dir verbose"
+
+        if [ ${#COMMAND_ARGS[@]} -lt 1 ]; then
+            # Show all config
+            echo "vpdmn configuration ($CONFIG_FILE):"
+            echo ""
+            for key in $VALID_KEYS; do
+                value=$(config_get "$key" "")
+                default=$(config_default "$key")
+                if [ -n "$value" ]; then
+                    echo "  ${CYAN}$key${NC} = $value"
+                else
+                    echo "  ${CYAN}$key${NC} = $default ${YELLOW}(default)${NC}"
+                fi
+            done
+            echo ""
+            echo "Config directory: $CONFIG_DIR"
+        else
+            KEY="${COMMAND_ARGS[0]}"
+            VALUE="${COMMAND_ARGS[1]:-}"
+
+            # Validate key
+            if ! echo "$VALID_KEYS" | grep -qw "$KEY"; then
+                echo -e "${RED}[vpdmn]${NC} Unknown config key: $KEY" >&2
+                echo "Valid keys: $VALID_KEYS" >&2
+                exit 1
+            fi
+
+            if [ -z "$VALUE" ]; then
+                # Get value
+                current=$(config_get "$KEY" "")
+                default=$(config_default "$KEY")
+                if [ -n "$current" ]; then
+                    echo "$current"
+                else
+                    echo "$default"
+                fi
+            elif [ "$VALUE" = "--reset" ]; then
+                # Reset to default
+                config_unset "$KEY"
+                echo "Reset $KEY to default: $(config_default "$KEY")"
+            else
+                # Validate value for arch
+                if [ "$KEY" = "arch" ]; then
+                    case "$VALUE" in
+                        aarch64|x86_64) ;;
+                        *)
+                            echo -e "${RED}[vpdmn]${NC} Invalid architecture: $VALUE" >&2
+                            echo "Valid values: aarch64, x86_64" >&2
+                            exit 1
+                            ;;
+                    esac
+                fi
+
+                # Validate value for verbose
+                if [ "$KEY" = "verbose" ]; then
+                    case "$VALUE" in
+                        true|false) ;;
+                        *)
+                            echo -e "${RED}[vpdmn]${NC} Invalid verbose value: $VALUE" >&2
+                            echo "Valid values: true, false" >&2
+                            exit 1
+                            ;;
+                    esac
+                fi
+
+                # Set value
+                config_set "$KEY" "$VALUE"
+                echo "Set $KEY = $VALUE"
+            fi
+        fi
+        ;;
+
+    clean)
+        # DEPRECATED: Use 'vstorage clean' instead
+        echo -e "${YELLOW}[vpdmn]${NC} DEPRECATED: 'clean' is deprecated, use 'vstorage clean' instead" >&2
+        echo -e "${YELLOW}[vpdmn]${NC}   vstorage clean          - clean current architecture" >&2
+        echo -e "${YELLOW}[vpdmn]${NC}   vstorage clean <arch>   - clean specific architecture" >&2
+        echo -e "${YELLOW}[vpdmn]${NC}   vstorage clean --all    - clean all architectures" >&2
+        echo "" >&2
+
+        # Still perform the clean for now (will be removed in future version)
+        CLEAN_DIR="${STATE_DIR:-$DEFAULT_STATE_DIR/$TARGET_ARCH}"
+        if [ -d "$CLEAN_DIR" ]; then
+            # Stop memres if running
+            if [ -f "$CLEAN_DIR/daemon.pid" ]; then
+                pid=$(cat "$CLEAN_DIR/daemon.pid" 2>/dev/null)
+                if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+                    echo -e "${YELLOW}[vpdmn]${NC} Stopping memres (PID $pid)..."
+                    kill "$pid" 2>/dev/null || true
+                fi
+            fi
+            echo -e "${YELLOW}[vpdmn]${NC} Removing state directory: $CLEAN_DIR"
+            rm -rf "$CLEAN_DIR"
+            echo -e "${GREEN}[vpdmn]${NC} State cleaned. Next run will start fresh."
+        else
+            echo -e "${GREEN}[vpdmn]${NC} No state directory found for $TARGET_ARCH"
+        fi
+        ;;
+
+    info)
+        run_podman_command "podman info"
+        ;;
+
+    version)
+        run_podman_command "podman version"
+        ;;
+
+    system)
+        # Passthrough to podman system commands (df, prune, migrate, etc.)
+        if [ ${#COMMAND_ARGS[@]} -lt 1 ]; then
+            echo -e "${RED}[vpdmn]${NC} system requires a subcommand: df, prune, migrate, info" >&2
+            exit 1
+        fi
+        run_podman_command "podman system ${COMMAND_ARGS[*]}"
+        ;;
+
+    vstorage)
+        # Host-side storage management (runs on host, not in VM)
+        if [ ${#COMMAND_ARGS[@]} -lt 1 ]; then
+            STORAGE_CMD="list"
+        else
+            STORAGE_CMD="${COMMAND_ARGS[0]}"
+        fi
+
+        case "$STORAGE_CMD" in
+            list)
+                echo "vpdmn storage directories:"
+                echo ""
+                found=0
+                for state_dir in "$DEFAULT_STATE_DIR"/*/; do
+                    [ -d "$state_dir" ] || continue
+                    found=1
+                    instance=$(basename "$state_dir")
+                    size=$(du -sh "$state_dir" 2>/dev/null | cut -f1)
+
+                    echo "  ${CYAN}$instance${NC}"
+                    echo "    Path:   $state_dir"
+                    echo "    Size:   $size"
+
+                    # Check if memres is running
+                    if [ -f "$state_dir/daemon.pid" ]; then
+                        pid=$(cat "$state_dir/daemon.pid")
+                        if [ -d "/proc/$pid" ]; then
+                            echo "    Status: ${GREEN}memres running${NC} (PID $pid)"
+                        else
+                            echo "    Status: stopped"
+                        fi
+                    else
+                        echo "    Status: no memres"
+                    fi
+                    echo ""
+                done
+                if [ $found -eq 0 ]; then
+                    echo "  (no storage directories found)"
+                    echo ""
+                fi
+
+                # Total size
+                if [ -d "$DEFAULT_STATE_DIR" ] && [ $found -gt 0 ]; then
+                    total=$(du -sh "$DEFAULT_STATE_DIR" 2>/dev/null | cut -f1)
+                    echo "Total: $total"
+                fi
+                ;;
+
+            path)
+                # Show path for specific or current architecture
+                arch="${COMMAND_ARGS[1]:-$TARGET_ARCH}"
+                echo "${STATE_DIR:-$DEFAULT_STATE_DIR/$arch}"
+                ;;
+
+            df)
+                # Detailed breakdown
+                for state_dir in "$DEFAULT_STATE_DIR"/*/; do
+                    [ -d "$state_dir" ] || continue
+                    instance=$(basename "$state_dir")
+                    echo "${BOLD}$instance${NC}:"
+
+                    # Show individual components
+                    for item in podman-state.img share; do
+                        if [ -e "$state_dir/$item" ]; then
+                            item_size=$(du -sh "$state_dir/$item" 2>/dev/null | cut -f1)
+                            printf "  %-20s %s\n" "$item" "$item_size"
+                        fi
+                    done
+                    echo ""
+                done
+                ;;
+
+            clean)
+                # Clean storage for specific arch or all
+                arch="${COMMAND_ARGS[1]:-}"
+                if [ "$arch" = "--all" ]; then
+                    # Stop any running memres first
+                    for pid_file in "$DEFAULT_STATE_DIR"/*/daemon.pid; do
+                        [ -f "$pid_file" ] || continue
+                        pid=$(cat "$pid_file" 2>/dev/null)
+                        if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+                            echo -e "${YELLOW}[vpdmn]${NC} Stopping memres (PID $pid)..."
+                            kill "$pid" 2>/dev/null || true
+                        fi
+                    done
+                    echo -e "${YELLOW}[vpdmn]${NC} Removing all storage directories..."
+                    rm -rf "$DEFAULT_STATE_DIR"
+                    echo -e "${GREEN}[vpdmn]${NC} All storage cleaned."
+                elif [ -n "$arch" ]; then
+                    # Clean specific arch
+                    clean_dir="$DEFAULT_STATE_DIR/$arch"
+                    if [ -d "$clean_dir" ]; then
+                        # Stop memres if running
+                        if [ -f "$clean_dir/daemon.pid" ]; then
+                            pid=$(cat "$clean_dir/daemon.pid" 2>/dev/null)
+                            if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+                                echo -e "${YELLOW}[vpdmn]${NC} Stopping memres (PID $pid)..."
+                                kill "$pid" 2>/dev/null || true
+                            fi
+                        fi
+                        rm -rf "$clean_dir"
+                        echo -e "${GREEN}[vpdmn]${NC} Cleaned: $clean_dir"
+                    else
+                        echo -e "${YELLOW}[vpdmn]${NC} Not found: $clean_dir"
+                    fi
+                else
+                    # Clean current arch (same as existing clean command)
+                    clean_dir="${STATE_DIR:-$DEFAULT_STATE_DIR/$TARGET_ARCH}"
+                    if [ -d "$clean_dir" ]; then
+                        # Stop memres if running
+                        if [ -f "$clean_dir/daemon.pid" ]; then
+                            pid=$(cat "$clean_dir/daemon.pid" 2>/dev/null)
+                            if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+                                echo -e "${YELLOW}[vpdmn]${NC} Stopping memres (PID $pid)..."
+                                kill "$pid" 2>/dev/null || true
+                            fi
+                        fi
+                        rm -rf "$clean_dir"
+                        echo -e "${GREEN}[vpdmn]${NC} Cleaned: $clean_dir"
+                    else
+                        echo -e "${GREEN}[vpdmn]${NC} No storage directory found for $TARGET_ARCH"
+                    fi
+                fi
+                ;;
+
+            *)
+                echo -e "${RED}[vpdmn]${NC} Unknown vstorage subcommand: $STORAGE_CMD" >&2
+                echo "Usage: vpdmn vstorage [list|path|df|clean]" >&2
+                echo "" >&2
+                echo "Subcommands:" >&2
+                echo "  list              List all storage directories with details" >&2
+                echo "  path [arch]       Show path to storage directory" >&2
+                echo "  df                Show detailed disk usage breakdown" >&2
+                echo "  clean [arch|--all] Clean storage directories" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+
+    vrun)
+        # Extended run: run a command in a container (podman-like syntax)
+        # Usage: vpdmn vrun [options] <image> [command] [args...]
+        # Options:
+        #   -it, -i, -t              Interactive mode with TTY
+        #   --network, -n            Enable networking
+        #   -p <host>:<guest>        Forward port from host to container
+        #   -v <host>:<container>    Mount host directory in container
+        #
+        # Parse vrun-specific options (allows podman-like: vpdmn vrun -it alpine /bin/sh)
+        VRUN_VOLUMES=()
+        HAS_VOLUMES=false
+
+        while [ ${#COMMAND_ARGS[@]} -gt 0 ]; do
+            case "${COMMAND_ARGS[0]}" in
+                -it|--interactive)
+                    INTERACTIVE="true"
+                    COMMAND_ARGS=("${COMMAND_ARGS[@]:1}")
+                    ;;
+                -i|-t)
+                    INTERACTIVE="true"
+                    COMMAND_ARGS=("${COMMAND_ARGS[@]:1}")
+                    ;;
+                --no-network)
+                    NETWORK="false"
+                    COMMAND_ARGS=("${COMMAND_ARGS[@]:1}")
+                    ;;
+                -p|--publish)
+                    # Port forward: -p 8080:80 or -p 8080:80/tcp
+                    NETWORK="true"  # Port forwarding requires networking
+                    if [ ${#COMMAND_ARGS[@]} -lt 2 ]; then
+                        echo -e "${RED}[vpdmn]${NC} -p requires <host_port>:<container_port>" >&2
+                        exit 1
+                    fi
+                    PORT_FORWARDS+=("${COMMAND_ARGS[1]}")
+                    COMMAND_ARGS=("${COMMAND_ARGS[@]:2}")
+                    ;;
+                -v|--volume)
+                    # Volume mount: -v /host/path:/container/path[:ro|:rw]
+                    if [ ${#COMMAND_ARGS[@]} -lt 2 ]; then
+                        echo -e "${RED}[vpdmn]${NC} -v requires <host_path>:<container_path>" >&2
+                        exit 1
+                    fi
+                    VRUN_VOLUMES+=("-v" "${COMMAND_ARGS[1]}")
+                    HAS_VOLUMES=true
+                    COMMAND_ARGS=("${COMMAND_ARGS[@]:2}")
+                    ;;
+                -*)
+                    # Unknown option - stop parsing, rest goes to container
+                    break
+                    ;;
+                *)
+                    # Not an option - this is the image name
+                    break
+                    ;;
+            esac
+        done
+
+        # Volume mounts require daemon mode
+        if [ "$HAS_VOLUMES" = "true" ] && ! daemon_is_running; then
+            echo -e "${RED}[vpdmn]${NC} Volume mounts require daemon mode. Start with: vpdmn memres start" >&2
+            exit 1
+        fi
+
+        if [ ${#COMMAND_ARGS[@]} -lt 1 ]; then
+            echo -e "${RED}[vpdmn]${NC} vrun requires <image> [command] [args...]" >&2
+            echo "Usage: vpdmn vrun [options] <image> [command] [args...]" >&2
+            echo "" >&2
+            echo "Options:" >&2
+            echo "  -it, -i, -t              Interactive mode with TTY" >&2
+            echo "  --no-network             Disable networking" >&2
+            echo "  -p <host>:<container>    Forward port" >&2
+            echo "  -v <host>:<container>    Mount host directory in container" >&2
+            echo "" >&2
+            echo "Examples:" >&2
+            echo "  vpdmn vrun alpine /bin/ls -la" >&2
+            echo "  vpdmn vrun -it alpine /bin/sh" >&2
+            echo "  vpdmn vrun -p 8080:80 nginx:latest" >&2
+            echo "  vpdmn vrun -v /tmp/data:/data alpine cat /data/file.txt" >&2
+            exit 1
+        fi
+
+        IMAGE_NAME="${COMMAND_ARGS[0]}"
+        CONTAINER_CMD=""
+
+        # Build command from remaining args
+        for ((i=1; i<${#COMMAND_ARGS[@]}; i++)); do
+            if [ -n "$CONTAINER_CMD" ]; then
+                CONTAINER_CMD="$CONTAINER_CMD ${COMMAND_ARGS[$i]}"
+            else
+                CONTAINER_CMD="${COMMAND_ARGS[$i]}"
+            fi
+        done
+
+        # Prepare volume mounts if any
+        VOLUME_OPTS=""
+        if [ "$HAS_VOLUMES" = "true" ]; then
+            [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[vpdmn]${NC} Preparing volume mounts..." >&2
+
+            # Parse and prepare volumes (transforms host paths to guest paths)
+            parse_and_prepare_volumes "${VRUN_VOLUMES[@]}" || {
+                cleanup_volumes
+                exit 1
+            }
+
+            # Build volume options string from transformed args
+            VOLUME_OPTS="${TRANSFORMED_VOLUME_ARGS[*]}"
+            [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[vpdmn]${NC} Volume options: $VOLUME_OPTS" >&2
+        fi
+
+        # Build podman run command
+        PODMAN_RUN_OPTS="--rm"
+        if [ "$INTERACTIVE" = "true" ]; then
+            PODMAN_RUN_OPTS="$PODMAN_RUN_OPTS -it"
+        fi
+        # Use host networking when enabled (container shares VM's network stack)
+        if [ "$NETWORK" = "true" ]; then
+            PODMAN_RUN_OPTS="$PODMAN_RUN_OPTS --network=host --dns=10.0.2.3 --dns=8.8.8.8"
+        fi
+
+        # Add volume mounts
+        if [ -n "$VOLUME_OPTS" ]; then
+            PODMAN_RUN_OPTS="$PODMAN_RUN_OPTS $VOLUME_OPTS"
+        fi
+
+        if [ -n "$CONTAINER_CMD" ]; then
+            # Clear entrypoint when command provided - ensures command runs directly
+            # without being passed to image's entrypoint (e.g., prevents 'sh /bin/echo')
+            PODMAN_CMD="podman run $PODMAN_RUN_OPTS --entrypoint '' $IMAGE_NAME $CONTAINER_CMD"
+        else
+            PODMAN_CMD="podman run $PODMAN_RUN_OPTS $IMAGE_NAME"
+        fi
+
+        [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[vpdmn]${NC} Podman command: $PODMAN_CMD" >&2
+
+        # Use daemon mode for non-interactive runs
+        if [ "$INTERACTIVE" = "true" ]; then
+            # Interactive mode with volumes still needs to stop daemon (volumes use share dir)
+            # Interactive mode without volumes can use daemon_interactive (faster)
+            if [ "$HAS_VOLUMES" = "false" ] && daemon_is_running; then
+                # Use daemon interactive mode - keeps daemon running
+                [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[vpdmn]${NC} Using daemon interactive mode" >&2
+                RUNNER_ARGS=$(build_runner_args)
+                "$RUNNER" $RUNNER_ARGS --daemon-interactive -- "$PODMAN_CMD"
+                exit $?
+            else
+                # Fall back to regular QEMU for interactive (stop daemon if running)
+                DAEMON_WAS_RUNNING=false
+                if daemon_is_running; then
+                    DAEMON_WAS_RUNNING=true
+                    echo -e "${YELLOW}[vpdmn]${NC} Stopping daemon for interactive mode..." >&2
+                    "$RUNNER" --state-dir "${STATE_DIR:-$DEFAULT_STATE_DIR/$TARGET_ARCH}" --daemon-stop >/dev/null 2>&1 || true
+                    sleep 1
+                fi
+                RUNNER_ARGS=$(build_runner_args)
+                "$RUNNER" $RUNNER_ARGS -- "$PODMAN_CMD"
+                VRUN_EXIT=$?
+
+                # Sync volumes back after container exits
+                if [ "$HAS_VOLUMES" = "true" ]; then
+                    sync_volumes_back
+                    cleanup_volumes
+                fi
+
+                # Restart daemon if it was running before
+                if [ "$DAEMON_WAS_RUNNING" = "true" ]; then
+                    echo -e "${CYAN}[vpdmn]${NC} Restarting daemon..." >&2
+                    "$RUNNER" $RUNNER_ARGS --daemon-start >/dev/null 2>&1 || true
+                fi
+
+                exit $VRUN_EXIT
+            fi
+        else
+            # Non-interactive can use daemon mode
+            run_podman_command "$PODMAN_CMD"
+            VRUN_EXIT=$?
+
+            # Sync volumes back after container exits
+            if [ "$HAS_VOLUMES" = "true" ]; then
+                sync_volumes_back
+                cleanup_volumes
+            fi
+
+            exit $VRUN_EXIT
+        fi
+        ;;
+
+    run)
+        # Podman run command - mirrors 'podman run' syntax
+        # Usage: vpdmn run [options] <image> [command]
+        # Automatically prepends 'podman run' to the arguments
+        # Supports volume mounts with -v (requires daemon mode)
+        if [ ${#COMMAND_ARGS[@]} -eq 0 ]; then
+            echo -e "${RED}[vpdmn]${NC} run requires an image" >&2
+            echo "Usage: vpdmn run [options] <image> [command]" >&2
+            echo "" >&2
+            echo "Examples:" >&2
+            echo "  vpdmn run alpine /bin/echo hello" >&2
+            echo "  vpdmn run -it alpine /bin/sh" >&2
+            echo "  vpdmn run --rm -e FOO=bar myapp:latest" >&2
+            echo "  vpdmn run -v /tmp/data:/data alpine cat /data/file.txt" >&2
+            exit 1
+        fi
+
+        # Check if any volume mounts are present
+        RUN_HAS_VOLUMES=false
+        for arg in "${COMMAND_ARGS[@]}"; do
+            if [ "$arg" = "-v" ] || [ "$arg" = "--volume" ]; then
+                RUN_HAS_VOLUMES=true
+                break
+            fi
+        done
+
+        # Volume mounts require daemon mode
+        if [ "$RUN_HAS_VOLUMES" = "true" ] && ! daemon_is_running; then
+            echo -e "${RED}[vpdmn]${NC} Volume mounts require daemon mode. Start with: vpdmn memres start" >&2
+            exit 1
+        fi
+
+        # Transform volume mounts if present
+        if [ "$RUN_HAS_VOLUMES" = "true" ]; then
+            [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[vpdmn]${NC} Preparing volume mounts for run command..." >&2
+
+            # Parse and prepare volumes (transforms host paths to guest paths)
+            parse_and_prepare_volumes "${COMMAND_ARGS[@]}" || {
+                cleanup_volumes
+                exit 1
+            }
+            # Update COMMAND_ARGS with transformed values
+            COMMAND_ARGS=("${TRANSFORMED_VOLUME_ARGS[@]}")
+        fi
+
+        # Build podman run command from args
+        # Note: -it may have been consumed by global parser, so add it back if INTERACTIVE is set
+        if [ "$INTERACTIVE" = "true" ]; then
+            PODMAN_CMD="podman run -it ${COMMAND_ARGS[*]}"
+        else
+            PODMAN_CMD="podman run ${COMMAND_ARGS[*]}"
+        fi
+
+        if [ "$INTERACTIVE" = "true" ]; then
+            # Interactive mode with volumes still needs to stop daemon (volumes use share dir)
+            # Interactive mode without volumes can use daemon_interactive (faster)
+            if [ "$RUN_HAS_VOLUMES" = "false" ] && daemon_is_running; then
+                # Use daemon interactive mode - keeps daemon running
+                [ "$VERBOSE" = "true" ] && echo -e "${CYAN}[vpdmn]${NC} Using daemon interactive mode" >&2
+                RUNNER_ARGS=$(build_runner_args)
+                "$RUNNER" $RUNNER_ARGS --daemon-interactive -- "$PODMAN_CMD"
+                exit $?
+            else
+                # Fall back to regular QEMU for interactive (stop daemon if running)
+                DAEMON_WAS_RUNNING=false
+                if daemon_is_running; then
+                    DAEMON_WAS_RUNNING=true
+                    echo -e "${YELLOW}[vpdmn]${NC} Stopping daemon for interactive mode..." >&2
+                    "$RUNNER" --state-dir "${STATE_DIR:-$DEFAULT_STATE_DIR/$TARGET_ARCH}" --daemon-stop >/dev/null 2>&1 || true
+                    sleep 1
+                fi
+                RUNNER_ARGS=$(build_runner_args)
+                "$RUNNER" $RUNNER_ARGS -- "$PODMAN_CMD"
+                RUN_EXIT=$?
+
+                # Sync volumes back after container exits
+                if [ "$RUN_HAS_VOLUMES" = "true" ]; then
+                    sync_volumes_back
+                    cleanup_volumes
+                fi
+
+                # Restart daemon if it was running before
+                if [ "$DAEMON_WAS_RUNNING" = "true" ]; then
+                    echo -e "${CYAN}[vpdmn]${NC} Restarting daemon..." >&2
+                    "$RUNNER" $RUNNER_ARGS --daemon-start >/dev/null 2>&1 || true
+                fi
+
+                exit $RUN_EXIT
+            fi
+        else
+            # Non-interactive - use daemon mode when available
+            run_podman_command "$PODMAN_CMD"
+            RUN_EXIT=$?
+
+            # Sync volumes back after container exits
+            if [ "$RUN_HAS_VOLUMES" = "true" ]; then
+                sync_volumes_back
+                cleanup_volumes
+            fi
+
+            exit $RUN_EXIT
+        fi
+        ;;
+
+    # Memory resident subcommand: vpdmn memres start|stop|restart|status
+    # vmemres is the preferred name (v prefix for vpdmn-specific commands)
+    memres|vmemres)
+        if [ ${#COMMAND_ARGS[@]} -lt 1 ]; then
+            echo -e "${RED}[vpdmn]${NC} memres requires a subcommand: start, stop, restart, status, list" >&2
+            exit 1
+        fi
+
+        MEMRES_CMD="${COMMAND_ARGS[0]}"
+
+        # Parse memres-specific options (after the subcommand)
+        MEMRES_ARGS=("${COMMAND_ARGS[@]:1}")
+        i=0
+        while [ $i -lt ${#MEMRES_ARGS[@]} ]; do
+            arg="${MEMRES_ARGS[$i]}"
+            case "$arg" in
+                -p|--publish)
+                    # Port forward: -p 8080:80 or -p 8080:80/tcp
+                    i=$((i + 1))
+                    if [ $i -ge ${#MEMRES_ARGS[@]} ]; then
+                        echo -e "${RED}[vpdmn]${NC} -p requires <host_port>:<container_port>" >&2
+                        exit 1
+                    fi
+                    PORT_FORWARDS+=("${MEMRES_ARGS[$i]}")
+                    ;;
+            esac
+            i=$((i + 1))
+        done
+
+        RUNNER_ARGS=$(build_runner_args)
+
+        case "$MEMRES_CMD" in
+            start)
+                if daemon_is_running; then
+                    echo -e "${YELLOW}[vpdmn]${NC} A memres instance is already running for $TARGET_ARCH"
+                    echo ""
+                    "$RUNNER" $RUNNER_ARGS --daemon-status
+                    echo ""
+                    echo "Options:"
+                    echo "  1) Restart with new settings (stops current instance)"
+                    echo "  2) Start additional instance with different --state-dir"
+                    echo "  3) Cancel"
+                    echo ""
+                    read -p "Choice [1-3]: " choice
+                    case "$choice" in
+                        1)
+                            echo -e "${CYAN}[vpdmn]${NC} Restarting memres..."
+                            "$RUNNER" $RUNNER_ARGS --daemon-stop
+                            sleep 1
+                            "$RUNNER" $RUNNER_ARGS --daemon-start
+                            ;;
+                        2)
+                            echo ""
+                            echo "To start an additional instance, use -I <name>:"
+                            echo "  vpdmn -I web memres start -p 8080:80"
+                            echo "  vpdmn -I api memres start -p 3000:3000"
+                            echo ""
+                            echo "Then interact with it:"
+                            echo "  vpdmn -I web images"
+                            echo ""
+                            exit 0
+                            ;;
+                        *)
+                            echo "Cancelled."
+                            exit 0
+                            ;;
+                    esac
+                else
+                    "$RUNNER" $RUNNER_ARGS --daemon-start
+                fi
+                ;;
+            stop)
+                "$RUNNER" $RUNNER_ARGS --daemon-stop
+                ;;
+            restart)
+                # Stop if running
+                "$RUNNER" $RUNNER_ARGS --daemon-stop 2>/dev/null || true
+
+                # Clean if --clean was passed
+                for arg in "${COMMAND_ARGS[@]:1}"; do
+                    if [ "$arg" = "--clean" ]; then
+                        CLEAN_DIR="${STATE_DIR:-$DEFAULT_STATE_DIR/$TARGET_ARCH}"
+                        if [ -d "$CLEAN_DIR" ]; then
+                            echo -e "${YELLOW}[vpdmn]${NC} Cleaning state directory: $CLEAN_DIR"
+                            rm -rf "$CLEAN_DIR"
+                        fi
+                        break
+                    fi
+                done
+
+                # Start
+                "$RUNNER" $RUNNER_ARGS --daemon-start
+                ;;
+            status)
+                "$RUNNER" $RUNNER_ARGS --daemon-status
+                ;;
+            list)
+                # Show all running memres instances
+                echo "Running memres instances:"
+                echo ""
+                found=0
+                tracked_pids=""
+                for pid_file in "$DEFAULT_STATE_DIR"/*/daemon.pid; do
+                    [ -f "$pid_file" ] || continue
+                    pid=$(cat "$pid_file" 2>/dev/null)
+                    if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+                        instance_dir=$(dirname "$pid_file")
+                        instance_name=$(basename "$instance_dir")
+                        echo "  ${CYAN}$instance_name${NC}"
+                        echo "    PID: $pid"
+                        echo "    State: $instance_dir"
+                        if [ -f "$instance_dir/qemu.log" ]; then
+                            # Try to extract port forwards from qemu command line
+                            ports=$(grep -o 'hostfwd=[^,]*' "$instance_dir/qemu.log" 2>/dev/null | sed 's/hostfwd=tcp:://g; s/-/:/' | tr '\n' ' ')
+                            [ -n "$ports" ] && echo "    Ports: $ports"
+                        fi
+                        echo ""
+                        found=$((found + 1))
+                        tracked_pids="$tracked_pids $pid"
+                    fi
+                done
+                if [ $found -eq 0 ]; then
+                    echo "  (none)"
+                fi
+
+                # Check for zombie/orphan QEMU processes (vdkr or vpdmn)
+                echo ""
+                echo "Checking for orphan QEMU processes..."
+                zombies=""
+                for qemu_pid in $(pgrep -f "qemu-system.*runtime=(docker|podman)" 2>/dev/null || true); do
+                    # Skip if this PID is already tracked
+                    if echo "$tracked_pids" | grep -qw "$qemu_pid"; then
+                        continue
+                    fi
+                    # Also check vdkr state dirs
+                    vdkr_tracked=false
+                    for vpid_file in "$HOME/.vdkr"/*/daemon.pid; do
+                        [ -f "$vpid_file" ] || continue
+                        vpid=$(cat "$vpid_file" 2>/dev/null)
+                        if [ "$vpid" = "$qemu_pid" ]; then
+                            vdkr_tracked=true
+                            break
+                        fi
+                    done
+                    if [ "$vdkr_tracked" = "true" ]; then
+                        continue
+                    fi
+                    zombies="$zombies $qemu_pid"
+                done
+
+                if [ -n "$zombies" ]; then
+                    echo ""
+                    echo -e "${YELLOW}Orphan QEMU processes found:${NC}"
+                    for zpid in $zombies; do
+                        # Extract runtime from cmdline
+                        cmdline=$(cat /proc/$zpid/cmdline 2>/dev/null | tr '\0' ' ')
+                        runtime=$(echo "$cmdline" | grep -o 'runtime=[a-z]*' | cut -d= -f2)
+                        state_dir=$(echo "$cmdline" | grep -o 'path=[^,]*daemon.sock' | sed 's|path=||; s|/daemon.sock||')
+                        echo ""
+                        echo "  ${RED}PID $zpid${NC} (${runtime:-unknown})"
+                        [ -n "$state_dir" ] && echo "    State: $state_dir"
+                        echo "    Kill with: kill $zpid"
+                    done
+                    echo ""
+                    echo -e "To kill all orphans: ${CYAN}kill$zombies${NC}"
+                else
+                    echo "  (no orphans found)"
+                fi
+                ;;
+            *)
+                echo -e "${RED}[vpdmn]${NC} Unknown memres subcommand: $MEMRES_CMD" >&2
+                echo "Usage: vpdmn memres start|stop|restart|status|list" >&2
+                exit 1
+                ;;
+        esac
+        ;;
+
+    *)
+        echo -e "${RED}[vpdmn]${NC} Unknown command: $COMMAND" >&2
+        echo "Run 'vpdmn --help' for usage" >&2
+        exit 1
+        ;;
+esac
