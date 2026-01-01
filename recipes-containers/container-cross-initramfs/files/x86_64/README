@@ -1,0 +1,21 @@
+Container Cross-Install Blobs for x86_64
+========================================
+
+This directory should contain:
+
+  bzImage            - Linux kernel for QEMU x86_64
+  initramfs.cpio.gz  - Unified initramfs with Docker + Podman tools
+
+These blobs are used by container-cross-install to bundle containers
+into Yocto images at build time.
+
+TO POPULATE (one-time):
+
+  MACHINE=qemux86-64 bitbake container-cross-initramfs-build
+
+  cp tmp/deploy/images/qemux86-64/container-cross-initramfs/bzImage .
+  cp tmp/deploy/images/qemux86-64/container-cross-initramfs/initramfs.cpio.gz .
+
+If blobs are not checked in, users must build them before using
+container-cross-install. The build will fail with instructions if
+blobs are missing.
