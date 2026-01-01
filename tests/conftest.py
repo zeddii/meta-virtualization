@@ -36,6 +36,8 @@ import os
 import subprocess
 import shutil
 import tempfile
+import signal
+import atexit
 import pytest
 from pathlib import Path
 
@@ -43,6 +45,52 @@ from pathlib import Path
 # Test state directories - separate from user's ~/.vdkr/ and ~/.vpdmn/
 TEST_STATE_BASE = os.path.expanduser("~/.vdkr-test")
 VPDMN_TEST_STATE_BASE = os.path.expanduser("~/.vpdmn-test")
+
+# Track test memres PIDs for cleanup
+_test_memres_pids = set()
+
+
+def _cleanup_test_memres():
+    """
+    Clean up any test memres processes that may have been left running.
+    Called on exit (atexit) and signal handlers.
+    """
+    for state_base in [TEST_STATE_BASE, VPDMN_TEST_STATE_BASE]:
+        for arch_dir in Path(state_base).glob("*"):
+            pid_file = arch_dir / "daemon.pid"
+            if pid_file.exists():
+                try:
+                    pid = int(pid_file.read_text().strip())
+                    # Check if process is still running
+                    if Path(f"/proc/{pid}").exists():
+                        os.kill(pid, signal.SIGTERM)
+                        # Give it a moment to clean up
+                        import time
+                        time.sleep(0.5)
+                        # Force kill if still running
+                        if Path(f"/proc/{pid}").exists():
+                            os.kill(pid, signal.SIGKILL)
+                except (ValueError, ProcessLookupError, PermissionError):
+                    pass
+                # Remove stale PID file
+                try:
+                    pid_file.unlink()
+                except OSError:
+                    pass
+
+
+def _signal_handler(signum, frame):
+    """Handle SIGINT/SIGTERM by cleaning up test memres before exit."""
+    _cleanup_test_memres()
+    # Re-raise the signal to trigger default behavior
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+# Register cleanup handlers
+atexit.register(_cleanup_test_memres)
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
 
 
 def pytest_addoption(parser):
