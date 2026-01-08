@@ -397,6 +397,13 @@ class VdkrRunner:
         if not self.has_image("alpine"):
             self.pull("alpine:latest", timeout=timeout)
 
+    def ensure_busybox(self, timeout=300):
+        """Ensure busybox:latest is available, pulling if necessary."""
+        # Ensure memres is running first (in case a previous test stopped it)
+        self.ensure_memres()
+        if not self.has_image("busybox"):
+            self.pull("busybox:latest", timeout=timeout)
+
 
 @pytest.fixture(scope="session")
 def vdkr(vdkr_bin, vdkr_env, arch, test_state_dir):
@@ -607,6 +614,13 @@ class VpdmnRunner:
         self.ensure_memres()
         if not self.has_image("alpine"):
             self.pull("alpine:latest", timeout=timeout)
+
+    def ensure_busybox(self, timeout=300):
+        """Ensure busybox:latest is available, pulling if necessary."""
+        # Ensure memres is running first (in case a previous test stopped it)
+        self.ensure_memres()
+        if not self.has_image("busybox"):
+            self.pull("busybox:latest", timeout=timeout)
 
 
 @pytest.fixture(scope="session")
