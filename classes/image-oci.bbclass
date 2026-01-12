@@ -65,10 +65,117 @@ OCI_IMAGE_STOPSIGNAL ?= ""
 #     format: <port>/tcp, <port>/udp, or <port> (same as <port>/tcp).
 OCI_IMAGE_PORTS ?= ""
 
-# key=value list of labels
+# key=value list of labels (user-defined)
 OCI_IMAGE_LABELS ?= ""
 # key=value list of environment variables
 OCI_IMAGE_ENV_VARS ?= ""
+
+# =============================================================================
+# Build-time metadata for traceability
+# =============================================================================
+#
+# These variables embed source info into OCI image labels for traceability.
+# Standard OCI annotations are used: https://github.com/opencontainers/image-spec/blob/main/annotations.md
+#
+# OCI_IMAGE_APP_RECIPE: Recipe name for the "main application" in the container.
+#   If set, future versions may auto-extract SRCREV/branch from this recipe.
+#   For now, it's documentation and a hook point.
+#
+# OCI_IMAGE_REVISION: Git commit SHA (short or full).
+#   - If set: uses this value
+#   - If empty: auto-detects from TOPDIR git repo
+#   - Set to "none" to disable
+#
+# OCI_IMAGE_BRANCH: Git branch name.
+#   - If set: uses this value
+#   - If empty: auto-detects from TOPDIR git repo
+#   - Set to "none" to disable
+#
+# OCI_IMAGE_BUILD_DATE: ISO 8601 timestamp.
+#   - Auto-generated at build time
+#
+# These become standard OCI labels:
+#   org.opencontainers.image.revision = OCI_IMAGE_REVISION
+#   org.opencontainers.image.ref.name = OCI_IMAGE_BRANCH
+#   org.opencontainers.image.created = OCI_IMAGE_BUILD_DATE
+#   org.opencontainers.image.version = PV (if meaningful)
+
+OCI_IMAGE_APP_RECIPE ?= ""
+OCI_IMAGE_REVISION ?= ""
+OCI_IMAGE_BRANCH ?= ""
+OCI_IMAGE_BUILD_DATE ?= ""
+
+def oci_image_get_git_revision(d):
+    """Get short git revision from TOPDIR."""
+    import subprocess
+    try:
+        rev = subprocess.check_output(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            cwd=d.getVar('TOPDIR'),
+            stderr=subprocess.DEVNULL
+        ).decode().strip()
+        return rev
+    except:
+        return ""
+
+def oci_image_get_git_branch(d):
+    """Get git branch name from TOPDIR."""
+    import subprocess
+    try:
+        branch = subprocess.check_output(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+            cwd=d.getVar('TOPDIR'),
+            stderr=subprocess.DEVNULL
+        ).decode().strip()
+        if branch and branch != 'HEAD':
+            return branch
+    except:
+        pass
+    return ""
+
+def oci_image_get_build_date(d):
+    """Get ISO 8601 build timestamp."""
+    import datetime
+    return datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+
+def oci_image_generate_labels(d):
+    """Generate standard OCI labels from build metadata.
+
+    Returns space-separated key=value pairs to append to OCI_IMAGE_LABELS.
+    """
+    labels = []
+
+    # Get revision (explicit > auto-detect)
+    revision = d.getVar('OCI_IMAGE_REVISION')
+    if not revision:
+        revision = oci_image_get_git_revision(d)
+    if revision and revision != 'none':
+        labels.append(f'org.opencontainers.image.revision={revision}')
+
+    # Get branch (explicit > auto-detect)
+    branch = d.getVar('OCI_IMAGE_BRANCH')
+    if not branch:
+        branch = oci_image_get_git_branch(d)
+    if branch and branch != 'none':
+        labels.append(f'org.opencontainers.image.ref.name={branch}')
+
+    # Build date (always auto-generated if not set)
+    build_date = d.getVar('OCI_IMAGE_BUILD_DATE')
+    if not build_date:
+        build_date = oci_image_get_build_date(d)
+    if build_date and build_date != 'none':
+        labels.append(f'org.opencontainers.image.created={build_date}')
+
+    # Version from PV (only if meaningful)
+    pv = d.getVar('PV') or ''
+    pv_clean = pv.split('+')[0]  # Strip +gitAUTOINC suffix
+    if pv_clean and pv_clean != '1.0':
+        labels.append(f'org.opencontainers.image.version={pv_clean}')
+
+    return ' '.join(labels)
+
+# Append auto-generated labels to user labels
+OCI_IMAGE_LABELS:append = " ${@oci_image_generate_labels(d)}"
 
 # whether the oci image dir should be left as a directory, or
 # bundled into a tarball.
