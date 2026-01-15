@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (C) 2025 Bruce Ashfield
+#
+# SPDX-License-Identifier: MIT
 """
 Tests for vdkr - Docker CLI for cross-architecture emulation.
 
