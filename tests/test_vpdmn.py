@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (C) 2025 Bruce Ashfield
+#
+# SPDX-License-Identifier: MIT
 """
 Tests for vpdmn - Podman CLI for cross-architecture emulation.
 
