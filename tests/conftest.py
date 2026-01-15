@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (C) 2025 Bruce Ashfield
+#
+# SPDX-License-Identifier: MIT
 """
 Pytest configuration and fixtures for vdkr, vpdmn and container-cross-install testing.
 
