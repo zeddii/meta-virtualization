@@ -43,4 +43,4 @@ DESCRIPTION = "Packages a tiny initramfs for switch_root and bundles the \
 # Set the runtime before including shared code
 VCONTAINER_RUNTIME = "vdkr"
 
-require vcontainer-initramfs-create.inc
+require vcontainer-initramfs-create-v2.inc

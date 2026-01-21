@@ -53,6 +53,15 @@ mount_tmpfs_dirs() {
     mount -t tmpfs tmpfs /tmp
     mount -t tmpfs tmpfs /run
     mount -t tmpfs tmpfs /mnt
+
+    # Handle Yocto read-only-rootfs volatile directories
+    # /var/log and /var/tmp are symlinks to volatile/log and volatile/tmp
+    if [ -d /var/volatile ]; then
+        mount -t tmpfs tmpfs /var/volatile
+        mkdir -p /var/volatile/log /var/volatile/tmp
+    fi
+
+    # Fallback for non-volatile layouts
     mount -t tmpfs tmpfs /var/run 2>/dev/null || true
     mount -t tmpfs tmpfs /var/tmp 2>/dev/null || true
 

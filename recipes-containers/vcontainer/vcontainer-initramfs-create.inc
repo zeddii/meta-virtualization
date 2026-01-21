@@ -117,8 +117,9 @@ do_compile() {
     fi
 
     # Extract busybox from rootfs using unsquashfs
-    # In usrmerge layouts, busybox is at usr/bin/busybox
-    BUSYBOX_PATH="usr/bin/busybox"
+    # In usrmerge layouts, busybox is a symlink to busybox.nosuid
+    # We need to extract the actual binary, not the symlink
+    BUSYBOX_PATH="usr/bin/busybox.nosuid"
     EXTRACT_DIR="${B}/squashfs-extract"
 
     bbnote "Extracting busybox from $BUSYBOX_PATH"
@@ -140,6 +141,41 @@ do_compile() {
     fi
     cp "${EXTRACT_DIR}/${BUSYBOX_PATH}" "${INITRAMFS_DIR}/bin/busybox"
     chmod +x ${INITRAMFS_DIR}/bin/busybox
+
+    # Extract required libraries for dynamically linked busybox
+    # In usrmerge layouts, libraries are in /usr/lib
+    # Library names differ by architecture:
+    #   x86_64: ld-linux-x86-64.so.2
+    #   aarch64: ld-linux-aarch64.so.1
+    bbnote "Extracting required libraries for ${TARGET_ARCH}..."
+    rm -rf "${EXTRACT_DIR}"
+    if [ "${TARGET_ARCH}" = "aarch64" ]; then
+        $UNSQUASHFS -d "${EXTRACT_DIR}" "${ROOTFS_SRC}" \
+            "usr/lib/ld-linux-aarch64.so.1" \
+            "usr/lib/libc.so.6" \
+            "usr/lib/libm.so.6" \
+            "usr/lib/libresolv.so.2" 2>/dev/null || true
+    else
+        $UNSQUASHFS -d "${EXTRACT_DIR}" "${ROOTFS_SRC}" \
+            "usr/lib/ld-linux-x86-64.so.2" \
+            "usr/lib/libc.so.6" \
+            "usr/lib/libm.so.6" \
+            "usr/lib/libresolv.so.2" 2>/dev/null || true
+    fi
+
+    # Create lib directory and copy libraries
+    mkdir -p ${INITRAMFS_DIR}/usr/lib
+    if [ -d "${EXTRACT_DIR}/usr/lib" ]; then
+        cp -a "${EXTRACT_DIR}/usr/lib"/*.so* ${INITRAMFS_DIR}/usr/lib/ 2>/dev/null || true
+        bbnote "Copied libraries to initramfs"
+        ls -la ${INITRAMFS_DIR}/usr/lib/
+    else
+        bbwarn "No libraries found - busybox may be statically linked or extraction failed"
+    fi
+    # Create /lib -> usr/lib symlink for usrmerge compatibility
+    cd ${INITRAMFS_DIR}
+    ln -sf usr/lib lib
+    cd -
 
     # Create minimal symlinks
     cd ${INITRAMFS_DIR}/bin
