@@ -32,7 +32,7 @@
 # Blobs are deployed to: tmp-vruntime-*/deploy/images/${MACHINE}/vdkr/
 #
 # To build the complete standalone tarball (recommended):
-#   MACHINE=qemux86-64 bitbake vcontainer-native -c create_tarball
+#   bitbake vcontainer-tarball
 #
 # ===========================================================================
 
@@ -43,4 +43,4 @@ DESCRIPTION = "Packages a tiny initramfs for switch_root and bundles the \
 # Set the runtime before including shared code
 VCONTAINER_RUNTIME = "vdkr"
 
-require vcontainer-initramfs-create-v2.inc
+require vcontainer-initramfs-create.inc
