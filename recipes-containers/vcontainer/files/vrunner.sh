@@ -1350,6 +1350,10 @@ if [ "$DAEMON_MODE" = "start" ]; then
 
             # Spawn background watchdog
             (
+                # Determine container runtime command for checking running containers
+                PS_CMD="docker ps -q"
+                [ "$RUNTIME" = "podman" ] && PS_CMD="podman ps -q"
+
                 while true; do
                     sleep 60  # Check every minute
                     [ -f "$ACTIVITY_FILE" ] || exit 0  # Clean exit if file removed
@@ -1364,7 +1368,19 @@ if [ "$DAEMON_MODE" = "start" ]; then
                     IDLE_SECONDS=$((NOW - LAST_ACTIVITY))
 
                     if [ "$IDLE_SECONDS" -ge "$IDLE_TIMEOUT" ]; then
-                        # Send QMP quit to gracefully stop QEMU
+                        # Check if any containers are running before shutting down
+                        if [ -S "$DAEMON_SOCKET" ]; then
+                            PS_CMD_B64=$(echo -n "$PS_CMD" | base64 -w0)
+                            RUNNING=$(echo "$PS_CMD_B64" | timeout 10 socat - "UNIX-CONNECT:$DAEMON_SOCKET" 2>/dev/null | \
+                                sed -n '/===OUTPUT_START===/,/===OUTPUT_END===/p' | grep -v '===')
+                            if [ -n "$RUNNING" ]; then
+                                # Containers are running - reset activity and skip shutdown
+                                touch "$ACTIVITY_FILE"
+                                continue
+                            fi
+                        fi
+
+                        # No containers running - send QMP quit to gracefully stop QEMU
                         if [ -S "$QMP_SOCKET" ]; then
                             echo '{"execute":"qmp_capabilities"}{"execute":"quit"}' | \
                                 socat - "UNIX-CONNECT:$QMP_SOCKET" >/dev/null 2>&1 || true
