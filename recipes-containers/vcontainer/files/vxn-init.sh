@@ -330,6 +330,15 @@ $OCI_ENV
 OCIENVEOF
     fi
 
+    # Per-run env from the host (#20): dom0 staged it on the input disk
+    # (.vxn-env/env, off any kernel cmdline). KEY=VAL lines -- export each into
+    # the container's environment so the entrypoint (e.g. claude) sees them.
+    if [ -f /mnt/input/.vxn-env/env ]; then
+        while IFS= read -r env_line; do
+            [ -n "$env_line" ] && export "$env_line" 2>/dev/null || true
+        done < /mnt/input/.vxn-env/env
+    fi
+
     # Ensure a sane PATH even if the image didn't set one.
     case ":${PATH:-}:" in
         *:/usr/local/bin:*) : ;;
