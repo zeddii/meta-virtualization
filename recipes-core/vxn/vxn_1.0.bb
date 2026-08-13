@@ -76,7 +76,7 @@ SRC_URI = "\
     file://vxn-host-certs.service \
     file://vxn-authorized-keys.sh \
     file://vxn-authorized-keys.service \
-    file://vxn-recipes/claude/Dockerfile \
+    file://vxn-recipes/claude/Vxnfile \
 "
 
 FILESEXTRAPATHS:prepend := "${THISDIR}/../../recipes-containers/vcontainer/files:"
@@ -312,7 +312,7 @@ do_install() {
     # time), not the tool itself -- same as the layer's other third-party-fetch
     # container recipes. ${datadir}/vxn/ is already in FILES:${PN}.
     install -d ${D}${datadir}/vxn/recipes/claude
-    install -m 0644 ${S}/vxn-recipes/claude/Dockerfile ${D}${datadir}/vxn/recipes/claude/Dockerfile
+    install -m 0644 ${S}/vxn-recipes/claude/Vxnfile ${D}${datadir}/vxn/recipes/claude/Vxnfile
 
     # Install blobs from do_compile output
     install -d ${D}${datadir}/vxn/${BLOB_ARCH}
