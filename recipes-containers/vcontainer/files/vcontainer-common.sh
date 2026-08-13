@@ -2034,13 +2034,6 @@ case "$COMMAND" in
         # vxn provision <name> [-f <Dockerfile>] [<context-dir>]
         # Assemble a rootfs from a mini-Dockerfile dom0-side (no docker) and cache
         # it at ~/.vxn/rootfs/<name>; `vxn run <name>` then direct-mounts it.
-        if [ "${VCONTAINER_HYPERVISOR:-}" = "qemu-xen" ]; then
-            echo -e "${YELLOW}[$VCONTAINER_RUNTIME_NAME]${NC} provision runs in dom0; for now use:" >&2
-            echo "  vxn ssh -- vxn provision <name> -f <dom0-path-to-Dockerfile> <dom0-context>" >&2
-            echo "  (host-side relay + context transport is a follow-up)" >&2
-            exit 1
-        fi
-        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] || vxn_unsupported "provision"
         _p_name=""; _p_dockerfile=""; _p_context=""
         i=0
         while [ $i -lt ${#COMMAND_ARGS[@]} ]; do
@@ -2054,8 +2047,31 @@ case "$COMMAND" in
         done
         [ -n "$_p_name" ] || {
             echo "usage: $VCONTAINER_RUNTIME_NAME provision <name> [-f <Dockerfile>] [<context-dir>]" >&2; exit 1; }
+        # Default the context to the Dockerfile's dir (or CWD); default the
+        # Dockerfile to <context>/Dockerfile.
+        [ -n "$_p_dockerfile" ] && [ -z "$_p_context" ] && _p_context="$(dirname "$_p_dockerfile")"
         [ -n "$_p_context" ] || _p_context="."
         [ -n "$_p_dockerfile" ] || _p_dockerfile="$_p_context/Dockerfile"
+
+        if [ "${VCONTAINER_HYPERVISOR:-}" = "qemu-xen" ]; then
+            # Host side: provision must run in dom0 (skopeo/chroot/network live
+            # there). Tar the context, stream it over ssh into dom0 scratch, run
+            # `vxn provision` there, clean up. The Dockerfile is referenced by
+            # basename inside the transported context (like docker, keep it in the
+            # context dir).
+            [ -f "$_p_dockerfile" ] || {
+                echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} Dockerfile not found: $_p_dockerfile" >&2; exit 1; }
+            _dfbase=$(basename "$_p_dockerfile")
+            # Bring dom0 up first (stdin-safe) so its auto-start can't consume the
+            # tar stream.
+            _vxn_ssh_dom0 -- true </dev/null || {
+                echo -e "${RED}[$VCONTAINER_RUNTIME_NAME]${NC} cannot reach dom0" >&2; exit 1; }
+            _dom0_ctx="/var/rh/vxn-provision-$$"
+            tar -C "$_p_context" -cf - . | _vxn_ssh_dom0 -- \
+                "mkdir -p $_dom0_ctx && tar -C $_dom0_ctx -xf - && vxn provision $_p_name -f $_dom0_ctx/$_dfbase $_dom0_ctx; _rc=\$?; rm -rf $_dom0_ctx; exit \$_rc"
+            exit $?
+        fi
+        [ "${VCONTAINER_HYPERVISOR:-}" = "xen" ] || vxn_unsupported "provision"
         _vxn_provision_build "$_p_name" "$_p_dockerfile" "$_p_context"
         exit $?
         ;;
